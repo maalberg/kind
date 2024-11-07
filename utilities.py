@@ -83,6 +83,16 @@ class fcnn(torch.nn.Module):
 
 
 # ---------------------------------------------------------------------------*/
+# - fully-connected neural network that constraints its inputs to be radially
+# - symmetric
+
+class radial_fcnn(fcnn):
+    def forward(self, x : torch.Tensor) -> torch.Tensor:
+        radial_x = torch.sum(torch.square(x), dim=-1, keepdim=True)
+        return super().forward(radial_x)
+
+
+# ---------------------------------------------------------------------------*/
 # - fully-connected autoencoder-based neural network
 
 class autoencoder(torch.nn.Module):

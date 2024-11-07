@@ -25,7 +25,7 @@ class dmd:
             activation=self.config['act'])
 
         # construct a fully-connected neural network that transforms latent coordinates into eigenvalues
-        self.eigenvalues = utils.fcnn([2, 170, 1], activation=self.config['act'])
+        self.eigenvalues = utils.radial_fcnn([1, 170, 1], activation=self.config['act'])
 
     def predict_impl(self, coord_first: torch.Tensor, eigens: torch.Tensor) -> torch.Tensor:
         """
@@ -65,10 +65,10 @@ class dmd:
         timeseries_o_batch = self.autoencoder.decoder(coords_batch)
 
         # calculate coding/decoding loss
-        timeseries_mseloss = torch.nn.MSELoss()
-        timeseries_o_loss = timeseries_mseloss(timeseries_o_batch, timeseries_batch)
+        criterion_timeseries = torch.nn.MSELoss()
+        loss_timeseries = criterion_timeseries(timeseries_o_batch, timeseries_batch)
 
-        # based on latent coordinates, derive the corresponding eigenvalues
+        # based on radially symmetric coordinates, derive the corresponding eigenvalues
         eigens_batch = self.eigenvalues(coords_batch)
 
         # with the help of derived eigenvalues predict coordinates in a linear manner
@@ -79,11 +79,11 @@ class dmd:
             [self.predict_impl(coords[torch.newaxis, 0], eigens) for coords, eigens in zip(coords_batch, eigens_batch)], dim=0)
 
         # calculate prediction loss
-        pred_mseloss = torch.nn.MSELoss()
-        pred_o_loss = pred_mseloss(coords_o_batch, coords_batch)
+        criterion_pred = torch.nn.MSELoss()
+        loss_pred = criterion_pred(coords_o_batch, coords_batch)
 
         # return the sum of all losses
-        return timeseries_o_loss + pred_o_loss
+        return loss_timeseries + loss_pred
 
     def predict(self, timeseries_start: torch.Tensor, prediction_steps_n: int) -> torch.Tensor:
         """
