@@ -82,8 +82,13 @@ class dmd:
         criterion_pred = torch.nn.MSELoss()
         loss_pred = criterion_pred(coords_o_batch, coords_batch)
 
+        # L2 weight regularization
+        loss_reg = torch.sum(
+            torch.cat(
+                [torch.square(param.view(-1)) for param in self.parameters()]))
+
         # return the sum of all losses
-        return loss_timeseries + loss_pred
+        return loss_timeseries + loss_pred + self.config['loss_reg_l2']*loss_reg
 
     def predict(self, timeseries_start: torch.Tensor, prediction_steps_n: int) -> torch.Tensor:
         """
