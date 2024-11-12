@@ -93,7 +93,8 @@ class dmd:
     def predict(self, timeseries_start: torch.Tensor, prediction_steps_n: int) -> torch.Tensor:
         """
         Based on the starting value of timeseries ``timeseries_start``, predicts a number of steps
-        into the future given by ``prediction_steps_n``.
+        into the future given by ``prediction_steps_n``. The starting timeseries isexpected
+        to be formatted as [1, C], where C is the number of data channels.
         """
         coord = self.autoencoder.encoder(timeseries_start)
 
