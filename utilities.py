@@ -154,14 +154,14 @@ class matrix_powers:
 # - rotation powers
 
 class rotation_powers:
-    def __init__(self, transposed=False):
+    def __init__(self, blocks_n : int = 1, transposed : bool = False):
         """
         Constructs an iterator over powers of a rotation matrix. The rotation
-        matrix is initialized as a two-dimensional identity matrix,
-        which corresponds to rotation by 0 degrees. The iterated
+        matrix is initialized with a ``blocks_n`` number of two-dimensional
+        identity matrices placed in a block-diagonal matrix. The iterated
         matrices may also be ``transposed``.
         """
-        self.rot = torch.eye(2)
+        self.rot = torch.block_diag(*[torch.eye(2) for _ in range(blocks_n)])
         self.transposed = transposed
 
     def next(self, phi: torch.Tensor) -> torch.Tensor:
@@ -169,8 +169,12 @@ class rotation_powers:
         Returns the next power of the rotation matrix. The matrix is parameterized
         by the given ``phi`` angle.
         """
-        self.rot = torch.matmul(self.rot, rotation_powers.build_rotation(phi))
+        self.rot = torch.matmul(self.rot, rotation_powers.build_rotation_blocks(phi))
         return self.rot if self.transposed == False else torch.transpose(self.rot, 0, 1)
+
+    @staticmethod
+    def build_rotation_blocks(phi: torch.Tensor) -> torch.Tensor:
+        return torch.block_diag(*[rotation_powers.build_rotation(a) for a in phi])
 
     @staticmethod
     def build_rotation(phi: torch.Tensor):
@@ -179,7 +183,10 @@ class rotation_powers:
         """
         cos = torch.cos(phi)
         sin = torch.sin(phi)
-        return torch.cat([
-            torch.stack([cos, -sin], dim=1),
-            torch.stack([sin, cos], dim=1)], dim=0)
+        rot = torch.zeros((2, 2))
+        rot[0,0] = cos
+        rot[1,1] = cos
+        rot[0,1] = -sin
+        rot[1,0] = sin
+        return rot
 

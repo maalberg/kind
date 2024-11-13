@@ -1,5 +1,6 @@
 import torch
 
+import koopman as koop
 import utilities as utils
 
 
@@ -18,69 +19,74 @@ class dmd:
         """
         self.config = configuration
 
-        # construct autoencoder that establishes an n-dimensional latent space,
-        # where n comes from the given configuration
-        self.autoencoder = utils.autoencoder(
-            features=[self.config['data_ch_n'], 80, 80, self.config['latent_ch_n']],
-            activation=self.config['act'])
+        data_dims_n      = self.config['data_ch_n']
+        eigenfunc_dims_n = self.config['osc_n'] * 2
 
-        # construct a fully-connected neural network that transforms latent coordinates into eigenvalues
-        self.eigenvalues = utils.radial_fcnn([1, 170, 1], activation=self.config['act'])
+        # based on a typical autoencoder framework, create an encoder that will decompose
+        # input data into Koopman eigenfunctions
+        self.decomposer = koop.eigenfunction(data_dims_n, eigenfunc_dims_n)
 
-    def predict_impl(self, coord_first: torch.Tensor, eigens: torch.Tensor) -> torch.Tensor:
+        # as usual for autoencoders, encoded data needs to be decoded back, so create a decoder
+        # that will compose/reconstruct data back to its original state
+        self.reconstructor = koop.eigenfunction(data_dims_n, eigenfunc_dims_n, inversed=True)
+
+        # finally, create an extractor of dynamic modes from Koopman eigenfunctions
+        self.dynamics = koop.eigenvalue(eigenfunc_dims_n=self.config['osc_n'] * 2)
+
+    def predict_impl(self, eigenfunction: torch.Tensor, eigenvalues: torch.Tensor) -> torch.Tensor:
         """
-        Implements prediction logic that takes the first coordinate ``coord_first``, a vector of
-        eigenvalues ``eigens`` and returns a vector of predicted coordinates.
-        The data must be formatted as [T, C], where T and C are the
-        number of timesteps and channels, respectively.
+        Predicts the trajectory of an ``eigenfunction`` into the future.
+        The eigenfunctions are supposed to be linear, so the dynamics of a predicted eigenfunction
+        is encoded in a matrix. At each prediction step this matrix is parameterized
+        with a value from ``eigenvalues``. So ``eigenvalues`` define the
+        length of the prediction. In fact, ``eigenvalues`` may contain
+        a duplicated version of the same eigenvalue if this
+        eigenvalue is not supposed to change along
+        the eigenfunction trajectory.
 
-        The T of both ``eigens`` and the returned prediction will be the same, so ``eigens``
-        dictate the length of the prediction. Note that ``eigens`` can be
-        represented by just one T-times repeated value.
+        The data must be formatted as [T, C], where T and C are the number of timesteps and channels, respectively.
         """
 
         # prepare the powers of a rotation matrix
-        a = utils.rotation_powers(transposed=True)
+        a = utils.rotation_powers(blocks_n=self.config['osc_n'], transposed=True)
 
-        # predict the given coordinates with the help of matrix powers
+        # predict the given eigenfunction into the future with the help of matrix powers
         #
         # note that matrix multiplication A @ x is performed here in a transposed manner, i.e. xT @ AT
         dt = self.config['timestep']
-        coords_pred = torch.cat([torch.matmul(coord_first, a.next(w * dt)) for w in eigens])
+        eigenfunc_pred = torch.cat([torch.matmul(eigenfunction, a.next(w * dt)) for w in eigenvalues])
 
         # for now, do not return the last predicted element, as this one predicts into the future,
         # and we need to arrange our data accordingly to be able to check the future
-        return torch.cat([coord_first, coords_pred[:-1]])
+        return torch.cat([eigenfunction, eigenfunc_pred[:-1]])
 
-    def fit(self, timeseries_batch: torch.Tensor) -> torch.Tensor:
+    def fit(self, timeseries: torch.Tensor) -> torch.Tensor:
         """
-        Fits internal neural networks to the given ``timeseries_batch``. The batch must be formatted
+        Fits internal neural networks to the given ``timeseries``. The ``timeseries`` must be formatted
         as [B, T, C], where B, T and C are the number of batch elements, time steps and
         data channels, respectively. The method returns a mean square error loss,
         which is meant to be used by an external optimization loop.
         """
 
-        # encode and decode the input batch of timeseries
-        coords_batch = self.autoencoder.encoder(timeseries_batch)
-        timeseries_o_batch = self.autoencoder.decoder(coords_batch)
+        # reconstruct timeseries
+        eigenfuncs = self.decomposer(timeseries)
+        timeseries_recon = self.reconstructor(eigenfuncs)
 
-        # calculate coding/decoding loss
-        criterion_timeseries = torch.nn.MSELoss()
-        loss_timeseries = criterion_timeseries(timeseries_o_batch, timeseries_batch)
+        # calculate reconstruction loss
+        criterion_recon = torch.nn.MSELoss()
+        loss_recon = criterion_recon(timeseries_recon, timeseries)
 
-        # based on radially symmetric coordinates, derive the corresponding eigenvalues
-        eigens_batch = self.eigenvalues(coords_batch)
+        # extract dynamic modes from eigenfunctions
+        eigenvalues = torch.stack([self.dynamics(eigenfunc) for eigenfunc in eigenfuncs], dim=0)
 
-        # with the help of derived eigenvalues predict coordinates in a linear manner
-        #
-        # stack predicted coordinates along a new dimension 0,
-        # thus effectively restoring the structure of the given batch
-        coords_o_batch = torch.stack(
-            [self.predict_impl(coords[torch.newaxis, 0], eigens) for coords, eigens in zip(coords_batch, eigens_batch)], dim=0)
+        # with the help of derived eigenvalues predict eigenfunctions in a linear manner
+        eigenfuncs_pred = torch.stack(
+            [self.predict_impl(
+                eigenfunc[torch.newaxis, 0], eigenvalue) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)], dim=0)
 
         # calculate prediction loss
         criterion_pred = torch.nn.MSELoss()
-        loss_pred = criterion_pred(coords_o_batch, coords_batch)
+        loss_pred = criterion_pred(eigenfuncs_pred, eigenfuncs)
 
         # L2 weight regularization
         loss_reg = torch.sum(
@@ -88,26 +94,30 @@ class dmd:
                 [torch.square(param.view(-1)) for param in self.parameters()]))
 
         # return the sum of all losses
-        return loss_timeseries + loss_pred + self.config['loss_reg_l2']*loss_reg
+        return loss_recon + loss_pred + self.config['loss_reg_l2']*loss_reg
 
-    def predict(self, timeseries_start: torch.Tensor, prediction_steps_n: int) -> torch.Tensor:
+    def predict(self, timeseries: torch.Tensor, horizon: int) -> torch.Tensor:
         """
-        Based on the starting value of timeseries ``timeseries_start``, predicts a number of steps
-        into the future given by ``prediction_steps_n``. The starting timeseries isexpected
-        to be formatted as [1, C], where C is the number of data channels.
+        Based on an initial state of ``timeseries``, predicts a number of steps into the future given
+        by ``horizon``. The ``timeseries`` are expected to be formatted
+        as [1, C], where C is the number of data channels.
         """
-        coord = self.autoencoder.encoder(timeseries_start)
 
-        # transform the first coordinate into an eigenvalue and
-        # repeat this eigenvalue to cover all prediction length
-        eigens = self.eigenvalues(coord).expand(prediction_steps_n, -1)
+        # first, decompose timeseries into corresponding eigenfunctions
+        eigenfuncs = self.decomposer(timeseries)
 
-        coords_pred = self.predict_impl(coord, eigens)
-        return self.autoencoder.decoder(coords_pred)
+        # find dynamic modes of decomposed eigenfunctions and
+        # duplicate these modes (eigenvalues) to cover all prediction horizon,
+        # yes, it is assumed that eigenvalues do not change along a state trajectory
+        eigenvalues = self.dynamics(eigenfuncs).expand(horizon, -1)
+
+        # predict an eigenfunction into the future and reconstruct it back into timeseries
+        eigenfuncs_pred = self.predict_impl(eigenfuncs, eigenvalues)
+        return self.reconstructor(eigenfuncs_pred)
 
     def parameters(self):
-        """Returns the parameters of the internal neural networks."""
+        """Returns the parameters of internal neural networks."""
         params = []
-        modules = self.autoencoder, self.eigenvalues
+        modules = self.decomposer, self.reconstructor, self.dynamics
         for module in modules: params.extend(list(module.parameters()))
         return params
