@@ -21,11 +21,35 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     return torch.reshape(data, (datachunks_n, datachunk_len, data.shape[1]))
 
 
+class topk(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.k = 2
+        self.postact_func = torch.nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        """
+
+        features_dim = -1
+        features_n = 2
+        features_i = range(features_n)
+        x_i = torch.tensor(features_i).expand_as(x[..., :features_n])
+
+        features = torch.gather(x, features_dim, x_i)
+        features = self.postact_func(features)
+
+        filtered = torch.zeros_like(x)
+        filtered.scatter_(features_dim, x_i, features)
+
+        return filtered
+
+
 # ---------------------------------------------------------------------------*/
 # - fully-connected neural network
 
 class fcnn(torch.nn.Module):
-    def __init__(self, features: list[int] = [1, 16 , 1], activation: str = 'relu') -> None:
+    def __init__(self, features: list[int] = [1, 16 , 1], actfunc: str = 'relu', actfunc_out: str = 'linear') -> None:
         """
         Constructs a fully-connected neural network with specified ``features`` and ``activation``.
 
@@ -34,25 +58,26 @@ class fcnn(torch.nn.Module):
         input, the network has one hidden layer with 16 neurons, and the
         network produces a one-dimensional output.
 
-        The ``activation`` is a string name for activation functions, e.g. a string 'relu'
+        The ``actfunc`` is a string name for activation functions, e.g. a string 'relu'
         translates into the torch class torch.nn.ReLU. The network will have one
-        single ``activation`` everywhere, except for the output layer - this
-        one is a simple identity, or 'linear'. Currently supported string
-        names are:
+        single ``actfunc`` everywhere, except for the output layer - this
+        one can be specified using ``actfunc_out``. Currently
+        supported activation strings/functions are:
         'relu'    torch.nn.ReLU
         'tanh'    torch.nn.Tanh
         'linear'  torch.nn.Identity
+        'topk'    utilities.topk
         """
         super().__init__()        
 
         # use a helper constant to define the number of hidden layers
         hidden_n = len(features) - 2
 
-        # assemble a list of activations;
+        # assemble a list of activation functions;
         # note that the number of hidden layers is incremented to accomodate the output layer,
         # so as long as we are counting hidden layers, these are set to user-specified
-        # activation, but when we reach the output layer, it is set to linear
-        activations = [activation if i < hidden_n else 'linear' for i in range(hidden_n + 1)]
+        # activation, but when we reach the output layer, it is set to user-defined string
+        activations = [actfunc if i < hidden_n else actfunc_out for i in range(hidden_n + 1)]
 
         # construct a neural network;
         # note that the bias of all layers, the output included, is set to true
@@ -61,7 +86,7 @@ class fcnn(torch.nn.Module):
                 torch.nn.Linear(i, o, bias=True), self.get_activation_by_name(a)]) for i, o, a in zip(
                     features[:-1], features[1:], activations)])
 
-    def forward(self, x : torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Evaluates this neural network."""
         return self.net(x)
 
@@ -77,6 +102,8 @@ class fcnn(torch.nn.Module):
             a = torch.nn.Tanh
         elif name == 'linear':
             a = torch.nn.Identity
+        elif name == 'topk':
+            a = topk
         else:
             raise ValueError(f'unknown activation function passed: {name}')
         return a()
@@ -87,7 +114,7 @@ class fcnn(torch.nn.Module):
 # - symmetric
 
 class radial_fcnn(fcnn):
-    def forward(self, x : torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         radial_x = torch.sum(torch.square(x), dim=-1, keepdim=True)
         return super().forward(radial_x)
 
@@ -181,6 +208,8 @@ class rotation_powers:
         """
         Returns a rotation matrix that is parameterized by angle ``phi``.
         """
+
+        # fixme: rewrite this piece of code in a more fancier way
         cos = torch.cos(phi)
         sin = torch.sin(phi)
         rot = torch.zeros((2, 2))

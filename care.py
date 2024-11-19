@@ -31,34 +31,7 @@ class dmd:
         self.reconstructor = koop.eigenfunction(data_dims_n, eigenfunc_dims_n, inversed=True)
 
         # finally, create an extractor of dynamic modes from Koopman eigenfunctions
-        self.dynamics = koop.eigenvalue(eigenfunc_dims_n=self.config['osc_n'] * 2)
-
-    def predict_impl(self, eigenfunction: torch.Tensor, eigenvalues: torch.Tensor) -> torch.Tensor:
-        """
-        Predicts the trajectory of an ``eigenfunction`` into the future.
-        The eigenfunctions are supposed to be linear, so the dynamics of a predicted eigenfunction
-        is encoded in a matrix. At each prediction step this matrix is parameterized
-        with a value from ``eigenvalues``. So ``eigenvalues`` define the
-        length of the prediction. In fact, ``eigenvalues`` may contain
-        a duplicated version of the same eigenvalue if this
-        eigenvalue is not supposed to change along
-        the eigenfunction trajectory.
-
-        The data must be formatted as [T, C], where T and C are the number of timesteps and channels, respectively.
-        """
-
-        # prepare the powers of a rotation matrix
-        a = utils.rotation_powers(blocks_n=self.config['osc_n'], transposed=True)
-
-        # predict the given eigenfunction into the future with the help of matrix powers
-        #
-        # note that matrix multiplication A @ x is performed here in a transposed manner, i.e. xT @ AT
-        dt = self.config['timestep']
-        eigenfunc_pred = torch.cat([torch.matmul(eigenfunction, a.next(w * dt)) for w in eigenvalues])
-
-        # for now, do not return the last predicted element, as this one predicts into the future,
-        # and we need to arrange our data accordingly to be able to check the future
-        return torch.cat([eigenfunction, eigenfunc_pred[:-1]])
+        self.dynamics = koop.eigenvalue(eigenfunc_dims_n)
 
     def fit(self, timeseries: torch.Tensor) -> torch.Tensor:
         """
@@ -68,52 +41,136 @@ class dmd:
         which is meant to be used by an external optimization loop.
         """
 
-        # reconstruct timeseries
+        # start by decomposing the given timeseries into eigenfunctions
         eigenfuncs = self.decomposer(timeseries)
-        timeseries_recon = self.reconstructor(eigenfuncs)
 
-        # calculate reconstruction loss
+        # reconstruct timeseries
+        timeseries_recon = self.reconstructor(eigenfuncs)
         criterion_recon = torch.nn.MSELoss()
         loss_recon = criterion_recon(timeseries_recon, timeseries)
 
-        # extract dynamic modes from eigenfunctions
+        # predict eigenfunctions
         eigenvalues = torch.stack([self.dynamics(eigenfunc) for eigenfunc in eigenfuncs], dim=0)
-
-        # with the help of derived eigenvalues predict eigenfunctions in a linear manner
         eigenfuncs_pred = torch.stack(
-            [self.predict_impl(
+            [self._impl_predict_from(
                 eigenfunc[torch.newaxis, 0], eigenvalue) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)], dim=0)
-
-        # calculate prediction loss
         criterion_pred = torch.nn.MSELoss()
         loss_pred = criterion_pred(eigenfuncs_pred, eigenfuncs)
 
-        # L2 weight regularization
-        loss_reg = torch.sum(
+        # a loss for correlation between eigenfunctions
+        #loss_corr = torch.sum(torch.tensor([self._impl_fit_eigenfunc_corr(eigenfunc) for eigenfunc in eigenfuncs]))
+
+        # L1 regularization to promote sparcity
+        #loss_sparcity = torch.sum(
+            #torch.cat(
+                #[torch.abs(param.view(-1)) for param in self._impl_parameters_autoencoder()]))
+
+        # L2 regularization to avoid big weights
+        loss_small = torch.sum(
             torch.cat(
                 [torch.square(param.view(-1)) for param in self.parameters()]))
 
         # return the sum of all losses
-        return loss_recon + loss_pred + self.config['loss_reg_l2']*loss_reg
+        return loss_recon + loss_pred + 1e-10*loss_small# + 1e-6*loss_sparcity
 
-    def predict(self, timeseries: torch.Tensor, horizon: int) -> torch.Tensor:
+    def _impl_fit_eigenfunc_corr(self, eigenfunction: torch.Tensor) -> torch.Tensor:
+
+        # take the first and second dimensions from every radial pair of eigenfunctions
+        x = torch.cat([
+            eigenfunction[:, dim, torch.newaxis] for dim in range(eigenfunction.shape[1]) if dim % 2 == 0], dim=1)
+        y = torch.cat([
+            eigenfunction[:, dim, torch.newaxis] for dim in range(eigenfunction.shape[1]) if dim % 2], dim=1)
+
+        # calculate correlation for x and y eigenfunctions
+        #
+        # each eigenfunction is formatted as [T, 1], so for the sake of computing a correlation
+        # the eigenfunction is transposed
+        #
+        # the lower-left triangle is extracted from the correlation matrix
+        #
+        # the elements of the lower-left triangle are taken as absolute not to spoil their mean
+        xcor = torch.abs(torch.tril(torch.corrcoef(x.T), diagonal=-1))
+        ycor = torch.abs(torch.tril(torch.corrcoef(y.T), diagonal=-1))
+
+        # extract non-zero elements from the triangled version of the correlation matrix and
+        # take the mean of these elements
+        return torch.mean(torch.tensor(
+            [torch.mean(xcor[xcor.nonzero(as_tuple=True)]), torch.mean(ycor[ycor.nonzero(as_tuple=True)])]))
+
+    def predict(self, timeseries: torch.Tensor, horizon: int = 51) -> torch.Tensor:
         """
-        Based on an initial state of ``timeseries``, predicts a number of steps into the future given
-        by ``horizon``. The ``timeseries`` are expected to be formatted
-        as [1, C], where C is the number of data channels.
+        Predicts a batch of ``timeseries`` in a linear manner. The method takes the start of every timeseries in
+        the given batch and predicts it by a number of steps defined by the lengths of these timeseries.
+        Therefore, the ``timeseries`` are expected to be formatted as [B, T, C], where B, T and C
+        are the number of batch elements, time steps and data channels, respectively.
         """
 
-        # first, decompose timeseries into corresponding eigenfunctions
-        eigenfuncs = self.decomposer(timeseries)
+        # take the starting values of the given timeseries while keeping the batch structure
+        timeseries_start = dmd.start_of(timeseries)
+
+        # decompose starting values into corresponding eigenfunctions
+        eigenfuncs = self.decomposer(timeseries_start)
 
         # find dynamic modes of decomposed eigenfunctions and
         # duplicate these modes (eigenvalues) to cover all prediction horizon,
-        # yes, it is assumed that eigenvalues do not change along a state trajectory
-        eigenvalues = self.dynamics(eigenfuncs).expand(horizon, -1)
+        # yes, it is assumed that an eigenvalue do not change along a state trajectory
+        #
+        # keep the batch structure
+        eigenvalues = torch.stack(
+            [self.dynamics(eigenfunc).expand(horizon, -1) for eigenfunc in eigenfuncs])
+
+        # predict an eigenfunction into the future with the help of an eigenvalue
+        eigenfuncs_pred = torch.stack([
+            self._impl_predict_from(eigenfunc, eigenvalue) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)])
+
+        # reconstruct a predicted eigenfunction back into timeseries
+        return self.reconstructor(eigenfuncs_pred)
+
+    def predict_from(self, start: torch.Tensor, horizon: int) -> torch.Tensor:
+        """
+        Predicts a timeseries starting from a ``start`` position and into the future for a
+        number of time steps specified by ``horizon``. The ``start`` must be formatted
+        as [1, C], where C is the number of data channels.
+        """
+
+        # sample an eigenfunction at the given initial condition
+        eigenfunc = self.decomposer(start)
+
+        # find the dynamic mode of the decomposed eigenfunction and
+        # duplicate this mode (eigenvalue) to cover all prediction horizon,
+        # yes, it is assumed that an eigenvalue does not change along a state trajectory
+        eigenvalue = self.dynamics(eigenfunc).expand(horizon, -1)
 
         # predict an eigenfunction into the future and reconstruct it back into timeseries
-        eigenfuncs_pred = self.predict_impl(eigenfuncs, eigenvalues)
-        return self.reconstructor(eigenfuncs_pred)
+        #
+        # note that reconstruction interface expects batches, so we need to insert a
+        # singleton dimension at the first dimension by unsqueezing
+        return self.reconstructor(torch.unsqueeze(
+            self._impl_predict_from(eigenfunc, eigenvalue), dim=0))
+
+    def _impl_predict_from(self, start: torch.Tensor, eigenvalue: torch.Tensor) -> torch.Tensor:
+        """
+        Predicts an eigenfunction starting from the ``start`` of the eigenfunction and into the future. The
+        number of predicted steps is defined by the length of ``eigenvalue`` vector. Note that
+        ``eigenvalue`` can also be filled with the same value, thus promoting the
+        invariance of an eigenvalue along a trajectory.
+
+        Accordingly, the ``start``of an eigenfunction must be formatted as [1, C], whereas ``eigenvalue`` as
+        [T, C]. Here, T and C are the number of time steps and data channels, respectively.
+        """
+
+        # prepare the powers of a rotation matrix
+        a = utils.rotation_powers(blocks_n=self.config['osc_n'], transposed=True)
+
+        # predict the given eigenfunction from its starting value into the future with the help of matrix powers
+        #
+        # note that matrix multiplication A @ x is performed here in a transposed manner, i.e. xT @ AT
+        t = self.config['timestep']
+        eigenfunc = torch.cat([torch.matmul(start, a.next(omega * t)) for omega in eigenvalue])
+
+        # for now, do not return the last predicted element, as this one predicts into the future,
+        # and we need to arrange our data accordingly to be able to check the future
+        return torch.cat([start, eigenfunc[:-1]])
 
     def parameters(self):
         """Returns the parameters of internal neural networks."""
@@ -121,3 +178,18 @@ class dmd:
         modules = self.decomposer, self.reconstructor, self.dynamics
         for module in modules: params.extend(list(module.parameters()))
         return params
+
+    def _impl_parameters_autoencoder(self):
+        params = []
+        nets = self.decomposer, self.reconstructor
+        for net in nets: params.extend(list(net.parameters()))
+        return params
+
+    @staticmethod
+    def start_of(timeseries: torch.Tensor) -> torch.Tensor:
+        """
+        Returns the start of every timeseries inside a batch ``timeseries``. Consequently, ``timeseries``
+        are expected to be formatted as [B, T, C], where B, T and C are the number of
+        batch elements, time steps and data channels, respectively.
+        """
+        return torch.stack([ts[torch.newaxis, 0] for ts in timeseries], dim=0)
