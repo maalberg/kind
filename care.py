@@ -30,8 +30,12 @@ class dmd:
         # that will compose/reconstruct data back to its original state
         self.reconstructor = koop.eigenfunction(data_dims_n, eigenfunc_dims_n, inversed=True)
 
-        # finally, create an extractor of dynamic modes from Koopman eigenfunctions
-        self.dynamics = koop.eigenvalue(eigenfunc_dims_n)
+        # test
+        eigenvalue_ranges = [(0.5, 1.5), (2.5, 3.5)]
+
+        radial_dims_n = 2
+        modes_n = eigenfunc_dims_n/radial_dims_n
+        self.filter = koop.eigenfunction_filter(eigenvalue_ranges)
 
     def fit(self, timeseries: torch.Tensor) -> torch.Tensor:
         """
@@ -41,8 +45,11 @@ class dmd:
         which is meant to be used by an external optimization loop.
         """
 
-        # start by decomposing the given timeseries into eigenfunctions
+        # decompose timeseries into eigenfunctions
         eigenfuncs = self.decomposer(timeseries)
+
+        # filter decomposed eigenfunctions based on expected eigenvalues (frequencies)
+        eigenfuncs, eigenvalues = self.filter(eigenfuncs)
 
         # reconstruct timeseries
         timeseries_recon = self.reconstructor(eigenfuncs)
@@ -50,7 +57,6 @@ class dmd:
         loss_recon = criterion_recon(timeseries_recon, timeseries)
 
         # predict eigenfunctions
-        eigenvalues = torch.stack([self.dynamics(eigenfunc) for eigenfunc in eigenfuncs], dim=0)
         eigenfuncs_pred = torch.stack(
             [self._impl_predict_from(
                 eigenfunc[torch.newaxis, 0], eigenvalue) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)], dim=0)
@@ -61,17 +67,17 @@ class dmd:
         #loss_corr = torch.sum(torch.tensor([self._impl_fit_eigenfunc_corr(eigenfunc) for eigenfunc in eigenfuncs]))
 
         # L1 regularization to promote sparcity
-        #loss_sparcity = torch.sum(
-            #torch.cat(
-                #[torch.abs(param.view(-1)) for param in self._impl_parameters_autoencoder()]))
+        loss_sparcity = torch.sum(
+            torch.cat(
+                [torch.abs(param.view(-1)) for param in self._impl_parameters_autoencoder()]))
 
         # L2 regularization to avoid big weights
-        loss_small = torch.sum(
-            torch.cat(
-                [torch.square(param.view(-1)) for param in self.parameters()]))
+        #loss_small = torch.sum(
+            #torch.cat(
+                #[torch.square(param.view(-1)) for param in self.parameters()]))
 
         # return the sum of all losses
-        return loss_recon + loss_pred + 1e-10*loss_small# + 1e-6*loss_sparcity
+        return 1e-3*loss_recon + loss_pred + 1e-9*loss_sparcity# + 1e-10*loss_small
 
     def _impl_fit_eigenfunc_corr(self, eigenfunction: torch.Tensor) -> torch.Tensor:
 
@@ -106,7 +112,7 @@ class dmd:
         """
 
         # take the starting values of the given timeseries while keeping the batch structure
-        timeseries_start = dmd.start_of(timeseries)
+        timeseries_start = self.start_of(timeseries)
 
         # decompose starting values into corresponding eigenfunctions
         eigenfuncs = self.decomposer(timeseries_start)
@@ -117,7 +123,10 @@ class dmd:
         #
         # keep the batch structure
         eigenvalues = torch.stack(
-            [self.dynamics(eigenfunc).expand(horizon, -1) for eigenfunc in eigenfuncs])
+            [self.filter.get_eigenvalue(eigenfunc).expand(horizon, -1) for eigenfunc in eigenfuncs], dim=0)
+
+        eigenfuncs = torch.stack(
+            [self.filter.filter_eigenfunction(eigenfunc, eigenvalue[torch.newaxis, 0]) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)], dim=0)
 
         # predict an eigenfunction into the future with the help of an eigenvalue
         eigenfuncs_pred = torch.stack([
@@ -175,7 +184,7 @@ class dmd:
     def parameters(self):
         """Returns the parameters of internal neural networks."""
         params = []
-        modules = self.decomposer, self.reconstructor, self.dynamics
+        modules = self.decomposer, self.reconstructor, self.filter
         for module in modules: params.extend(list(module.parameters()))
         return params
 

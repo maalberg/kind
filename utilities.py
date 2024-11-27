@@ -21,28 +21,63 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     return torch.reshape(data, (datachunks_n, datachunk_len, data.shape[1]))
 
 
-class topk(torch.nn.Module):
+class fourier_feature_map:
+    def __init__(self, data_dims_n: int = 1, feature_spec: tuple[float, float] = (0., 1.), feature_dims_n: int = 1) -> None:
+
+        feature_mean, feature_std = feature_spec
+        self.map = feature_mean + feature_std * torch.randn(data_dims_n, feature_dims_n)
+
+    def __call__(self, data: torch.Tensor) -> torch.Tensor:
+
+        mapped = torch.stack([
+            self._impl_map(timeseries) for timeseries in data], dim=0)
+
+        return mapped
+
+    def _impl_map(self, timeseries: torch.Tensor) -> torch.Tensor:
+        x = timeseries @ self.map
+        x = 2 * torch.pi * x
+        return torch.cat([torch.sin(x), torch.cos(x)], dim=1)
+
+
+# ---------------------------------------------------------------------------*/
+# - activation function to prune features
+
+class feature_prune(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.k = 2
-        self.postact_func = torch.nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.k = 3
+
+    def forward(self, data: torch.Tensor) -> torch.Tensor:
         """
+        Prunes features in ``data`` to leave only a certain number of features requested by the user.
+        The pruned features are set to zero.
+
+        NB! There is no additional activation function, e.g. ReLU or TanH, applied to pruned features.
         """
 
         features_dim = -1
-        features_n = 2
+        features_n = self.k * 2
+
+        # determine the indices of preserved features
+        #
+        # based on a user-defined number, preserved features start from the beginning of the feature space
         features_i = range(features_n)
-        x_i = torch.tensor(features_i).expand_as(x[..., :features_n])
 
-        features = torch.gather(x, features_dim, x_i)
-        features = self.postact_func(features)
+        # expand the indices of preserved features according to the dimensions of data
+        #
+        # indices are expanded to the size of a data portion that is going to be extracted/preserved
+        data_i = torch.tensor(features_i).expand_as(data[..., :features_n])
 
-        filtered = torch.zeros_like(x)
-        filtered.scatter_(features_dim, x_i, features)
+        # extract features from data
+        features = torch.gather(data, features_dim, data_i)
 
-        return filtered
+        # recreate input data with pruned features set to zero
+        pruned = torch.zeros_like(data)
+        pruned.scatter_(features_dim, data_i, features)
+
+        return pruned
 
 
 # ---------------------------------------------------------------------------*/
@@ -66,7 +101,7 @@ class fcnn(torch.nn.Module):
         'relu'    torch.nn.ReLU
         'tanh'    torch.nn.Tanh
         'linear'  torch.nn.Identity
-        'topk'    utilities.topk
+        'prune'   utilities.feature_prune
         """
         super().__init__()        
 
@@ -86,9 +121,9 @@ class fcnn(torch.nn.Module):
                 torch.nn.Linear(i, o, bias=True), self.get_activation_by_name(a)]) for i, o, a in zip(
                     features[:-1], features[1:], activations)])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Evaluates this neural network."""
-        return self.net(x)
+    def forward(self, data: torch.Tensor) -> torch.Tensor:
+        """Evaluates this neural network on ``data``."""
+        return self.net(data)
 
     @staticmethod
     def get_activation_by_name(name: str):
@@ -102,8 +137,8 @@ class fcnn(torch.nn.Module):
             a = torch.nn.Tanh
         elif name == 'linear':
             a = torch.nn.Identity
-        elif name == 'topk':
-            a = topk
+        elif name == 'prune':
+            a = feature_prune
         else:
             raise ValueError(f'unknown activation function passed: {name}')
         return a()
