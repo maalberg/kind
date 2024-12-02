@@ -30,12 +30,8 @@ class dmd:
         # that will compose/reconstruct data back to its original state
         self.reconstructor = koop.eigenfunction(data_dims_n, eigenfunc_dims_n, inversed=True)
 
-        # test
-        eigenvalue_ranges = [(0.5, 1.5), (2.5, 3.5)]
-
-        radial_dims_n = 2
-        modes_n = eigenfunc_dims_n/radial_dims_n
-        self.filter = koop.eigenfunction_filter(eigenvalue_ranges)
+        # create a neural network that will derive dynamics from the decomposed eigenfunctions
+        self.dynamics = koop.eigenvalue(eigenfunc_dims_n)
 
     def fit(self, timeseries: torch.Tensor) -> torch.Tensor:
         """
@@ -48,60 +44,94 @@ class dmd:
         # decompose timeseries into eigenfunctions
         eigenfuncs = self.decomposer(timeseries)
 
-        # filter decomposed eigenfunctions based on expected eigenvalues (frequencies)
-        eigenfuncs, eigenvalues = self.filter(eigenfuncs)
+        # get eigenvalues from eigenfunctions
+        eigenvalues = torch.stack([
+            self.dynamics(eigenfunc) for eigenfunc in eigenfuncs], dim=0)
 
-        # reconstruct timeseries
-        timeseries_recon = self.reconstructor(eigenfuncs)
-        criterion_recon = torch.nn.MSELoss()
-        loss_recon = criterion_recon(timeseries_recon, timeseries)
+        #eigenfuncs = torch.stack([
+            #self._impl_filter_eigenfunc(eigenfunc, eigenvalue) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)], dim=0)
 
         # predict eigenfunctions
         eigenfuncs_pred = torch.stack(
             [self._impl_predict_from(
                 eigenfunc[torch.newaxis, 0], eigenvalue) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)], dim=0)
+
+        # reconstruct timeseries
+        timeseries_recon = self.reconstructor(eigenfuncs_pred)
+
+        # frequency loss
+        freq_target = torch.randn_like(eigenvalues)
+        freq_target[:, :, 0] = freq_target[:, :, 0] * 0.5 + 1.0
+        freq_target[:, :, 1] = freq_target[:, :, 1] * 0.5 + 10.0
+        freq_criterion = torch.nn.MSELoss()
+        loss_freq = freq_criterion(eigenvalues, freq_target)
+
+        # prediction loss
         criterion_pred = torch.nn.MSELoss()
         loss_pred = criterion_pred(eigenfuncs_pred, eigenfuncs)
 
-        # a loss for correlation between eigenfunctions
-        #loss_corr = torch.sum(torch.tensor([self._impl_fit_eigenfunc_corr(eigenfunc) for eigenfunc in eigenfuncs]))
+        # reconstruction loss
+        criterion_recon = torch.nn.MSELoss()
+        loss_recon = criterion_recon(timeseries_recon, timeseries)
 
         # L1 regularization to promote sparcity
-        loss_sparcity = torch.sum(
-            torch.cat(
-                [torch.abs(param.view(-1)) for param in self._impl_parameters_autoencoder()]))
+        #loss_sparcity = torch.sum(
+            #torch.cat(
+                #[torch.abs(param.view(-1)) for param in self._impl_parameters_autoencoder()]))
 
         # L2 regularization to avoid big weights
-        #loss_small = torch.sum(
-            #torch.cat(
-                #[torch.square(param.view(-1)) for param in self.parameters()]))
+        loss_small = torch.sum(
+            torch.cat(
+                [torch.square(param.view(-1)) for param in self.parameters()]))
 
         # return the sum of all losses
-        return 1e-3*loss_recon + loss_pred + 1e-9*loss_sparcity# + 1e-10*loss_small
+        return loss_recon + loss_pred + 1e-1*loss_freq + 1e-8*loss_small
 
-    def _impl_fit_eigenfunc_corr(self, eigenfunction: torch.Tensor) -> torch.Tensor:
+    def _impl_filter_eigenfunc(self, eigenfunc: torch.Tensor, eigenvalue: torch.Tensor) -> torch.Tensor:
+        eigenvalues = torch.split(eigenvalue, 1, dim=1)
+        eigenfuncs = torch.split(eigenfunc, 2, dim=1)
+        zerofunc = torch.zeros_like(eigenfuncs[0])
 
-        # take the first and second dimensions from every radial pair of eigenfunctions
-        x = torch.cat([
-            eigenfunction[:, dim, torch.newaxis] for dim in range(eigenfunction.shape[1]) if dim % 2 == 0], dim=1)
-        y = torch.cat([
-            eigenfunction[:, dim, torch.newaxis] for dim in range(eigenfunction.shape[1]) if dim % 2], dim=1)
+        eigenvalues_unique = self._impl_find_unique(eigenvalues)
+        return torch.cat([
+            torch.where(is_unique, eigenfunc, zerofunc) for eigenfunc, is_unique in zip(eigenfuncs, eigenvalues_unique)], dim=1)
 
-        # calculate correlation for x and y eigenfunctions
-        #
-        # each eigenfunction is formatted as [T, 1], so for the sake of computing a correlation
-        # the eigenfunction is transposed
-        #
-        # the lower-left triangle is extracted from the correlation matrix
-        #
-        # the elements of the lower-left triangle are taken as absolute not to spoil their mean
-        xcor = torch.abs(torch.tril(torch.corrcoef(x.T), diagonal=-1))
-        ycor = torch.abs(torch.tril(torch.corrcoef(y.T), diagonal=-1))
+    def _impl_find_unique(self, eigenvalues: tuple[torch.Tensor]) -> list[int]:
+        a = torch.abs(torch.tensor([eigenvalues[0][0, 0], eigenvalues[1][0, 0]]))
+        #print(a)
 
-        # extract non-zero elements from the triangled version of the correlation matrix and
-        # take the mean of these elements
-        return torch.mean(torch.tensor(
-            [torch.mean(xcor[xcor.nonzero(as_tuple=True)]), torch.mean(ycor[ycor.nonzero(as_tuple=True)])]))
+        thr = 0.1
+
+        # 1.
+        a_sorted, a_indices = torch.sort(a)
+        #print(a_sorted)
+        #print(a_indices)
+
+        # 2.
+        unique_mask = torch.zeros(a.shape, dtype=bool)
+        unique_mask[:1] = True
+        #print(unique_mask)
+
+        # 3.
+        diff = a_sorted[1:] - a_sorted[:-1]
+        #print(diff)
+
+        # 4.
+        unique_mask[1:] = diff > thr
+        #print(unique_mask)
+
+        # 5.
+        unique_elem = a_sorted[unique_mask]
+        #print(unique_elem)
+        unique_indices = a_indices[unique_mask]
+        #print(unique_indices)
+
+        # 6.
+        a_unique_mask = torch.zeros(a.shape, dtype=bool)
+        for i in unique_indices: a_unique_mask[i] = True
+        #print(a_unique_mask)
+
+        return a_unique_mask
 
     def predict(self, timeseries: torch.Tensor, horizon: int = 51) -> torch.Tensor:
         """
@@ -123,10 +153,7 @@ class dmd:
         #
         # keep the batch structure
         eigenvalues = torch.stack(
-            [self.filter.get_eigenvalue(eigenfunc).expand(horizon, -1) for eigenfunc in eigenfuncs], dim=0)
-
-        eigenfuncs = torch.stack(
-            [self.filter.filter_eigenfunction(eigenfunc, eigenvalue[torch.newaxis, 0]) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)], dim=0)
+            [self.dynamics(eigenfunc).expand(horizon, -1) for eigenfunc in eigenfuncs], dim=0)
 
         # predict an eigenfunction into the future with the help of an eigenvalue
         eigenfuncs_pred = torch.stack([
@@ -157,14 +184,14 @@ class dmd:
         return self.reconstructor(torch.unsqueeze(
             self._impl_predict_from(eigenfunc, eigenvalue), dim=0))
 
-    def _impl_predict_from(self, start: torch.Tensor, eigenvalue: torch.Tensor) -> torch.Tensor:
+    def _impl_predict_from(self, eigenfunc_start: torch.Tensor, eigenvalue: torch.Tensor) -> torch.Tensor:
         """
-        Predicts an eigenfunction starting from the ``start`` of the eigenfunction and into the future. The
+        Predicts an eigenfunction starting from the ``eigenfunc_start`` of the eigenfunction and into the future. The
         number of predicted steps is defined by the length of ``eigenvalue`` vector. Note that
         ``eigenvalue`` can also be filled with the same value, thus promoting the
         invariance of an eigenvalue along a trajectory.
 
-        Accordingly, the ``start``of an eigenfunction must be formatted as [1, C], whereas ``eigenvalue`` as
+        Accordingly, the ``eigenfunc_start`` of an eigenfunction must be formatted as [1, C], whereas ``eigenvalue`` as
         [T, C]. Here, T and C are the number of time steps and data channels, respectively.
         """
 
@@ -175,16 +202,16 @@ class dmd:
         #
         # note that matrix multiplication A @ x is performed here in a transposed manner, i.e. xT @ AT
         t = self.config['timestep']
-        eigenfunc = torch.cat([torch.matmul(start, a.next(omega * t)) for omega in eigenvalue])
+        eigenfunc = torch.cat([torch.matmul(eigenfunc_start, a.next(omega * t)) for omega in eigenvalue])
 
         # for now, do not return the last predicted element, as this one predicts into the future,
         # and we need to arrange our data accordingly to be able to check the future
-        return torch.cat([start, eigenfunc[:-1]])
+        return torch.cat([eigenfunc_start, eigenfunc[:-1]])
 
     def parameters(self):
         """Returns the parameters of internal neural networks."""
         params = []
-        modules = self.decomposer, self.reconstructor, self.filter
+        modules = self.decomposer, self.reconstructor, self.dynamics
         for module in modules: params.extend(list(module.parameters()))
         return params
 
