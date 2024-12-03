@@ -6,29 +6,34 @@ import utilities as utils
 # - eigenfunction
 
 class eigenfunction:
-    def __init__(self, data_dims_n: int = 2, eigenfunc_dims_n: int = 2, inversed : bool = False):
+    def __init__(self, timeseries_dims_n: int = 2, eigenfunc_dims_n: int = 2, inversed : bool = False):
         """
-        Constructs a fully-connected neural network that transforms input data into
+        Constructs a fully-connected neural network that transforms input timeseries into
         Koopman eigenfunctions (or vice versa if ``inversed`` is set to True).
         The underlying neural network is parameterized by the number of
-        dimensions in data and eigenfunction, represented by
-        parameters ``data_dims_n`` and ``eigenfunc_dims_n``, respectively.
+        dimensions in timeseries and eigenfunction, represented by
+        parameters ``timeseries_dims_n`` and
+        ``eigenfunc_dims_n``, respectively.
         """
 
         # define the structure of a fully-connected neural network
-        net_features = [data_dims_n, 80, 80, eigenfunc_dims_n]
+        net_features = [timeseries_dims_n, 80, 80, eigenfunc_dims_n]
 
         # create a fully-connected neural network that will learn the transformation from input
         # data to Koopman eigenfunctions
         self.net = utils.fcnn(
             features=net_features if inversed==False else list(reversed(net_features)))
-            #actfunc='relu')
-            #actfunc_out='prune' if inversed==False else 'linear')
 
-    def __call__(self, data: torch.Tensor) -> torch.Tensor:
-        return self.net(data)
+    def __call__(self, timeseries: torch.Tensor) -> torch.Tensor:
+        """
+        Decomposes ``timeseries`` into eigenfunctions. Input ``timeseries`` are expected
+        to be formatted as [B, T, C], where B, T, and C are the number of
+        batches, time steps and data channels, respectively.
+        """
+        return self.net(timeseries)
 
     def parameters(self):
+        """Returns the parameters of internal neural networks."""
         return self.net.parameters()
 
 
@@ -70,10 +75,18 @@ class eigenvalue:
             net(self.constrain_rad(eigenfunc)) for net, eigenfunc in zip(self.nets, eigenfuncs_rad)], dim=1)
 
     def parameters(self):
+        """Returns the parameters of internal neural networks."""
         params = []
         for net in self.nets: params.extend(list(net.parameters()))
         return params
 
     @staticmethod
-    def constrain_rad(eigenfunc: torch.Tensor) -> torch.Tensor:
-        return torch.sum(torch.square(eigenfunc), dim=1, keepdim=True)
+    def constrain_rad(eigenfunction: torch.Tensor) -> torch.Tensor:
+        """
+        Constrains an ``eigenfunction`` by its radius. The ``eigenfunction`` is expected
+        to be two-dimensional, in this case it is constrained as z1^2 + z2^2.
+        Thus, ``eigenfunction`` is expected to be formatted as [T, 2],
+        and the method yields an output formatted as [T, 1],
+        where T is the number of time steps.
+        """
+        return torch.sum(torch.square(eigenfunction), dim=1, keepdim=True)

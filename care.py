@@ -14,7 +14,7 @@ class dmd:
     """
     def __init__(self, configuration: dict) -> None:
         """
-        Construct an instance of dynamic mode decomposition based on the given ``configuration``.
+        Constructs an instance of a dynamic mode decomposition based on the given ``configuration``.
         The configuration is a dictionary with key-value pairs.
         """
         self.config = configuration
@@ -48,9 +48,6 @@ class dmd:
         eigenvalues = torch.stack([
             self.dynamics(eigenfunc) for eigenfunc in eigenfuncs], dim=0)
 
-        #eigenfuncs = torch.stack([
-            #self._impl_filter_eigenfunc(eigenfunc, eigenvalue) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)], dim=0)
-
         # predict eigenfunctions
         eigenfuncs_pred = torch.stack(
             [self._impl_predict_from(
@@ -74,11 +71,6 @@ class dmd:
         criterion_recon = torch.nn.MSELoss()
         loss_recon = criterion_recon(timeseries_recon, timeseries)
 
-        # L1 regularization to promote sparcity
-        #loss_sparcity = torch.sum(
-            #torch.cat(
-                #[torch.abs(param.view(-1)) for param in self._impl_parameters_autoencoder()]))
-
         # L2 regularization to avoid big weights
         loss_small = torch.sum(
             torch.cat(
@@ -87,58 +79,12 @@ class dmd:
         # return the sum of all losses
         return loss_recon + loss_pred + 1e-1*loss_freq + 1e-8*loss_small
 
-    def _impl_filter_eigenfunc(self, eigenfunc: torch.Tensor, eigenvalue: torch.Tensor) -> torch.Tensor:
-        eigenvalues = torch.split(eigenvalue, 1, dim=1)
-        eigenfuncs = torch.split(eigenfunc, 2, dim=1)
-        zerofunc = torch.zeros_like(eigenfuncs[0])
-
-        eigenvalues_unique = self._impl_find_unique(eigenvalues)
-        return torch.cat([
-            torch.where(is_unique, eigenfunc, zerofunc) for eigenfunc, is_unique in zip(eigenfuncs, eigenvalues_unique)], dim=1)
-
-    def _impl_find_unique(self, eigenvalues: tuple[torch.Tensor]) -> list[int]:
-        a = torch.abs(torch.tensor([eigenvalues[0][0, 0], eigenvalues[1][0, 0]]))
-        #print(a)
-
-        thr = 0.1
-
-        # 1.
-        a_sorted, a_indices = torch.sort(a)
-        #print(a_sorted)
-        #print(a_indices)
-
-        # 2.
-        unique_mask = torch.zeros(a.shape, dtype=bool)
-        unique_mask[:1] = True
-        #print(unique_mask)
-
-        # 3.
-        diff = a_sorted[1:] - a_sorted[:-1]
-        #print(diff)
-
-        # 4.
-        unique_mask[1:] = diff > thr
-        #print(unique_mask)
-
-        # 5.
-        unique_elem = a_sorted[unique_mask]
-        #print(unique_elem)
-        unique_indices = a_indices[unique_mask]
-        #print(unique_indices)
-
-        # 6.
-        a_unique_mask = torch.zeros(a.shape, dtype=bool)
-        for i in unique_indices: a_unique_mask[i] = True
-        #print(a_unique_mask)
-
-        return a_unique_mask
-
-    def predict(self, timeseries: torch.Tensor, horizon: int = 51) -> torch.Tensor:
+    def predict(self, timeseries: torch.Tensor, horizon: int) -> torch.Tensor:
         """
-        Predicts a batch of ``timeseries`` in a linear manner. The method takes the start of every timeseries in
-        the given batch and predicts it by a number of steps defined by the lengths of these timeseries.
-        Therefore, the ``timeseries`` are expected to be formatted as [B, T, C], where B, T and C
-        are the number of batch elements, time steps and data channels, respectively.
+        Predicts a batch of ``timeseries`` in a linear manner. The method takes the start of every timeseries
+        in the given batch and predicts it by a number of steps defined by ``horizon``. Therefore,
+        the ``timeseries`` are expected to be formatted as [B, T, C], where B, T and C are
+        the number of batch elements, time steps and data channels, respectively.
         """
 
         # take the starting values of the given timeseries while keeping the batch structure
@@ -215,12 +161,6 @@ class dmd:
         for module in modules: params.extend(list(module.parameters()))
         return params
 
-    def _impl_parameters_autoencoder(self):
-        params = []
-        nets = self.decomposer, self.reconstructor
-        for net in nets: params.extend(list(net.parameters()))
-        return params
-
     @staticmethod
     def start_of(timeseries: torch.Tensor) -> torch.Tensor:
         """
@@ -228,4 +168,4 @@ class dmd:
         are expected to be formatted as [B, T, C], where B, T and C are the number of
         batch elements, time steps and data channels, respectively.
         """
-        return torch.stack([ts[torch.newaxis, 0] for ts in timeseries], dim=0)
+        return torch.stack([datum[torch.newaxis, 0] for datum in timeseries], dim=0)
