@@ -57,11 +57,11 @@ class dmd:
         timeseries_recon = self.reconstructor(eigenfuncs_pred)
 
         # frequency loss
-        freq_target = torch.randn_like(eigenvalues)
-        freq_target[:, :, 0] = freq_target[:, :, 0] * 0.5 + 1.0
-        freq_target[:, :, 1] = freq_target[:, :, 1] * 0.5 + 10.0
-        freq_criterion = torch.nn.MSELoss()
-        loss_freq = freq_criterion(eigenvalues, freq_target)
+        #freq_target = torch.randn_like(eigenvalues)
+        #freq_target[:, :, 0] = freq_target[:, :, 0] * 0.5 + 1.0
+        #freq_target[:, :, 1] = freq_target[:, :, 1] * 0.5 + 10.0
+        #freq_criterion = torch.nn.MSELoss()
+        #loss_freq = freq_criterion(eigenvalues, freq_target)
 
         # prediction loss
         criterion_pred = torch.nn.MSELoss()
@@ -77,7 +77,7 @@ class dmd:
                 [torch.square(param.view(-1)) for param in self.parameters()]))
 
         # return the sum of all losses
-        return loss_recon + loss_pred + 1e-1*loss_freq + 1e-8*loss_small
+        return 1e-2*loss_recon + loss_pred + 1e-8*loss_small# + 1e-1*loss_freq
 
     def predict(self, timeseries: torch.Tensor, horizon: int) -> torch.Tensor:
         """

@@ -216,27 +216,24 @@ class rotation_powers:
         self.rot = torch.block_diag(*[torch.eye(2) for _ in range(blocks_n)])
         self.transposed = transposed
 
-    def next(self, phi: torch.Tensor) -> torch.Tensor:
+    def next(self, eigenvalue: torch.Tensor) -> torch.Tensor:
         """
         Returns the next power of the rotation matrix. The matrix is parameterized
-        by the given ``phi`` angle.
+        by an ``eigenvalue``.
         """
-        self.rot = torch.matmul(self.rot, rotation_powers.build_rotation_blocks(phi))
+        self.rot = torch.matmul(self.rot, self.make_rot_diag(eigenvalue))
         return self.rot if self.transposed == False else torch.transpose(self.rot, 0, 1)
 
     @staticmethod
-    def build_rotation_blocks(phi: torch.Tensor) -> torch.Tensor:
-        return torch.block_diag(*[rotation_powers.build_rotation(a) for a in phi])
+    def make_rot_diag(eigenvalue: torch.Tensor) -> torch.Tensor:
+        return torch.block_diag(*[rotation_powers.make_rotation(angle) for angle in eigenvalue])
 
     @staticmethod
-    def build_rotation(phi: torch.Tensor):
-        """
-        Returns a rotation matrix that is parameterized by angle ``phi``.
-        """
+    def make_rotation(angle: torch.Tensor):
 
-        # fixme: rewrite this piece of code in a more fancier way
-        cos = torch.cos(phi)
-        sin = torch.sin(phi)
+        cos = torch.cos(angle)
+        sin = torch.sin(angle)
+
         rot = torch.zeros((2, 2))
         rot[0,0] = cos
         rot[1,1] = cos
