@@ -77,7 +77,7 @@ class dmd:
                 [torch.square(param.view(-1)) for param in self.parameters()]))
 
         # return the sum of all losses
-        return 1e-2*loss_recon + loss_pred + 1e-8*loss_small# + 1e-1*loss_freq
+        return 1e-2*loss_recon + loss_pred + 1e-8*loss_small# + 1e-3*loss_freq
 
     def predict(self, timeseries: torch.Tensor, horizon: int) -> torch.Tensor:
         """
