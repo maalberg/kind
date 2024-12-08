@@ -15,12 +15,12 @@ class dmd:
     def __init__(self, configuration: dict) -> None:
         """
         Constructs an instance of a dynamic mode decomposition based on the given ``configuration``.
-        The configuration is a dictionary with key-value pairs.
+        The ``configuration`` is a dictionary with key-value pairs.
         """
-        self.config = configuration
+        self.cfg = configuration
 
-        data_dims_n      = self.config['data_ch_n']
-        eigenfunc_dims_n = self.config['osc_n'] * 2
+        data_dims_n      = self.cfg['data_ch_n']
+        eigenfunc_dims_n = len(self.cfg['modes']) * 2
 
         # based on a typical autoencoder framework, create an encoder that will decompose
         # input data into Koopman eigenfunctions
@@ -57,11 +57,11 @@ class dmd:
         timeseries_recon = self.reconstructor(eigenfuncs_pred)
 
         # frequency loss
-        #freq_target = torch.randn_like(eigenvalues)
-        #freq_target[:, :, 0] = freq_target[:, :, 0] * 0.5 + 1.0
-        #freq_target[:, :, 1] = freq_target[:, :, 1] * 0.5 + 10.0
-        #freq_criterion = torch.nn.MSELoss()
-        #loss_freq = freq_criterion(eigenvalues, freq_target)
+        freq_target = torch.randn_like(eigenvalues)
+        for mode in range(eigenvalues.shape[-1]):
+            freq_target[:, :, mode] = freq_target[:, :, mode] * self.cfg['modes'][mode][1] + self.cfg['modes'][mode][0]
+        freq_criterion = torch.nn.MSELoss()
+        loss_freq = freq_criterion(eigenvalues, freq_target)
 
         # prediction loss
         criterion_pred = torch.nn.MSELoss()
@@ -77,7 +77,7 @@ class dmd:
                 [torch.square(param.view(-1)) for param in self.parameters()]))
 
         # return the sum of all losses
-        return 1e-2*loss_recon + loss_pred + 1e-8*loss_small# + 1e-3*loss_freq
+        return self.cfg['loss_hp_recon']*loss_recon + loss_pred + self.cfg['loss_hp_weights_l2']*loss_small + self.cfg['loss_hp_modes']*loss_freq
 
     def predict(self, timeseries: torch.Tensor, horizon: int) -> torch.Tensor:
         """
@@ -142,13 +142,13 @@ class dmd:
         """
 
         # prepare the powers of a rotation matrix
-        a = utils.rotation_powers(blocks_n=self.config['osc_n'], transposed=True)
+        a = utils.rotation_powers(blocks_n=len(self.cfg['modes']), transposed=True)
 
         # predict the given eigenfunction from its starting value into the future with the help of matrix powers
         #
         # note that matrix multiplication A @ x is performed here in a transposed manner, i.e. xT @ AT
-        t = self.config['timestep']
-        eigenfunc = torch.cat([torch.matmul(eigenfunc_start, a.next(omega * t)) for omega in eigenvalue])
+        dt = self.cfg['timestep']
+        eigenfunc = torch.cat([torch.matmul(eigenfunc_start, a.next(omega * dt)) for omega in eigenvalue])
 
         # for now, do not return the last predicted element, as this one predicts into the future,
         # and we need to arrange our data accordingly to be able to check the future

@@ -51,11 +51,14 @@ class eigenvalue:
         # can be described in a two-dimensional space
         self.radial_dims_n = 2
 
+        # right now an eigenvalue has only one property: angular frequency omega
+        self.eigenvalue_props_n = 1
+
         # since an eigenfunction may have more dimensions than 2, a respective number of
         # neural networks is created to process two-dimensional parts
         # of the eigenfunction space in parallel
         nets_n = int(eigenfunc_dims_n / self.radial_dims_n)
-        self.nets = [utils.fcnn(features=[1, 170, 1], actfunc='relu') for _ in range(nets_n)]
+        self.nets = [utils.fcnn(features=[1, 170, self.eigenvalue_props_n], actfunc='relu') for _ in range(nets_n)]
 
     def __call__(self, eigenfunction: torch.Tensor) -> torch.Tensor:
         """
