@@ -17,12 +17,13 @@ class eigenfunction:
         """
 
         # define the structure of a fully-connected neural network
-        net_features = [timeseries_dims_n, 80, 80, eigenfunc_dims_n]
+        net_features = [timeseries_dims_n, 32, 32, eigenfunc_dims_n]
 
         # create a fully-connected neural network that will learn the transformation from input
         # data to Koopman eigenfunctions
         self.net = utils.fcnn(
-            features=net_features if inversed==False else list(reversed(net_features)))
+            features=net_features if inversed==False else list(reversed(net_features)),
+            actfunc='relu')
 
     def __call__(self, timeseries: torch.Tensor) -> torch.Tensor:
         """
@@ -58,7 +59,9 @@ class eigenvalue:
         # neural networks is created to process two-dimensional parts
         # of the eigenfunction space in parallel
         nets_n = int(eigenfunc_dims_n / self.radial_dims_n)
-        self.nets = [utils.fcnn(features=[1, 170, self.eigenvalue_props_n], actfunc='relu') for _ in range(nets_n)]
+        self.nets = [utils.fcnn(
+            features=[1, 128, self.eigenvalue_props_n],
+            actfunc='relu') for _ in range(nets_n)]
 
     def __call__(self, eigenfunction: torch.Tensor) -> torch.Tensor:
         """

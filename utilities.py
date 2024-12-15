@@ -241,3 +241,28 @@ class rotation_powers:
         rot[1,0] = sin
         return rot
 
+
+# ---------------------------------------------------------------------------*/
+# -
+
+class rotation_dynamics:
+    def __init__(self, frequency: torch.Tensor, dt: float) -> None:
+        self.frequency = frequency
+        self.linear = self.linearize(frequency[0, 0] * dt)
+
+    @staticmethod
+    def linearize(eigenvalue: torch.Tensor) -> torch.Tensor:
+        return torch.block_diag(*[rotation_dynamics.make_rotation(angle) for angle in eigenvalue])
+
+    @staticmethod
+    def make_rotation(theta: torch.Tensor) -> torch.Tensor:
+        theta_cos = torch.cos(theta)
+        theta_sin = torch.sin(theta)
+
+        rot = torch.zeros((2, 2))
+        rot[0,0] = theta_cos
+        rot[1,1] = theta_cos
+        rot[0,1] = -theta_sin
+        rot[1,0] = theta_sin
+        return rot
+

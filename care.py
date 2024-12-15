@@ -44,41 +44,62 @@ class dmd:
         # decompose timeseries into eigenfunctions
         eigenfuncs = self.decomposer(timeseries)
 
-        # get eigenvalues from eigenfunctions
-        eigenvalues = torch.stack([
-            self.dynamics(eigenfunc) for eigenfunc in eigenfuncs], dim=0)
+        eigenvalues = torch.stack([self.dynamics(efn) for efn in eigenfuncs], dim=0)
 
         # predict eigenfunctions
+        horizon         = timeseries.shape[1]
+        dt              = self.cfg['timestep']
         eigenfuncs_pred = torch.stack(
             [self._impl_predict_from(
-                eigenfunc[torch.newaxis, 0], eigenvalue) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)], dim=0)
+                efn[torch.newaxis, 0],
+                horizon,
+                utils.rotation_dynamics.linearize(
+                    eva[0] * dt)) for efn, eva in zip(eigenfuncs, eigenvalues)], dim=0)
 
         # reconstruct timeseries
         timeseries_recon = self.reconstructor(eigenfuncs_pred)
 
         # frequency loss
-        freq_target = torch.randn_like(eigenvalues)
-        for mode in range(eigenvalues.shape[-1]):
-            freq_target[:, :, mode] = freq_target[:, :, mode] * self.cfg['modes'][mode][1] + self.cfg['modes'][mode][0]
-        freq_criterion = torch.nn.MSELoss()
-        loss_freq = freq_criterion(eigenvalues, freq_target)
+        #freq_target = torch.ones_like(eigenvalues) * self.cfg['modes'][0]
+        freq_target = torch.cat([
+            torch.randn(
+                eigenvalues.shape[0], 1) * self.cfg['modes'][k][1] + self.cfg['modes'][k][0] for k in range(eigenvalues.shape[-1])], dim=1)
+        #freq_target = torch.randn(eigenvalues.shape[0]) * self.cfg['modes'][0][1] + self.cfg['modes'][0][0]
+        err_mode = torch.mean(torch.square(freq_target - eigenvalues[:, 0, :]))
 
         # prediction loss
-        criterion_pred = torch.nn.MSELoss()
-        loss_pred = criterion_pred(eigenfuncs_pred, eigenfuncs)
+        err_pred = torch.mean(torch.square(eigenfuncs - eigenfuncs_pred))
 
         # reconstruction loss
-        criterion_recon = torch.nn.MSELoss()
-        loss_recon = criterion_recon(timeseries_recon, timeseries)
+        err_recon = torch.mean(torch.square(timeseries - timeseries_recon))
 
         # L2 regularization to avoid big weights
-        loss_small = torch.sum(
+        #err_big_weights = torch.sum(
+            #torch.cat(
+                #[torch.square(param.view(-1)) for param in self.parameters()]))
+
+        # L1 regularization
+        err_sparse_weights = torch.sum(
             torch.cat(
-                [torch.square(param.view(-1)) for param in self.parameters()]))
+                [torch.abs(param.view(-1)) for param in self.parameters()]))
+
+        hp_recon          = self.cfg['loss_hp_recon']
+        hp_pred           = self.cfg['loss_hp_pred']
+        hp_mode           = self.cfg['loss_hp_mode']
+        hp_big_weights    = self.cfg['loss_hp_big_weights']
+        hp_sparse_weights = self.cfg['loss_hp_sparse_weights']
+
+        err_recon          = hp_recon * err_recon
+        err_pred           = hp_pred * err_pred
+        err_mode           = hp_mode * err_mode
+        #err_big_weights    = hp_big_weights * err_big_weights
+        err_sparse_weights = hp_sparse_weights * err_sparse_weights
+
+        loss = err_recon + err_pred + err_mode + err_sparse_weights
 
         # return the sum of all losses
-        return self.cfg['loss_hp_recon']*loss_recon + loss_pred + self.cfg['loss_hp_weights_l2']*loss_small + self.cfg['loss_hp_modes']*loss_freq
-
+        return loss, err_recon, err_pred, err_mode
+        
     def predict(self, timeseries: torch.Tensor, horizon: int) -> torch.Tensor:
         """
         Predicts a batch of ``timeseries`` in a linear manner. The method takes the start of every timeseries
@@ -93,44 +114,40 @@ class dmd:
         # decompose starting values into corresponding eigenfunctions
         eigenfuncs = self.decomposer(timeseries_start)
 
-        # find dynamic modes of decomposed eigenfunctions and
-        # duplicate these modes (eigenvalues) to cover all prediction horizon,
-        # yes, it is assumed that an eigenvalue do not change along a state trajectory
-        #
-        # keep the batch structure
-        eigenvalues = torch.stack(
-            [self.dynamics(eigenfunc).expand(horizon, -1) for eigenfunc in eigenfuncs], dim=0)
+        eigenvalues = torch.stack([self.dynamics(efn) for efn in eigenfuncs], dim=0)
 
         # predict an eigenfunction into the future with the help of an eigenvalue
+        dt = self.cfg['timestep']
         eigenfuncs_pred = torch.stack([
-            self._impl_predict_from(eigenfunc, eigenvalue) for eigenfunc, eigenvalue in zip(eigenfuncs, eigenvalues)])
+            self._impl_predict_from(
+                efn[torch.newaxis, 0],
+                horizon,
+                utils.rotation_dynamics.linearize(eva[0] * dt)) for efn, eva in zip(eigenfuncs, eigenvalues)], dim=0)
 
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfuncs_pred)
 
-    def predict_from(self, start: torch.Tensor, horizon: int) -> torch.Tensor:
-        """
-        Predicts a timeseries starting from a ``start`` position and into the future for a
-        number of time steps specified by ``horizon``. The ``start`` must be formatted
-        as [1, C], where C is the number of data channels.
-        """
+    def _impl_calc_err_lin(self, efn: torch.Tensor, efn_pred: torch.Tensor) -> torch.Tensor:
 
-        # sample an eigenfunction at the given initial condition
-        eigenfunc = self.decomposer(start)
+        norm = 1/(len(efn) - 1)
 
-        # find the dynamic mode of the decomposed eigenfunction and
-        # duplicate this mode (eigenvalue) to cover all prediction horizon,
-        # yes, it is assumed that an eigenvalue does not change along a state trajectory
-        eigenvalue = self.dynamics(eigenfunc).expand(horizon, -1)
+        return norm * torch.sum([
+            torch.mean(torch.square(true - pred), keepdim=True) for true, pred in zip(efn[1:], efn_pred[1:])])
+        
+    def _impl_calc_err_pred(self, ts: torch.Tensor, ts_pred: torch.Tensor) -> torch.Tensor:
 
-        # predict an eigenfunction into the future and reconstruct it back into timeseries
-        #
-        # note that reconstruction interface expects batches, so we need to insert a
-        # singleton dimension at the first dimension by unsqueezing
-        return self.reconstructor(torch.unsqueeze(
-            self._impl_predict_from(eigenfunc, eigenvalue), dim=0))
+        norm = 1.0/len(ts)
 
-    def _impl_predict_from(self, eigenfunc_start: torch.Tensor, eigenvalue: torch.Tensor) -> torch.Tensor:
+        return norm * torch.sum(torch.cat([
+            torch.mean(torch.square(true - pred), dim=0, keepdim=True) for true, pred in zip(ts[1:], ts_pred[1:])]))
+
+    def _impl_linearize(self, efn: torch.Tensor):
+        omega = self.dynamics(efn)
+        dt = self.cfg['timestep']
+
+        return utils.rotation_dynamics(omega, dt)
+
+    def _impl_predict_from(self, efn_start: torch.Tensor, horizon: int, dyn: torch.Tensor) -> torch.Tensor:
         """
         Predicts an eigenfunction starting from the ``eigenfunc_start`` of the eigenfunction and into the future. The
         number of predicted steps is defined by the length of ``eigenvalue`` vector. Note that
@@ -141,18 +158,15 @@ class dmd:
         [T, C]. Here, T and C are the number of time steps and data channels, respectively.
         """
 
-        # prepare the powers of a rotation matrix
-        a = utils.rotation_powers(blocks_n=len(self.cfg['modes']), transposed=True)
+        efn = torch.cat([
+            self._impl_predict_next(efn_start, efn_next_i, dyn) for efn_next_i in range(1, horizon)])
 
-        # predict the given eigenfunction from its starting value into the future with the help of matrix powers
-        #
-        # note that matrix multiplication A @ x is performed here in a transposed manner, i.e. xT @ AT
-        dt = self.cfg['timestep']
-        eigenfunc = torch.cat([torch.matmul(eigenfunc_start, a.next(omega * dt)) for omega in eigenvalue])
+        return torch.cat([efn_start, efn])
 
-        # for now, do not return the last predicted element, as this one predicts into the future,
-        # and we need to arrange our data accordingly to be able to check the future
-        return torch.cat([eigenfunc_start, eigenfunc[:-1]])
+    def _impl_predict_next(self, efn_start: torch.Tensor, efn_next_i: int, dyn: torch.Tensor) -> torch.Tensor:
+            return torch.matmul(
+                efn_start,
+                torch.transpose(torch.linalg.matrix_power(dyn, efn_next_i), 0, 1))
 
     def parameters(self):
         """Returns the parameters of internal neural networks."""
