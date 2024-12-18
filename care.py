@@ -47,7 +47,7 @@ class dmd:
         eigenvalues = torch.stack([self.dynamics(efn) for efn in eigenfuncs], dim=0)
 
         # predict eigenfunctions
-        horizon         = timeseries.shape[1]
+        horizon         = self.cfg['horizon']
         dt              = self.cfg['timestep']
         eigenfuncs_pred = torch.stack(
             [self._impl_predict_from(
@@ -68,10 +68,10 @@ class dmd:
         err_mode = torch.mean(torch.square(freq_target - eigenvalues[:, 0, :]))
 
         # prediction loss
-        err_pred = torch.mean(torch.square(eigenfuncs - eigenfuncs_pred))
+        err_pred = torch.mean(torch.square(eigenfuncs[:, :horizon, :] - eigenfuncs_pred))
 
         # reconstruction loss
-        err_recon = torch.mean(torch.square(timeseries - timeseries_recon))
+        err_recon = torch.mean(torch.square(timeseries[:, :horizon, :] - timeseries_recon))
 
         # L2 regularization to avoid big weights
         #err_big_weights = torch.sum(
