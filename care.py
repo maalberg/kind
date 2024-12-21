@@ -42,41 +42,72 @@ class dmd:
         """
 
         # decompose timeseries into eigenfunctions
+        #
+        # eigenfunctions are shaped as [B, T, C_efn], where C_efn denotes the number of
+        # channels in eigenfunctions, i.e. in the latent space of this autoencoder
         eigenfuncs = self.decomposer(timeseries)
 
+        # derive eigenvalues
+        #
+        # derived eigenvalues are shaped as [B, T, C_eva], where C_eva is equal to C_efn/2,
+        # i.e. a pair of latent space channels builds an eigenvalue
         eigenvalues = torch.stack([self.dynamics(efn) for efn in eigenfuncs], dim=0)
 
-        # predict eigenfunctions
-        horizon         = self.cfg['horizon']
-        dt              = self.cfg['timestep']
-        eigenfuncs_pred = torch.stack(
-            [self._impl_predict_from(
-                efn[torch.newaxis, 0],
-                horizon,
-                utils.rotation_dynamics.linearize(
-                    eva[0] * dt)) for efn, eva in zip(eigenfuncs, eigenvalues)], dim=0)
+        # based on derived eigenvalues, build a rotation matrix for every trajectory
+        #
+        # built matrices are shaped as [B, 2, 2]
+        dt = self.cfg['timestep']
+        matrices = torch.stack([utils.rotation_dynamics.linearize(eva[0] * dt) for eva in eigenvalues], dim=0)
+
+        # raise built matrices to powers covering all horizon
+        #
+        # powered matrices are shaped as [B, H - 1, 2, 2], where H is the number of horizon steps and -1
+        # is because we do not predict the first time step
+        #
+        # note that the rotation matrices are then transposed to allow multiplication with
+        # eigenfunction starting values shaped as rows, i.e. [1, C_efn]
+        horizon = self.cfg['horizon']
+        matpows = torch.stack([
+            torch.transpose(
+                torch.linalg.matrix_power(matrices, h), -2, -1) for h in range(1, horizon)], dim=1)
+
+        # extract the starting values of eigenfunctions
+        #
+        # these starting values are shaped as [B, 1, 1, C_efn] to allow tensor broadcasting when
+        # multiplying by rotation matrices
+        eigenfuncs_start = torch.stack([efn[torch.newaxis, torch.newaxis, 0] for efn in eigenfuncs], dim=0)
+
+        # predict eigenfunctions by multiplying their starting values by powered rotation matrices
+        #
+        # both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, C_efn], i.e.
+        # batches with eigenfunction trajectories consisting of inidividual points [1, C_efn]
+        eigenfuncs_pred = torch.matmul(eigenfuncs_start, matpows)
+
+        # remove singleton dimensions that were needed for the broadcasting of multiplication
+        eigenfuncs_start = torch.squeeze(eigenfuncs_start, 1)
+        eigenfuncs_pred  = torch.squeeze(eigenfuncs_pred, -2)
+
+        eigenfuncs_pred = torch.cat([eigenfuncs_start, eigenfuncs_pred], dim=1)
 
         # reconstruct timeseries
         timeseries_recon = self.reconstructor(eigenfuncs_pred)
 
         # frequency loss
-        #freq_target = torch.ones_like(eigenvalues) * self.cfg['modes'][0]
         freq_target = torch.cat([
             torch.randn(
                 eigenvalues.shape[0], 1) * self.cfg['modes'][k][1] + self.cfg['modes'][k][0] for k in range(eigenvalues.shape[-1])], dim=1)
-        #freq_target = torch.randn(eigenvalues.shape[0]) * self.cfg['modes'][0][1] + self.cfg['modes'][0][0]
         err_mode = torch.mean(torch.square(freq_target - eigenvalues[:, 0, :]))
 
         # prediction loss
-        err_pred = torch.mean(torch.square(eigenfuncs[:, :horizon, :] - eigenfuncs_pred))
+        err_pred = torch.mean(torch.square(eigenfuncs[:, 1:horizon, :] - eigenfuncs_pred[:, 1:horizon, :]))
 
         # reconstruction loss
         err_recon = torch.mean(torch.square(timeseries[:, :horizon, :] - timeseries_recon))
 
         # L2 regularization to avoid big weights
-        #err_big_weights = torch.sum(
-            #torch.cat(
-                #[torch.square(param.view(-1)) for param in self.parameters()]))
+        err_big_weights = torch.sum(
+            torch.cat(
+                [torch.square(param.view(-1)) for param in self.parameters()]))
 
         # L1 regularization
         err_sparse_weights = torch.sum(
@@ -92,10 +123,10 @@ class dmd:
         err_recon          = hp_recon * err_recon
         err_pred           = hp_pred * err_pred
         err_mode           = hp_mode * err_mode
-        #err_big_weights    = hp_big_weights * err_big_weights
+        err_big_weights    = hp_big_weights * err_big_weights
         err_sparse_weights = hp_sparse_weights * err_sparse_weights
 
-        loss = err_recon + err_pred + err_mode + err_sparse_weights
+        loss = err_recon + err_pred + err_mode + err_big_weights + err_sparse_weights
 
         # return the sum of all losses
         return loss, err_recon, err_pred, err_mode
@@ -116,36 +147,32 @@ class dmd:
 
         eigenvalues = torch.stack([self.dynamics(efn) for efn in eigenfuncs], dim=0)
 
-        # predict an eigenfunction into the future with the help of an eigenvalue
         dt = self.cfg['timestep']
-        eigenfuncs_pred = torch.stack([
-            self._impl_predict_from(
-                efn[torch.newaxis, 0],
-                horizon,
-                utils.rotation_dynamics.linearize(eva[0] * dt)) for efn, eva in zip(eigenfuncs, eigenvalues)], dim=0)
+        matrices = torch.stack([utils.rotation_dynamics.linearize(eva[0] * dt) for eva in eigenvalues], dim=0)
+
+        #horizon = self.cfg['horizon']
+        matpows = torch.stack([
+            torch.transpose(
+                torch.linalg.matrix_power(matrices, h), -2, -1) for h in range(1, horizon)], dim=1)
+
+        eigenfuncs_start = torch.unsqueeze(eigenfuncs, 1)
+        eigenfuncs_pred = torch.matmul(eigenfuncs_start, matpows)
+
+        eigenfuncs_start = torch.squeeze(eigenfuncs_start, 1)
+        eigenfuncs_pred  = torch.squeeze(eigenfuncs_pred, -2)
+
+        eigenfuncs_pred = torch.cat([eigenfuncs_start, eigenfuncs_pred], dim=1)
+
+        # predict an eigenfunction into the future with the help of an eigenvalue
+        #dt = self.cfg['timestep']
+        #eigenfuncs_pred = torch.stack([
+            #self._impl_predict_from(
+                #efn[torch.newaxis, 0],
+                #horizon,
+                #utils.rotation_dynamics.linearize(eva[0] * dt)) for efn, eva in zip(eigenfuncs, eigenvalues)], dim=0)
 
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfuncs_pred)
-
-    def _impl_calc_err_lin(self, efn: torch.Tensor, efn_pred: torch.Tensor) -> torch.Tensor:
-
-        norm = 1/(len(efn) - 1)
-
-        return norm * torch.sum([
-            torch.mean(torch.square(true - pred), keepdim=True) for true, pred in zip(efn[1:], efn_pred[1:])])
-        
-    def _impl_calc_err_pred(self, ts: torch.Tensor, ts_pred: torch.Tensor) -> torch.Tensor:
-
-        norm = 1.0/len(ts)
-
-        return norm * torch.sum(torch.cat([
-            torch.mean(torch.square(true - pred), dim=0, keepdim=True) for true, pred in zip(ts[1:], ts_pred[1:])]))
-
-    def _impl_linearize(self, efn: torch.Tensor):
-        omega = self.dynamics(efn)
-        dt = self.cfg['timestep']
-
-        return utils.rotation_dynamics(omega, dt)
 
     def _impl_predict_from(self, efn_start: torch.Tensor, horizon: int, dyn: torch.Tensor) -> torch.Tensor:
         """
