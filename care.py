@@ -51,7 +51,7 @@ class dmd:
         #
         # derived eigenvalues are shaped as [B, T, C_eva], where C_eva is equal to C_efn/2,
         # i.e. a pair of latent space channels builds an eigenvalue
-        eigenvalues = torch.stack([self.dynamics(efn) for efn in eigenfuncs], dim=0)
+        eigenvalues = self.dynamics(eigenfuncs)
 
         # based on derived eigenvalues, build a rotation matrix for every trajectory
         #
@@ -145,7 +145,7 @@ class dmd:
         # decompose starting values into corresponding eigenfunctions
         eigenfuncs = self.decomposer(timeseries_start)
 
-        eigenvalues = torch.stack([self.dynamics(efn) for efn in eigenfuncs], dim=0)
+        eigenvalues = self.dynamics(eigenfuncs)
 
         dt = self.cfg['timestep']
         matrices = torch.stack([utils.rotation_dynamics.linearize(eva[0] * dt) for eva in eigenvalues], dim=0)

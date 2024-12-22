@@ -63,13 +63,15 @@ class eigenvalue:
             features=[1, 128, self.eigenvalue_props_n],
             actfunc='relu') for _ in range(nets_n)]
 
-    def __call__(self, eigenfunction: torch.Tensor) -> torch.Tensor:
+    def __call__(self, eigenfunctions: torch.Tensor) -> torch.Tensor:
         """
-        Transforms a Koopman ``eigenfunction`` into eigenvalue(s).
+        Transforms Koopman ``eigenfunctions`` into eigenvalues. Input ``eigenfunctions`` are expected
+        to be shaped as [B, T, C], where B, T and C are the number of batches, time steps
+        and eigenfunction channels, respectively.
         """
 
         # split an eigenfunction into two-dimensional radial subfunctions
-        eigenfuncs_rad = torch.split(eigenfunction, self.radial_dims_n, dim=1)
+        eigenfuncs_rad = torch.split(eigenfunctions, self.radial_dims_n, dim=2)
 
         # apply a dedicated neural network to each two-dimensional eigenfunction
         #
@@ -78,7 +80,7 @@ class eigenvalue:
         # also note how eigenvalues for each radial eigenfunction are concatenated as columns
         # to the result
         return torch.cat([
-            net(self.constrain_rad(eigenfunc)) for net, eigenfunc in zip(self.nets, eigenfuncs_rad)], dim=1)
+            net(self.constrain_rad(efn)) for net, efn in zip(self.nets, eigenfuncs_rad)], dim=2)
 
     def parameters(self):
         """Returns the parameters of internal neural networks."""
@@ -87,12 +89,10 @@ class eigenvalue:
         return params
 
     @staticmethod
-    def constrain_rad(eigenfunction: torch.Tensor) -> torch.Tensor:
+    def constrain_rad(eigenfunctions: torch.Tensor) -> torch.Tensor:
         """
-        Constrains an ``eigenfunction`` by its radius. The ``eigenfunction`` is expected
-        to be two-dimensional, in this case it is constrained as z1^2 + z2^2.
-        Thus, ``eigenfunction`` is expected to be formatted as [T, 2],
-        and the method yields an output formatted as [T, 1],
-        where T is the number of time steps.
+        Constrains an ``eigenfunction`` by its radius. Input ``eigenfunctions`` are expected
+        to be shaped as [B, T, 2], where B and T are the number of batches and
+        time steps, respectively. Radius is derived from 2 dimensions.
         """
-        return torch.sum(torch.square(eigenfunction), dim=1, keepdim=True)
+        return torch.sum(torch.square(eigenfunctions), dim=-1, keepdim=True)
