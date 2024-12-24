@@ -52,8 +52,8 @@ class eigenvalue:
         # can be described in a two-dimensional space
         self.radial_dims_n = 2
 
-        # right now an eigenvalue has only one property: angular frequency omega
-        self.eigenvalue_props_n = 1
+        # an eigenvalue has two properties: scaling mu and angular frequency omega
+        self.eigenvalue_props_n = 2
 
         # since an eigenfunction may have more dimensions than 2, a respective number of
         # neural networks is created to process two-dimensional parts
@@ -81,6 +81,15 @@ class eigenvalue:
         # to the result
         return torch.cat([
             net(self.constrain_rad(efn)) for net, efn in zip(self.nets, eigenfuncs_rad)], dim=2)
+    
+    def to_rotation_diag(self, eigenvalues: torch.Tensor):
+
+        # split incoming eigenvalues along the last, i.e. channel, dimension
+        evas = torch.split(eigenvalues, self.eigenvalue_props_n, dim=-1)
+
+        return torch.block_diag(*[utils.make_rotation(
+            exponent=eva[0, 0],
+            angle=eva[0, 1]) for eva in evas])
 
     def parameters(self):
         """Returns the parameters of internal neural networks."""

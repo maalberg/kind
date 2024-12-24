@@ -33,6 +33,8 @@ class dmd:
         # create a neural network that will derive dynamics from the decomposed eigenfunctions
         self.dynamics = koop.eigenvalue(eigenfunc_dims_n)
 
+        self._init_err_mode(configuration['batch_size'], configuration['modes'])
+
     def fit(self, timeseries: torch.Tensor) -> torch.Tensor:
         """
         Fits internal neural networks to the given ``timeseries``. The ``timeseries`` must be formatted
@@ -49,15 +51,15 @@ class dmd:
 
         # derive eigenvalues
         #
-        # derived eigenvalues are shaped as [B, T, C_eva], where C_eva is equal to C_efn/2,
-        # i.e. a pair of latent space channels builds an eigenvalue
+        # derived eigenvalues are shaped as [B, T, C_eva], where C_eva denotes the number of
+        # eigenvalues with their properties
         eigenvalues = self.dynamics(eigenfuncs)
 
         # based on derived eigenvalues, build a rotation matrix for every trajectory
         #
         # built matrices are shaped as [B, 2, 2]
         dt = self.cfg['timestep']
-        matrices = torch.stack([utils.rotation_dynamics.linearize(eva[0] * dt) for eva in eigenvalues], dim=0)
+        matrices = torch.stack([self.dynamics.to_rotation_diag(eva[torch.newaxis, 0] * dt) for eva in eigenvalues], dim=0)
 
         # raise built matrices to powers covering all horizon
         #
@@ -92,11 +94,7 @@ class dmd:
         # reconstruct timeseries
         timeseries_recon = self.reconstructor(eigenfuncs_pred)
 
-        # frequency loss
-        freq_target = torch.cat([
-            torch.randn(
-                eigenvalues.shape[0], 1) * self.cfg['modes'][k][1] + self.cfg['modes'][k][0] for k in range(eigenvalues.shape[-1])], dim=1)
-        err_mode = torch.mean(torch.square(freq_target - eigenvalues[:, 0, :]))
+        err_mode = self._calc_err_mode(eigenvalues)
 
         # prediction loss
         err_pred = torch.mean(torch.square(eigenfuncs[:, 1:horizon, :] - eigenfuncs_pred[:, 1:horizon, :]))
@@ -148,9 +146,8 @@ class dmd:
         eigenvalues = self.dynamics(eigenfuncs)
 
         dt = self.cfg['timestep']
-        matrices = torch.stack([utils.rotation_dynamics.linearize(eva[0] * dt) for eva in eigenvalues], dim=0)
+        matrices = torch.stack([self.dynamics.to_rotation_diag(eva[torch.newaxis, 0] * dt) for eva in eigenvalues], dim=0)
 
-        #horizon = self.cfg['horizon']
         matpows = torch.stack([
             torch.transpose(
                 torch.linalg.matrix_power(matrices, h), -2, -1) for h in range(1, horizon)], dim=1)
@@ -163,16 +160,35 @@ class dmd:
 
         eigenfuncs_pred = torch.cat([eigenfuncs_start, eigenfuncs_pred], dim=1)
 
-        # predict an eigenfunction into the future with the help of an eigenvalue
-        #dt = self.cfg['timestep']
-        #eigenfuncs_pred = torch.stack([
-            #self._impl_predict_from(
-                #efn[torch.newaxis, 0],
-                #horizon,
-                #utils.rotation_dynamics.linearize(eva[0] * dt)) for efn, eva in zip(eigenfuncs, eigenvalues)], dim=0)
-
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfuncs_pred)
+
+    def _init_err_mode(self, batch_size: int, modes: list) -> None:
+
+        # assemble indices to extract frequency properties of eigenvalues
+        #
+        # since an angular frequency is the second property of an eigenvalue, then
+        # the indices of a channel dimension are all odd indices
+        indices = torch.unsqueeze(torch.unsqueeze(
+            torch.tensor([2*m + 1 for m in range(len(modes))]), dim=0), dim=0)
+        self._eva_f_indices = indices.repeat(batch_size, 1, 1)
+
+        # 
+        targets_n = self.cfg['batch_size']
+        targets = torch.cat([
+            torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
+        self._eva_f_targets = torch.unsqueeze(targets, 1)
+
+    def _calc_err_mode(self, eigenvalues: torch.Tensor) -> torch.Tensor:
+
+        indices = self._eva_f_indices[:eigenvalues.shape[0], :, :]
+
+        # gather eigenvalue frequencies from the last, i.e. channel, dimension
+        evas = torch.gather(eigenvalues, -1, indices)
+
+        targets = self._eva_f_targets[:eigenvalues.shape[0], :, :]
+
+        return torch.mean(torch.square(targets - evas))
 
     def _impl_predict_from(self, efn_start: torch.Tensor, horizon: int, dyn: torch.Tensor) -> torch.Tensor:
         """
