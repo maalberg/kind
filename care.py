@@ -1,13 +1,12 @@
 import torch
 
-import koopman as koop
 import utilities as utils
 
 
 # ---------------------------------------------------------------------------*/
-# - dynamic mode decomposition
+# - deep Koopman neural network for a dynamic mode decomposition
 
-class dmd:
+class deep_koopman:
     """
     Creates an autoencoder-based neural network that is expected to decompose
     dynamical modes of a system from simulated or experimental data.
@@ -24,16 +23,16 @@ class dmd:
 
         # based on a typical autoencoder framework, create an encoder that will decompose
         # input data into Koopman eigenfunctions
-        self.decomposer = koop.eigenfunction(data_dims_n, eigenfunc_dims_n)
+        self.decomposer = eigenfunction(data_dims_n, eigenfunc_dims_n)
 
         # as usual for autoencoders, encoded data needs to be decoded back, so create a decoder
         # that will compose/reconstruct data back to its original state
-        self.reconstructor = koop.eigenfunction(data_dims_n, eigenfunc_dims_n, inversed=True)
+        self.reconstructor = eigenfunction(data_dims_n, eigenfunc_dims_n, inversed=True)
 
         # create a neural network that will derive dynamics from the decomposed eigenfunctions
-        self.dynamics = koop.eigenvalue(eigenfunc_dims_n)
+        self.dynamics = eigenvalue(eigenfunc_dims_n)
 
-        self._init_err_mode(configuration['batch_size'], configuration['modes'])
+        self._init_mode(configuration)
 
     def fit(self, timeseries: torch.Tensor) -> torch.Tensor:
         """
@@ -48,6 +47,8 @@ class dmd:
         # eigenfunctions are shaped as [B, T, C_efn], where C_efn denotes the number of
         # channels in eigenfunctions, i.e. in the latent space of this autoencoder
         eigenfuncs = self.decomposer(timeseries)
+
+        horizon = self.cfg['horizon']
 
         # derive eigenvalues
         #
@@ -68,7 +69,6 @@ class dmd:
         #
         # note that the rotation matrices are then transposed to allow multiplication with
         # eigenfunction starting values shaped as rows, i.e. [1, C_efn]
-        horizon = self.cfg['horizon']
         matpows = torch.stack([
             torch.transpose(
                 torch.linalg.matrix_power(matrices, h), -2, -1) for h in range(1, horizon)], dim=1)
@@ -77,24 +77,24 @@ class dmd:
         #
         # these starting values are shaped as [B, 1, 1, C_efn] to allow tensor broadcasting when
         # multiplying by rotation matrices
-        eigenfuncs_start = torch.stack([efn[torch.newaxis, torch.newaxis, 0] for efn in eigenfuncs], dim=0)
+        efn_start = torch.stack([efn[torch.newaxis, torch.newaxis, 0] for efn in eigenfuncs], dim=0)
 
         # predict eigenfunctions by multiplying their starting values by powered rotation matrices
         #
         # both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, C_efn], i.e.
         # batches with eigenfunction trajectories consisting of inidividual points [1, C_efn]
-        eigenfuncs_pred = torch.matmul(eigenfuncs_start, matpows)
+        efn_pred = torch.matmul(efn_start, matpows)
 
         # remove singleton dimensions that were needed for the broadcasting of multiplication
-        eigenfuncs_start = torch.squeeze(eigenfuncs_start, 1)
-        eigenfuncs_pred  = torch.squeeze(eigenfuncs_pred, -2)
+        efn_start = torch.squeeze(efn_start, 1)
+        efn_pred  = torch.squeeze(efn_pred, -2)
 
-        eigenfuncs_pred = torch.cat([eigenfuncs_start, eigenfuncs_pred], dim=1)
+        eigenfuncs_pred = torch.cat([efn_start, efn_pred], dim=1)
 
         # reconstruct timeseries
         timeseries_recon = self.reconstructor(eigenfuncs_pred)
 
-        err_mode = self._calc_err_mode(eigenvalues)
+        err_mode = self._get_mode_err(eigenvalues)
 
         # prediction loss
         err_pred = torch.mean(torch.square(eigenfuncs[:, 1:horizon, :] - eigenfuncs_pred[:, 1:horizon, :]))
@@ -128,7 +128,7 @@ class dmd:
 
         # return the sum of all losses
         return loss, err_recon, err_pred, err_mode
-        
+
     def predict(self, timeseries: torch.Tensor, horizon: int) -> torch.Tensor:
         """
         Predicts a batch of ``timeseries`` in a linear manner. The method takes the start of every timeseries
@@ -163,53 +163,44 @@ class dmd:
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfuncs_pred)
 
-    def _init_err_mode(self, batch_size: int, modes: list) -> None:
+    def _init_mode(self, cfg: dict) -> None:
+        """
+        Initializes dynamic modes for subsequent calculation of mode error during training.
+        """
+
+        modes = cfg['modes']
+        targets_n = cfg['batch_size']
 
         # assemble indices to extract frequency properties of eigenvalues
         #
         # since an angular frequency is the second property of an eigenvalue, then
         # the indices of a channel dimension are all odd indices
+        #
+        # by unsqueezing we establish a batch structure in the assembled indices
         indices = torch.unsqueeze(torch.unsqueeze(
             torch.tensor([2*m + 1 for m in range(len(modes))]), dim=0), dim=0)
-        self._eva_f_indices = indices.repeat(batch_size, 1, 1)
+
+        # repeat the batch dimension to comply with the number of actual batches/targets
+        self._eva_f_indices = indices.repeat(targets_n, 1, 1)
 
         # 
-        targets_n = self.cfg['batch_size']
         targets = torch.cat([
             torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
         self._eva_f_targets = torch.unsqueeze(targets, 1)
 
-    def _calc_err_mode(self, eigenvalues: torch.Tensor) -> torch.Tensor:
+    def _get_mode_err(self, eigenvalues: torch.Tensor) -> torch.Tensor:
 
+        # correct the size of indices according to the actual size of input eigenvalues
         indices = self._eva_f_indices[:eigenvalues.shape[0], :, :]
 
-        # gather eigenvalue frequencies from the last, i.e. channel, dimension
-        evas = torch.gather(eigenvalues, -1, indices)
+        # use corrected indices to gather eigenvalue frequencies from the last, i.e. channel, dimension
+        ch_dim = -1
+        evas = torch.gather(eigenvalues, ch_dim, indices)
 
+        # correct the size of targets according to the actual size of input eigenvalues
         targets = self._eva_f_targets[:eigenvalues.shape[0], :, :]
 
         return torch.mean(torch.square(targets - evas))
-
-    def _impl_predict_from(self, efn_start: torch.Tensor, horizon: int, dyn: torch.Tensor) -> torch.Tensor:
-        """
-        Predicts an eigenfunction starting from the ``eigenfunc_start`` of the eigenfunction and into the future. The
-        number of predicted steps is defined by the length of ``eigenvalue`` vector. Note that
-        ``eigenvalue`` can also be filled with the same value, thus promoting the
-        invariance of an eigenvalue along a trajectory.
-
-        Accordingly, the ``eigenfunc_start`` of an eigenfunction must be formatted as [1, C], whereas ``eigenvalue`` as
-        [T, C]. Here, T and C are the number of time steps and data channels, respectively.
-        """
-
-        efn = torch.cat([
-            self._impl_predict_next(efn_start, efn_next_i, dyn) for efn_next_i in range(1, horizon)])
-
-        return torch.cat([efn_start, efn])
-
-    def _impl_predict_next(self, efn_start: torch.Tensor, efn_next_i: int, dyn: torch.Tensor) -> torch.Tensor:
-            return torch.matmul(
-                efn_start,
-                torch.transpose(torch.linalg.matrix_power(dyn, efn_next_i), 0, 1))
 
     def parameters(self):
         """Returns the parameters of internal neural networks."""
@@ -226,3 +217,117 @@ class dmd:
         batch elements, time steps and data channels, respectively.
         """
         return torch.stack([datum[torch.newaxis, 0] for datum in timeseries], dim=0)
+
+
+# ---------------------------------------------------------------------------*/
+# - eigenfunction
+
+class eigenfunction:
+    def __init__(self, timeseries_dims_n: int = 2, eigenfunc_dims_n: int = 2, inversed: bool = False):
+        """
+        Constructs a fully-connected neural network that transforms input timeseries into
+        Koopman eigenfunctions (or vice versa if ``inversed`` is set to True).
+        The underlying neural network is parameterized by the number of
+        dimensions in timeseries and eigenfunction, represented by
+        parameters ``timeseries_dims_n`` and
+        ``eigenfunc_dims_n``, respectively.
+        """
+
+        # define the structure of a fully-connected neural network
+        net_features = [timeseries_dims_n, 32, 32, eigenfunc_dims_n]
+
+        # create a fully-connected neural network that will learn the transformation from input
+        # data to Koopman eigenfunctions
+        self.net = utils.fcnn(
+            features=net_features if inversed==False else list(reversed(net_features)),
+            actfunc='relu')
+
+    def __call__(self, timeseries: torch.Tensor) -> torch.Tensor:
+        """
+        Decomposes ``timeseries`` into eigenfunctions. Input ``timeseries`` are expected
+        to be formatted as [B, T, C], where B, T, and C are the number of
+        batches, time steps and data channels, respectively.
+        """
+        return self.net(timeseries)
+
+    def parameters(self):
+        """Returns the parameters of internal neural networks."""
+        return self.net.parameters()
+
+
+# ---------------------------------------------------------------------------*/
+# - eigenvalue
+
+class eigenvalue:
+    def __init__(self, eigenfunc_dims_n: int = 2) -> None:
+        """
+        Creates a fully-connected neural network-based operator to transform
+        Koopman eigenfunctions into eigenvalues.
+        """
+
+        # eigenvalues will be derived from radial eigenfunctions, and these
+        # can be described in a two-dimensional space
+        self.radial_dims_n = 2
+
+        # an eigenvalue has two properties: scaling mu and angular frequency omega
+        self.eigenvalue_props_n = 2
+
+        # since an eigenfunction may have more dimensions than 2, a respective number of
+        # neural networks is created to process two-dimensional parts
+        # of the eigenfunction space in parallel
+        nets_n = int(eigenfunc_dims_n / self.radial_dims_n)
+        self.nets = [utils.fcnn(
+            features=[1, 128, self.eigenvalue_props_n],
+            actfunc='relu') for _ in range(nets_n)]
+
+    def __call__(self, eigenfunctions: torch.Tensor) -> torch.Tensor:
+        """
+        Transforms Koopman ``eigenfunctions`` into eigenvalues. Input ``eigenfunctions`` are expected
+        to be shaped as [B, T, C], where B, T and C are the number of batches, time steps
+        and eigenfunction channels, respectively.
+        """
+
+        # split an eigenfunction into two-dimensional radial subfunctions
+        eigenfuncs_rad = torch.split(eigenfunctions, self.radial_dims_n, dim=2)
+
+        # apply a dedicated neural network to each two-dimensional eigenfunction
+        #
+        # note how a two-dimensional eigenfunction is first constrained to respect radial symmetry
+        #
+        # also note how eigenvalues for each radial eigenfunction are concatenated as columns
+        # to the result
+        return torch.cat([
+            net(self.constrain_rad(efn)) for net, efn in zip(self.nets, eigenfuncs_rad)], dim=2)
+    
+    def to_rotation_diag(self, eigenvalues: torch.Tensor):
+        """Uses ``eigenvalues`` to assemble a matrix with 2x2 rotation matrices on its diagonal."""
+
+        # split incoming eigenvalues along the last, i.e. channel, dimension
+        evas = torch.split(eigenvalues, self.eigenvalue_props_n, dim=-1)
+
+        return torch.block_diag(*[utils.make_rotation(
+            exponent=eva[0, 0],
+            angle=eva[0, 1]) for eva in evas])
+
+    def parameters(self):
+        """Returns the parameters of internal neural networks."""
+        params = []
+        for net in self.nets: params.extend(list(net.parameters()))
+        return params
+
+    @staticmethod
+    def constrain_rad(eigenfunctions: torch.Tensor) -> torch.Tensor:
+        """
+        Constrains an ``eigenfunction`` by its radius. Input ``eigenfunctions`` are expected
+        to be shaped as [B, T, 2], where B and T are the number of batches and
+        time steps, respectively. Radius is derived from 2 dimensions.
+        """
+        return torch.sum(torch.square(eigenfunctions), dim=-1, keepdim=True)
+
+
+# ---------------------------------------------------------------------------*/
+# - control input matrix
+
+class control_input:
+    pass
+
