@@ -48,58 +48,21 @@ class deep_koopman:
         #
         # eigenfunctions are shaped as [B, T, C_efn], where C_efn denotes the number of
         # channels in eigenfunctions, i.e. in the latent space of this autoencoder
-        eigenfuncs = self.decomposer(timeseries)
-
-        horizon = self.cfg['horizon']
-
-        # derive eigenvalues
-        #
-        # derived eigenvalues are shaped as [B, T, C_eva], where C_eva denotes the number of
-        # eigenvalues with their properties
-        eigenvalues = self.dynamics(eigenfuncs)
-
-        # based on derived eigenvalues, build a rotation matrix for every trajectory
-        #
-        # built matrices are shaped as [B, 2, 2]
-        dt = self.cfg['timestep']
-        matrices = torch.stack([self.dynamics.to_rotation_diag(eva[torch.newaxis, 0] * dt) for eva in eigenvalues], dim=0)
-
-        # raise built matrices to powers covering all horizon
-        #
-        # powered matrices are shaped as [B, H - 1, 2, 2], where H is the number of horizon steps and -1
-        # is because we do not predict the first time step
-        #
-        # note that the rotation matrices are then transposed to allow multiplication with
-        # eigenfunction starting values shaped as rows, i.e. [1, C_efn]
-        matpows = torch.stack([
-            torch.transpose(
-                torch.linalg.matrix_power(matrices, h), -2, -1) for h in range(1, horizon)], dim=1)
+        eigenfunctions = self.decomposer(timeseries)
 
         # extract the starting values of eigenfunctions
-        #
-        # these starting values are shaped as [B, 1, 1, C_efn] to allow tensor broadcasting when
-        # multiplying by rotation matrices
-        efn_start = torch.stack([efn[torch.newaxis, torch.newaxis, 0] for efn in eigenfuncs], dim=0)
+        eigenfunctions_start = torch.stack([efn[torch.newaxis, 0] for efn in eigenfunctions], dim=0)
 
-        # predict eigenfunctions by multiplying their starting values by powered rotation matrices
-        #
-        # both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, C_efn], i.e.
-        # batches with eigenfunction trajectories consisting of inidividual points [1, C_efn]
-        efn_pred = torch.matmul(efn_start, matpows)
-
-        # remove singleton dimensions that were needed for the broadcasting of multiplication
-        efn_start = torch.squeeze(efn_start, 1)
-        efn_pred  = torch.squeeze(efn_pred, -2)
-
-        eigenfuncs_pred = torch.cat([efn_start, efn_pred], dim=1)
+        horizon = self.cfg['horizon']
+        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon)
 
         # reconstruct timeseries
-        timeseries_recon = self.reconstructor(eigenfuncs_pred)
+        timeseries_recon = self.reconstructor(eigenfunctions_pred)
 
-        err_mode = self._get_mode_err(eigenvalues)
+        err_mode = self._get_mode_err(eigenfunctions)
 
         # prediction loss
-        err_pred = torch.mean(torch.square(eigenfuncs[:, 1:horizon, :] - eigenfuncs_pred[:, 1:horizon, :]))
+        err_pred = torch.mean(torch.square(eigenfunctions[:, 1:horizon, :] - eigenfunctions_pred[:, 1:horizon, :]))
 
         # reconstruction loss
         err_recon = torch.mean(torch.square(timeseries[:, :horizon, :] - timeseries_recon))
@@ -143,27 +106,60 @@ class deep_koopman:
         timeseries_start = self.start_of(timeseries)
 
         # decompose starting values into corresponding eigenfunctions
-        eigenfuncs = self.decomposer(timeseries_start)
+        eigenfunctions_start = self.decomposer(timeseries_start)
 
-        eigenvalues = self.dynamics(eigenfuncs)
+        # predict eigenfunctions from start up to horizon
+        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon)
 
+        # reconstruct a predicted eigenfunction back into timeseries
+        return self.reconstructor(eigenfunctions_pred)
+
+    def _predict_efn(self, efn_start: torch.Tensor, horizon: int) -> torch.Tensor:
+        """
+        Predicts eigenfunction from a start point ``efn_start`` up to ``horizon``. The start
+        point ``efn_start`` must be shaped as [B, 1, C], where B and C_efn are the
+        number of batch elements and eigenfunction channels, respectively.
+        The predicted eigenfunction is shaped as [B, horizon, C_efn].
+        """
+
+        # derive eigenvalues
+        #
+        # derived eigenvalues are shaped as [B, 1, C_eva], where C_eva denotes the number of
+        # eigenvalues with their properties
+        eigenvalues = self.dynamics(efn_start)
+
+        # based on derived eigenvalues, build a rotation matrix for every trajectory
+        #
+        # built matrices are shaped as [B, 2, 2]
         dt = self.cfg['timestep']
         matrices = torch.stack([self.dynamics.to_rotation_diag(eva[torch.newaxis, 0] * dt) for eva in eigenvalues], dim=0)
 
+        # raise built matrices to powers covering all horizon
+        #
+        # powered matrices are shaped as [B, H - 1, 2, 2], where H is the number of horizon steps and -1
+        # is because we do not predict the first time step
+        #
+        # note that the rotation matrices are then transposed to allow multiplication with
+        # eigenfunction starting values shaped as rows, i.e. [1, C_efn]
         matpows = torch.stack([
             torch.transpose(
                 torch.linalg.matrix_power(matrices, h), -2, -1) for h in range(1, horizon)], dim=1)
 
-        eigenfuncs_start = torch.unsqueeze(eigenfuncs, 1)
-        eigenfuncs_pred = torch.matmul(eigenfuncs_start, matpows)
+        # starting values are shaped as [B, 1, 1, C_efn] to allow tensor broadcasting when
+        # multiplying by rotation matrices
+        efn_start = torch.unsqueeze(efn_start, 1)
 
-        eigenfuncs_start = torch.squeeze(eigenfuncs_start, 1)
-        eigenfuncs_pred  = torch.squeeze(eigenfuncs_pred, -2)
+        # predict eigenfunctions by multiplying their starting values by powered rotation matrices
+        #
+        # both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, C_efn], i.e.
+        # batches with eigenfunction trajectories consisting of inidividual points [1, C_efn]
+        efn_pred = torch.matmul(efn_start, matpows)
 
-        eigenfuncs_pred = torch.cat([eigenfuncs_start, eigenfuncs_pred], dim=1)
+        # remove singleton dimensions that were needed for the broadcasting of multiplication
+        efn_start = torch.squeeze(efn_start, 1)
+        efn_pred  = torch.squeeze(efn_pred, -2)
 
-        # reconstruct a predicted eigenfunction back into timeseries
-        return self.reconstructor(eigenfuncs_pred)
+        return torch.cat([efn_start, efn_pred], dim=1)
 
     def _init_mode(self, cfg: dict) -> None:
         """
@@ -190,7 +186,9 @@ class deep_koopman:
             torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
         self._eva_f_targets = torch.unsqueeze(targets, 1)
 
-    def _get_mode_err(self, eigenvalues: torch.Tensor) -> torch.Tensor:
+    def _get_mode_err(self, eigenfuncs: torch.Tensor) -> torch.Tensor:
+
+        eigenvalues = self.dynamics(eigenfuncs)
 
         # correct the size of indices according to the actual size of input eigenvalues
         indices = self._eva_f_indices[:eigenvalues.shape[0], :, :]
