@@ -32,6 +32,8 @@ class deep_koopman:
         # create a neural network that will derive dynamics from the decomposed eigenfunctions
         self.dynamics = eigenvalue(eigenfunc_dims_n)
 
+        self.ctr_input = control_matrix(ctr_dims_n=1, efn_dims_n=eigenfunc_dims_n, mat_dims_n=1)
+
         self._init_mode(configuration)
 
     def fit(self, timeseries: torch.Tensor) -> torch.Tensor:
@@ -259,7 +261,7 @@ class eigenfunction:
 # - eigenvalue
 
 class eigenvalue:
-    def __init__(self, eigenfunc_dims_n: int = 2) -> None:
+    def __init__(self, efn_dims_n: int = 2) -> None:
         """
         Creates a fully-connected neural network-based operator to transform
         Koopman eigenfunctions into eigenvalues.
@@ -267,17 +269,17 @@ class eigenvalue:
 
         # eigenvalues will be derived from radial eigenfunctions, and these
         # can be described in a two-dimensional space
-        self.radial_dims_n = 2
+        self.rad_dims_n = 2
 
         # an eigenvalue has two properties: scaling mu and angular frequency omega
-        self.eigenvalue_props_n = 2
+        self.eva_props_n = 2
 
         # since an eigenfunction may have more dimensions than 2, a respective number of
         # neural networks is created to process two-dimensional parts
         # of the eigenfunction space in parallel
-        nets_n = int(eigenfunc_dims_n / self.radial_dims_n)
+        nets_n = int(efn_dims_n / self.rad_dims_n)
         self.nets = [utils.fcnn(
-            features=[1, 128, self.eigenvalue_props_n],
+            features=[1, 128, self.eva_props_n],
             actfunc='relu') for _ in range(nets_n)]
 
     def __call__(self, eigenfunctions: torch.Tensor) -> torch.Tensor:
@@ -288,7 +290,7 @@ class eigenvalue:
         """
 
         # split an eigenfunction into two-dimensional radial subfunctions
-        eigenfuncs_rad = torch.split(eigenfunctions, self.radial_dims_n, dim=2)
+        eigenfuncs_rad = torch.split(eigenfunctions, self.rad_dims_n, dim=2)
 
         # apply a dedicated neural network to each two-dimensional eigenfunction
         #
@@ -298,12 +300,12 @@ class eigenvalue:
         # to the result
         return torch.cat([
             net(self.constrain_rad(efn)) for net, efn in zip(self.nets, eigenfuncs_rad)], dim=2)
-    
+
     def to_rotation_diag(self, eigenvalues: torch.Tensor):
         """Uses ``eigenvalues`` to assemble a matrix with 2x2 rotation matrices on its diagonal."""
 
         # split incoming eigenvalues along the last, i.e. channel, dimension
-        evas = torch.split(eigenvalues, self.eigenvalue_props_n, dim=-1)
+        evas = torch.split(eigenvalues, self.eva_props_n, dim=-1)
 
         return torch.block_diag(*[utils.make_rotation(
             exponent=eva[0, 0],
@@ -328,6 +330,28 @@ class eigenvalue:
 # ---------------------------------------------------------------------------*/
 # - control input matrix
 
-class control_input:
-    pass
+class control_matrix:
+    def __init__(self, ctr_dims_n: int = 1, efn_dims_n: int = 2, mat_dims_n: int = 1) -> None:
+
+        # control will be applied to radial eigenfunctions, and these
+        # are described in a two-dimensional space
+        rad_dims_n = 2
+
+        # there will be n neural networks
+        nets_n = int(efn_dims_n / rad_dims_n)
+
+        self.nets = [utils.fcnn(
+            features=[ctr_dims_n, 128, mat_dims_n],
+            actfunc='relu') for _ in range(nets_n)]
+
+    def __call__(self, control: torch.Tensor) -> torch.Tensor:
+
+        return torch.cat([
+            net(control) for net in self.nets], dim=2)
+
+    def parameters(self):
+        """Returns the parameters of internal neural networks."""
+        params = []
+        for net in self.nets: params.extend(list(net.parameters()))
+        return params
 
