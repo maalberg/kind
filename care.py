@@ -34,6 +34,7 @@ class deep_koopman:
 
         self.ctr_input = control_matrix(ctr_dims_n=1, efn_dims_n=eigenfunc_dims_n, mat_dims_n=1)
 
+        self._init_starts(configuration)
         self._init_mode(configuration)
 
     def fit(self, timeseries: torch.Tensor) -> torch.Tensor:
@@ -50,8 +51,10 @@ class deep_koopman:
         # channels in eigenfunctions, i.e. in the latent space of this autoencoder
         eigenfunctions = self.decomposer(timeseries)
 
-        # extract the starting values of eigenfunctions
-        eigenfunctions_start = torch.stack([efn[torch.newaxis, 0] for efn in eigenfunctions], dim=0)
+        # gather the starting points of eigenfunctions
+        #
+        # the indices of starting points must be corrected according to the current number of batch elements
+        eigenfunctions_start = torch.gather(eigenfunctions, -1, self._efn_start_indices[:eigenfunctions.shape[0], :, :])
 
         horizon = self.cfg['horizon']
         eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon)
@@ -103,7 +106,8 @@ class deep_koopman:
         """
 
         # take the starting values of the given timeseries while keeping the batch structure
-        timeseries_start = self.start_of(timeseries)
+        #timeseries_start = self.start_of(timeseries)
+        timeseries_start = torch.gather(timeseries, -1, self._ts_start_indices[:timeseries.shape[0], :, :])
 
         # decompose starting values into corresponding eigenfunctions
         eigenfunctions_start = self.decomposer(timeseries_start)
@@ -160,6 +164,18 @@ class deep_koopman:
         efn_pred  = torch.squeeze(efn_pred, -2)
 
         return torch.cat([efn_start, efn_pred], dim=1)
+
+    def _init_starts(self, cfg: dict) -> None:
+
+        data_dims_n = self.cfg['data_ch_n']
+        efn_dims_n  = len(cfg['modes']) * 2
+        starts_n    = cfg['batch_size']
+
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(data_dims_n)]), dim=0), dim=0)
+        self._ts_start_indices = indices.repeat(starts_n, 1, 1)
+
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(efn_dims_n)]), dim=0), dim=0)
+        self._efn_start_indices = indices.repeat(starts_n, 1, 1)
 
     def _init_mode(self, cfg: dict) -> None:
         """
