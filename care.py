@@ -51,18 +51,25 @@ class deep_koopman:
         # channels in eigenfunctions, i.e. in the latent space of this autoencoder
         eigenfunctions = self.decomposer(timeseries)
 
-        # gather the starting points of eigenfunctions
+        # derive complete trajectories of eigenvalues that are shaped as [B, T, C_eva], where C_eva
+        # is the number of channels in an eigenvalue
+        #
+        # these complete eigenvalue trajectories are further used throughout this method
+        eigenvalues = self.dynamics(eigenfunctions)
+
+        # gather the starting points of eigenfunctions with their corresponding eigenvalues
         #
         # the indices of starting points must be corrected according to the current number of batch elements
         eigenfunctions_start = torch.gather(eigenfunctions, -1, self._efn_start_indices[:eigenfunctions.shape[0], :, :])
+        eigenvalues_start = torch.gather(eigenvalues, -1, self._eva_start_indices[:eigenvalues.shape[0], :, :])
 
         horizon = self.cfg['horizon']
-        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon)
+        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, eigenvalues_start, horizon)
 
         # reconstruct timeseries
         timeseries_recon = self.reconstructor(eigenfunctions_pred)
 
-        err_mode = self._get_mode_err(eigenfunctions)
+        err_mode = self._get_mode_err(eigenfunctions, eigenvalues)
 
         # prediction loss
         err_pred = torch.mean(torch.square(eigenfunctions[:, 1:horizon, :] - eigenfunctions_pred[:, 1:horizon, :]))
@@ -106,19 +113,20 @@ class deep_koopman:
         """
 
         # take the starting values of the given timeseries while keeping the batch structure
-        #timeseries_start = self.start_of(timeseries)
         timeseries_start = torch.gather(timeseries, -1, self._ts_start_indices[:timeseries.shape[0], :, :])
 
         # decompose starting values into corresponding eigenfunctions
         eigenfunctions_start = self.decomposer(timeseries_start)
 
+        eigenvalues_start = self.dynamics(eigenfunctions_start)
+
         # predict eigenfunctions from start up to horizon
-        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon)
+        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, eigenvalues_start, horizon)
 
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfunctions_pred)
 
-    def _predict_efn(self, efn_start: torch.Tensor, horizon: int) -> torch.Tensor:
+    def _predict_efn(self, efn_start: torch.Tensor, eva_start: torch.Tensor, horizon: int) -> torch.Tensor:
         """
         Predicts eigenfunction from a start point ``efn_start`` up to ``horizon``. The start
         point ``efn_start`` must be shaped as [B, 1, C], where B and C_efn are the
@@ -126,17 +134,11 @@ class deep_koopman:
         The predicted eigenfunction is shaped as [B, horizon, C_efn].
         """
 
-        # derive eigenvalues
-        #
-        # derived eigenvalues are shaped as [B, 1, C_eva], where C_eva denotes the number of
-        # eigenvalues with their properties
-        eigenvalues = self.dynamics(efn_start)
-
-        # based on derived eigenvalues, build a rotation matrix for every trajectory
+        # based on provided eigenvalues, build a rotation matrix for every trajectory
         #
         # built matrices are shaped as [B, 2, 2]
         dt = self.cfg['timestep']
-        matrices = torch.stack([self.dynamics.to_rotation_diag(eva[torch.newaxis, 0] * dt) for eva in eigenvalues], dim=0)
+        matrices = torch.stack([self.dynamics.to_rotation_diag(eva[torch.newaxis, 0] * dt) for eva in eva_start], dim=0)
 
         # raise built matrices to powers covering all horizon
         #
@@ -165,17 +167,52 @@ class deep_koopman:
 
         return torch.cat([efn_start, efn_pred], dim=1)
 
+    def _apply_ctr(self, ctr: torch.Tensor, eva_f: torch.Tensor) -> torch.Tensor:
+
+        # gather the starting points of every batch element, i.e. of every control trajectory
+        #
+        # the points are shaped as [B, 1, C_ctr], where B and C_ctr are the number of
+        # batch elements and control data channels, respectively
+        ctr_start = torch.gather(ctr, -1, self._ctr_start_indices[:ctr.shape[0], :, :])
+        print(ctr_start.shape)
+
+        # transform the starting points into a B matrix coefficient
+        #
+        # The idea is that a 2x2 system matrix A is accompanied by a 2x1 input matrix B, and
+        # the first row of matrix B is a zero. So a neural network derives the second
+        # row element. Accordingly, this derived coefficient is shaped as [B, 1, 1].
+        k = self.ctr_input(ctr_start)
+        print(k.shape)
+
+        matrix = torch.transpose(torch.cat([torch.zeros_like(k), -k*eva_f^2], dim=-2), -2, -1)
+        print(matrix.shape)
+        print(tata.shape)
+
+        applied_ctr = torch.matmul(torch.square(ctr), matrix)
+
+        return applied_ctr
+
     def _init_starts(self, cfg: dict) -> None:
 
-        data_dims_n = self.cfg['data_ch_n']
-        efn_dims_n  = len(cfg['modes']) * 2
+        data_dims_n = cfg['data_ch_n']
+        ctr_dims_n  = cfg['ctr_ch_n']
+        modes_n     = len(cfg['modes'])
+        efn_dims_n  = modes_n * 2
         starts_n    = cfg['batch_size']
+
+        eva_all_dims_n = modes_n * self.dynamics.eva_props_n
+
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(ctr_dims_n)]), dim=0), dim=0)
+        self._ctr_start_indices = indices.repeat(starts_n, 1, 1)
 
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(data_dims_n)]), dim=0), dim=0)
         self._ts_start_indices = indices.repeat(starts_n, 1, 1)
 
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(efn_dims_n)]), dim=0), dim=0)
         self._efn_start_indices = indices.repeat(starts_n, 1, 1)
+
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(eva_all_dims_n)]), dim=0), dim=0)
+        self._eva_start_indices = indices.repeat(starts_n, 1, 1)
 
     def _init_mode(self, cfg: dict) -> None:
         """
@@ -202,19 +239,14 @@ class deep_koopman:
             torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
         self._eva_f_targets = torch.unsqueeze(targets, 1)
 
-    def _get_mode_err(self, eigenfuncs: torch.Tensor) -> torch.Tensor:
-
-        eigenvalues = self.dynamics(eigenfuncs)
+    def _get_mode_err(self, efn: torch.Tensor, eva: torch.Tensor) -> torch.Tensor:
 
         # correct the size of indices according to the actual size of input eigenvalues
-        indices = self._eva_f_indices[:eigenvalues.shape[0], :, :]
-
-        # use corrected indices to gather eigenvalue frequencies from the last, i.e. channel, dimension
-        ch_dim = -1
-        evas = torch.gather(eigenvalues, ch_dim, indices)
+        # and corrected indices to gather eigenvalue frequencies from the last, i.e. channel, dimension
+        evas = torch.gather(eva, -1, self._eva_f_indices[:eva.shape[0], :, :])
 
         # correct the size of targets according to the actual size of input eigenvalues
-        targets = self._eva_f_targets[:eigenvalues.shape[0], :, :]
+        targets = self._eva_f_targets[:eva.shape[0], :, :]
 
         return torch.mean(torch.square(targets - evas))
 
