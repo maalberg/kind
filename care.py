@@ -21,6 +21,8 @@ class deep_koopman:
         data_dims_n      = self.cfg['data_ch_n']
         eigenfunc_dims_n = len(self.cfg['modes']) * 2
 
+        self.cfg['efn_dims_n'] = eigenfunc_dims_n
+
         # based on a typical autoencoder framework, create an encoder that will decompose
         # input data into Koopman eigenfunctions
         self.decomposer = eigenfunction(data_dims_n, eigenfunc_dims_n)
@@ -34,15 +36,21 @@ class deep_koopman:
 
         self.ctr_input = control_matrix(ctr_dims_n=1, efn_dims_n=eigenfunc_dims_n, mat_dims_n=1)
 
-        self._init_starts(configuration)
-        self._init_mode(configuration)
+        self._init_indices()
+        self._init_starts()
+        self._init_mode()
 
-    def fit(self, timeseries: torch.Tensor) -> torch.Tensor:
+        self.k = None
+
+    def _init_indices(self) -> None:
+        starts_n = self.cfg['batch_size']
+        modes_n  = len(self.cfg['modes'])
+
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([2*i+1 for i in range(modes_n)]), dim=0), dim=0)
+        self._ctr_mat_indices = indices.repeat(starts_n, 1, 1)
+
+    def fit(self, timeseries: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
         """
-        Fits internal neural networks to the given ``timeseries``. The ``timeseries`` must be formatted
-        as [B, T, C], where B, T and C are the number of batch elements, time steps and
-        data channels, respectively. The method returns a mean square error loss,
-        which is meant to be used by an external optimization loop.
         """
 
         # decompose timeseries into eigenfunctions
@@ -65,6 +73,12 @@ class deep_koopman:
 
         horizon = self.cfg['horizon']
         eigenfunctions_pred = self._predict_efn(eigenfunctions_start, eigenvalues_start, horizon)
+
+        applied_ctr = self._apply_ctr(
+            control,
+            torch.gather(eigenvalues, -1, self._eva_f_indices[:eigenvalues.shape[0], :, :]))
+
+        eigenfunctions_pred = eigenfunctions_pred + applied_ctr
 
         # reconstruct timeseries
         timeseries_recon = self.reconstructor(eigenfunctions_pred)
@@ -104,12 +118,8 @@ class deep_koopman:
         # return the sum of all losses
         return loss, err_recon, err_pred, err_mode
 
-    def predict(self, timeseries: torch.Tensor, horizon: int) -> torch.Tensor:
+    def predict(self, timeseries: torch.Tensor, control: torch.Tensor, horizon: int) -> torch.Tensor:
         """
-        Predicts a batch of ``timeseries`` in a linear manner. The method takes the start of every timeseries
-        in the given batch and predicts it by a number of steps defined by ``horizon``. Therefore,
-        the ``timeseries`` are expected to be formatted as [B, T, C], where B, T and C are
-        the number of batch elements, time steps and data channels, respectively.
         """
 
         # take the starting values of the given timeseries while keeping the batch structure
@@ -122,6 +132,12 @@ class deep_koopman:
 
         # predict eigenfunctions from start up to horizon
         eigenfunctions_pred = self._predict_efn(eigenfunctions_start, eigenvalues_start, horizon)
+
+        applied_ctr = self._apply_ctr(
+            control,
+            torch.gather(eigenvalues_start, -1, self._eva_f_indices[:eigenvalues_start.shape[0], :, :]))
+
+        eigenfunctions_pred = eigenfunctions_pred + applied_ctr
 
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfunctions_pred)
@@ -174,7 +190,6 @@ class deep_koopman:
         # the points are shaped as [B, 1, C_ctr], where B and C_ctr are the number of
         # batch elements and control data channels, respectively
         ctr_start = torch.gather(ctr, -1, self._ctr_start_indices[:ctr.shape[0], :, :])
-        print(ctr_start.shape)
 
         # transform the starting points into a B matrix coefficient
         #
@@ -182,23 +197,27 @@ class deep_koopman:
         # the first row of matrix B is a zero. So a neural network derives the second
         # row element. Accordingly, this derived coefficient is shaped as [B, 1, 1].
         k = self.ctr_input(ctr_start)
-        print(k.shape)
 
-        matrix = torch.transpose(torch.cat([torch.zeros_like(k), -k*eva_f^2], dim=-2), -2, -1)
-        print(matrix.shape)
-        print(tata.shape)
+        mat_coeff = -k * torch.square(eva_f)
 
-        applied_ctr = torch.matmul(torch.square(ctr), matrix)
+        mat = torch.zeros(ctr.shape[0],
+                          1,
+                          self.cfg['efn_dims_n'],
+                          dtype=mat_coeff.dtype).scatter_(-1, self._ctr_mat_indices[:ctr.shape[0], :, :], mat_coeff)
+
+        applied_ctr = torch.matmul(torch.square(ctr), mat)
+
+        self.k = torch.mean(k)
 
         return applied_ctr
 
-    def _init_starts(self, cfg: dict) -> None:
+    def _init_starts(self) -> None:
 
-        data_dims_n = cfg['data_ch_n']
-        ctr_dims_n  = cfg['ctr_ch_n']
-        modes_n     = len(cfg['modes'])
+        data_dims_n = self.cfg['data_ch_n']
+        ctr_dims_n  = self.cfg['ctr_ch_n']
+        modes_n     = len(self.cfg['modes'])
         efn_dims_n  = modes_n * 2
-        starts_n    = cfg['batch_size']
+        starts_n    = self.cfg['batch_size']
 
         eva_all_dims_n = modes_n * self.dynamics.eva_props_n
 
@@ -214,13 +233,13 @@ class deep_koopman:
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(eva_all_dims_n)]), dim=0), dim=0)
         self._eva_start_indices = indices.repeat(starts_n, 1, 1)
 
-    def _init_mode(self, cfg: dict) -> None:
+    def _init_mode(self) -> None:
         """
         Initializes dynamic modes for subsequent calculation of mode error during training.
         """
 
-        modes = cfg['modes']
-        targets_n = cfg['batch_size']
+        modes = self.cfg['modes']
+        targets_n = self.cfg['batch_size']
 
         # assemble indices to extract frequency properties of eigenvalues
         #
