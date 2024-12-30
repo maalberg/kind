@@ -16,38 +16,78 @@ class deep_koopman:
         Constructs an instance of a dynamic mode decomposition based on the given ``configuration``.
         The ``configuration`` is a dictionary with key-value pairs.
         """
-        self.cfg = configuration
 
-        data_dims_n      = self.cfg['data_ch_n']
-        eigenfunc_dims_n = len(self.cfg['modes']) * 2
+        self._init(configuration)
 
-        self.cfg['efn_dims_n'] = eigenfunc_dims_n
+        efn_dims_n  = self.cfg['efn_dims_n']
+        data_dims_n = self.cfg['data_dims_n']
+        ctr_dims_n  = self.cfg['ctr_dims_n']
 
         # based on a typical autoencoder framework, create an encoder that will decompose
         # input data into Koopman eigenfunctions
-        self.decomposer = eigenfunction(data_dims_n, eigenfunc_dims_n)
+        self.decomposer = eigenfunction(data_dims_n, efn_dims_n)
 
         # as usual for autoencoders, encoded data needs to be decoded back, so create a decoder
         # that will compose/reconstruct data back to its original state
-        self.reconstructor = eigenfunction(data_dims_n, eigenfunc_dims_n, inversed=True)
+        self.reconstructor = eigenfunction(data_dims_n, efn_dims_n, inversed=True)
 
         # create a neural network that will derive dynamics from the decomposed eigenfunctions
-        self.dynamics = eigenvalue(eigenfunc_dims_n)
+        self.dynamics = eigenvalue(efn_dims_n)
 
-        self.ctr_input = control_matrix(ctr_dims_n=1, efn_dims_n=eigenfunc_dims_n, mat_dims_n=1)
+        self.ctr_input = control_matrix(ctr_dims_n=ctr_dims_n, efn_dims_n=efn_dims_n, mat_dims_n=1)
 
-        self._init_indices()
-        self._init_starts()
-        self._init_mode()
-
+        # test
         self.k = None
 
-    def _init_indices(self) -> None:
-        starts_n = self.cfg['batch_size']
-        modes_n  = len(self.cfg['modes'])
+    def _init(self, configuration: dict) -> None:
+        """Initializes the ``configuration`` of this class."""
+
+        self.cfg = configuration
+
+        data_dims_n = self.cfg['data_dims_n']
+        ctr_dims_n  = self.cfg['ctr_dims_n']
+        modes       = self.cfg['modes']
+        modes_n     = len(modes)
+        starts_n    = self.cfg['batch_size']
+        targets_n   = self.cfg['batch_size']
+
+        efn_dims_n  = modes_n * 2
+
+        self.cfg['efn_dims_n'] = efn_dims_n
+
+        eva_all_dims_n = modes_n * eigenvalue.eva_props_n
+
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(ctr_dims_n)]), dim=0), dim=0)
+        self._ctr_start_indices = indices.repeat(starts_n, 1, 1)
+
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(data_dims_n)]), dim=0), dim=0)
+        self._ts_start_indices = indices.repeat(starts_n, 1, 1)
+
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(efn_dims_n)]), dim=0), dim=0)
+        self._efn_start_indices = indices.repeat(starts_n, 1, 1)
+
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(eva_all_dims_n)]), dim=0), dim=0)
+        self._eva_start_indices = indices.repeat(starts_n, 1, 1)
 
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([2*i+1 for i in range(modes_n)]), dim=0), dim=0)
         self._ctr_mat_indices = indices.repeat(starts_n, 1, 1)
+
+        # assemble indices to extract frequency properties of eigenvalues
+        #
+        # since an angular frequency is the second property of an eigenvalue, then
+        # the indices of a channel dimension are all odd indices
+        #
+        # by unsqueezing we establish a batch structure in the assembled indices
+        indices = torch.unsqueeze(torch.unsqueeze(
+            torch.tensor([2*m + 1 for m in range(len(modes))]), dim=0), dim=0)
+
+        # repeat the batch dimension to comply with the number of actual batches/targets
+        self._eva_f_indices = indices.repeat(targets_n, 1, 1)
+
+        # 
+        targets = torch.cat([
+            torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
+        self._eva_f_targets = torch.unsqueeze(targets, 1)
 
     def fit(self, timeseries: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
         """
@@ -211,53 +251,6 @@ class deep_koopman:
 
         return applied_ctr
 
-    def _init_starts(self) -> None:
-
-        data_dims_n = self.cfg['data_ch_n']
-        ctr_dims_n  = self.cfg['ctr_ch_n']
-        modes_n     = len(self.cfg['modes'])
-        efn_dims_n  = modes_n * 2
-        starts_n    = self.cfg['batch_size']
-
-        eva_all_dims_n = modes_n * self.dynamics.eva_props_n
-
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(ctr_dims_n)]), dim=0), dim=0)
-        self._ctr_start_indices = indices.repeat(starts_n, 1, 1)
-
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(data_dims_n)]), dim=0), dim=0)
-        self._ts_start_indices = indices.repeat(starts_n, 1, 1)
-
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(efn_dims_n)]), dim=0), dim=0)
-        self._efn_start_indices = indices.repeat(starts_n, 1, 1)
-
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(eva_all_dims_n)]), dim=0), dim=0)
-        self._eva_start_indices = indices.repeat(starts_n, 1, 1)
-
-    def _init_mode(self) -> None:
-        """
-        Initializes dynamic modes for subsequent calculation of mode error during training.
-        """
-
-        modes = self.cfg['modes']
-        targets_n = self.cfg['batch_size']
-
-        # assemble indices to extract frequency properties of eigenvalues
-        #
-        # since an angular frequency is the second property of an eigenvalue, then
-        # the indices of a channel dimension are all odd indices
-        #
-        # by unsqueezing we establish a batch structure in the assembled indices
-        indices = torch.unsqueeze(torch.unsqueeze(
-            torch.tensor([2*m + 1 for m in range(len(modes))]), dim=0), dim=0)
-
-        # repeat the batch dimension to comply with the number of actual batches/targets
-        self._eva_f_indices = indices.repeat(targets_n, 1, 1)
-
-        # 
-        targets = torch.cat([
-            torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
-        self._eva_f_targets = torch.unsqueeze(targets, 1)
-
     def _get_mode_err(self, efn: torch.Tensor, eva: torch.Tensor) -> torch.Tensor:
 
         # correct the size of indices according to the actual size of input eigenvalues
@@ -326,6 +319,9 @@ class eigenfunction:
 # - eigenvalue
 
 class eigenvalue:
+    # an eigenvalue has two properties: scaling mu and angular frequency omega
+    eva_props_n = 2
+
     def __init__(self, efn_dims_n: int = 2) -> None:
         """
         Creates a fully-connected neural network-based operator to transform
@@ -335,9 +331,6 @@ class eigenvalue:
         # eigenvalues will be derived from radial eigenfunctions, and these
         # can be described in a two-dimensional space
         self.rad_dims_n = 2
-
-        # an eigenvalue has two properties: scaling mu and angular frequency omega
-        self.eva_props_n = 2
 
         # since an eigenfunction may have more dimensions than 2, a respective number of
         # neural networks is created to process two-dimensional parts
