@@ -21,6 +21,11 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     return torch.reshape(data, (datachunks_n, datachunk_len, data.shape[1]))
 
 
+def write_datafile(name: str, data) -> None:
+    filedata = np.reshape(data, (data.shape[0] * data.shape[1], data.shape[2]))
+    np.savetxt('./data/' + name + '.csv', filedata, fmt='%.14f', delimiter=',')
+
+
 # ---------------------------------------------------------------------------*/
 # - fully-connected neural network
 
