@@ -236,18 +236,19 @@ class deep_koopman:
         # The idea is that a 2x2 system matrix A is accompanied by a 2x1 input matrix B, and
         # the first row of matrix B is a zero. So a neural network derives the second
         # row element. Accordingly, this derived coefficient is shaped as [B, 1, 1].
-        k = self.ctr_input(ctr_start)
+        #k = self.ctr_input(ctr_start)
 
-        mat_coeff = -k * torch.square(eva_f)
+        #mat_coeff = -k * torch.square(eva_f)
+        mat_coeff = self.ctr_input(ctr_start)
 
         mat = torch.zeros(ctr.shape[0],
                           1,
                           self.cfg['efn_dims_n'],
                           dtype=mat_coeff.dtype).scatter_(-1, self._ctr_mat_indices[:ctr.shape[0], :, :], mat_coeff)
 
-        applied_ctr = torch.matmul(torch.square(ctr), mat)
+        applied_ctr = torch.matmul(ctr, mat)
 
-        self.k = torch.mean(k)
+        self.k = torch.mean(mat_coeff)
 
         return applied_ctr
 
@@ -265,7 +266,7 @@ class deep_koopman:
     def parameters(self):
         """Returns the parameters of internal neural networks."""
         params = []
-        modules = self.decomposer, self.reconstructor, self.dynamics
+        modules = self.decomposer, self.reconstructor, self.dynamics, self.ctr_input
         for module in modules: params.extend(list(module.parameters()))
         return params
 
