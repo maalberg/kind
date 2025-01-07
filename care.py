@@ -34,7 +34,7 @@ class deep_koopman:
         # create a neural network that will derive dynamics from the decomposed eigenfunctions
         self.dynamics = eigenvalue(efn_dims_n)
 
-        self.ctr_input = control_matrix(ctr_dims_n=ctr_dims_n, efn_dims_n=efn_dims_n, mat_dims_n=1)
+        self.force_coupler = forced_eigenfunction(force_dims_n=ctr_dims_n, efn_dims_n=efn_dims_n)
 
         # test
         self.k = None
@@ -70,7 +70,7 @@ class deep_koopman:
         self._eva_start_indices = indices.repeat(starts_n, 1, 1)
 
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([2*i+1 for i in range(modes_n)]), dim=0), dim=0)
-        self._ctr_mat_indices = indices.repeat(starts_n, 1, 1)
+        self._forced_coeff_indices = indices.repeat(starts_n, 1, 1)
 
         # assemble indices to extract frequency properties of eigenvalues
         #
@@ -89,7 +89,7 @@ class deep_koopman:
             torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
         self._eva_f_targets = torch.unsqueeze(targets, 1)
 
-    def fit(self, timeseries: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
+    def fit(self, timeseries: torch.Tensor, force: torch.Tensor) -> torch.Tensor:
         """
         """
 
@@ -105,17 +105,20 @@ class deep_koopman:
         # these complete eigenvalue trajectories are further used throughout this method
         eigenvalues = self.dynamics(eigenfunctions)
 
+        forced_coeff = self.force_coupler(force)
+
         # gather the starting points of eigenfunctions with their corresponding eigenvalues
         #
         # the indices of starting points must be corrected according to the current number of batch elements
         eigenfunctions_start = torch.gather(eigenfunctions, -1, self._efn_start_indices[:eigenfunctions.shape[0], :, :])
         eigenvalues_start = torch.gather(eigenvalues, -1, self._eva_start_indices[:eigenvalues.shape[0], :, :])
+        forced_coeff_start = torch.gather(forced_coeff, -1, self._ctr_start_indices[:forced_coeff.shape[0], :, :])
 
         horizon = self.cfg['horizon']
-        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, eigenvalues_start, horizon)
+        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon, eigenvalues_start, forced_coeff_start)
 
         applied_ctr = self._apply_ctr(
-            control,
+            force,
             torch.gather(eigenvalues, -1, self._eva_f_indices[:eigenvalues.shape[0], :, :]))
 
         eigenfunctions_pred = eigenfunctions_pred + applied_ctr
@@ -158,7 +161,7 @@ class deep_koopman:
         # return the sum of all losses
         return loss, err_recon, err_pred, err_mode
 
-    def predict(self, timeseries: torch.Tensor, control: torch.Tensor, horizon: int) -> torch.Tensor:
+    def predict(self, timeseries: torch.Tensor, force: torch.Tensor, horizon: int) -> torch.Tensor:
         """
         """
 
@@ -170,11 +173,13 @@ class deep_koopman:
 
         eigenvalues_start = self.dynamics(eigenfunctions_start)
 
+        forced_coeff_start = self.force_coupler(force)
+
         # predict eigenfunctions from start up to horizon
-        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, eigenvalues_start, horizon)
+        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon, eigenvalues_start, forced_coeff_start)
 
         applied_ctr = self._apply_ctr(
-            control,
+            force,
             torch.gather(eigenvalues_start, -1, self._eva_f_indices[:eigenvalues_start.shape[0], :, :]))
 
         eigenfunctions_pred = eigenfunctions_pred + applied_ctr
@@ -182,7 +187,78 @@ class deep_koopman:
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfunctions_pred)
 
-    def _predict_efn(self, efn_start: torch.Tensor, eva_start: torch.Tensor, horizon: int) -> torch.Tensor:
+    def _build_mat_a(self, eva: torch.Tensor, horizon: int) -> torch.Tensor:
+
+        # build a rotation matrix for every provided eigenvalue
+        #
+        # built matrices are shaped as [B, C_efn, C_efn], where B and C_efn are the number of batches
+        # and eigenfunction channels, respectively
+        dt = self.cfg['timestep']
+        mat = torch.stack([eigenvalue.to_rotation_diag(eva_i[torch.newaxis, 0] * dt) for eva_i in eva], dim=0)
+
+        # raise built matrices to powers covering all horizon
+        #
+        # powered matrices are shaped as [B, H - 1, C_efn, C_efn], where H is the number of horizon steps and -1
+        # is because we do not predict the first time step
+        #
+        # note that rotation matrices are transposed to allow multiplication with points
+        # shaped as rows, e.g. [1, C_efn]
+        return torch.stack([
+            torch.transpose(
+                torch.linalg.matrix_power(mat, h), -2, -1) for h in range(1, horizon)], dim=1)
+
+    def _build_mat_b(self, forced_coeff: torch.Tensor, mat_a: torch.Tensor) -> torch.Tensor:
+
+        # gather the starting points of every batch element, i.e. of every force trajectory
+        #
+        # the points are shaped as [B, 1, C_force], where B and C_force are the number of
+        # batch elements and force data channels, respectively
+        #force_start = torch.gather(force, -1, self._ctr_start_indices[:force.shape[0], :, :])
+
+        # scatter forced coefficients in a zero-filled matrix
+        #
+        # by zero-filling this B matrix right from the start, we declare that
+        # the first row of a 2x1 matrix B is a zero, and the forced
+        # coefficient goes into the second row
+        #
+        # matrix B is shaped as [B, C_efn, 1], where B and C_efn are the number of batches
+        # and eigenfunction channels, respectively
+        bch_n = forced_coeff.shape[0]
+        mat_b = torch.zeros(bch_n,
+                            1,
+                            self.cfg['efn_dims_n'],
+                            dtype=forced_coeff.dtype).scatter_(-1,
+                                                               self._forced_coeff_indices[:bch_n, :, :],
+                                                               forced_coeff)
+
+        # add an extra singleton dimension after the batch dimension to allow broadcasting
+        # during multiplication with matrix A
+        mat_b = torch.unsqueeze(mat_b, 1)
+
+        # multiply matrices A and B
+        #
+        # the idea is that u's (force inputs) that come after the first one must be affected
+        # by the previous dynamics, i.e. by the previous version of matrix A, so
+        # corresponding matrices B must be transformed by the right A's
+        #
+        # here, matrices A start with A^1, A^2 and so on, so we multiply these matrices
+        # to get A*B, A^2*B and so on, excluding the final matrix A^(H - 1),
+        # where H is the horizon of prediction, so the shape
+        # must be [B, H - 2, C_efn, 1]
+        mat_ab = torch.matmul(mat_a[:, :-1, :, :], mat_b)
+
+        print(mat_b.shape)
+        print(mat_ab.shape)
+        print(tata.shape)
+
+        # return the final version of matrices B by concatenating the first matrix B, which
+        # has no previous matrix A influence, and the rest of matrices B,
+        # which have this influence
+        #
+        # matrices B must now be shaped as [B, H - 1, C_efn, 1]
+        return torch.cat([mat_b, mat_ab], dim=1)
+
+    def _predict_efn(self, start: torch.Tensor, horizon: int, eva: torch.Tensor, forced_coeff: torch.Tensor) -> torch.Tensor:
         """
         Predicts eigenfunction from a start point ``efn_start`` up to ``horizon``. The start
         point ``efn_start`` must be shaped as [B, 1, C], where B and C_efn are the
@@ -190,32 +266,18 @@ class deep_koopman:
         The predicted eigenfunction is shaped as [B, horizon, C_efn].
         """
 
-        # based on provided eigenvalues, build a rotation matrix for every trajectory
-        #
-        # built matrices are shaped as [B, 2, 2]
-        dt = self.cfg['timestep']
-        matrices = torch.stack([self.dynamics.to_rotation_diag(eva[torch.newaxis, 0] * dt) for eva in eva_start], dim=0)
-
-        # raise built matrices to powers covering all horizon
-        #
-        # powered matrices are shaped as [B, H - 1, 2, 2], where H is the number of horizon steps and -1
-        # is because we do not predict the first time step
-        #
-        # note that the rotation matrices are then transposed to allow multiplication with
-        # eigenfunction starting values shaped as rows, i.e. [1, C_efn]
-        matpows = torch.stack([
-            torch.transpose(
-                torch.linalg.matrix_power(matrices, h), -2, -1) for h in range(1, horizon)], dim=1)
+        mat_a = self._build_mat_a(eva, horizon)
+        #mat_b = self._build_mat_b(forced_coeff, mat_a)
 
         # starting values are shaped as [B, 1, 1, C_efn] to allow tensor broadcasting when
         # multiplying by rotation matrices
-        efn_start = torch.unsqueeze(efn_start, 1)
+        efn_start = torch.unsqueeze(start, 1)
 
         # predict eigenfunctions by multiplying their starting values by powered rotation matrices
         #
         # both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, C_efn], i.e.
         # batches with eigenfunction trajectories consisting of inidividual points [1, C_efn]
-        efn_pred = torch.matmul(efn_start, matpows)
+        efn_pred = torch.matmul(efn_start, mat_a)
 
         # remove singleton dimensions that were needed for the broadcasting of multiplication
         efn_start = torch.squeeze(efn_start, 1)
@@ -239,12 +301,12 @@ class deep_koopman:
         #k = self.ctr_input(ctr_start)
 
         #mat_coeff = -k * torch.square(eva_f)
-        mat_coeff = self.ctr_input(ctr_start)
+        mat_coeff = self.force_coupler(ctr_start)
 
         mat = torch.zeros(ctr.shape[0],
                           1,
                           self.cfg['efn_dims_n'],
-                          dtype=mat_coeff.dtype).scatter_(-1, self._ctr_mat_indices[:ctr.shape[0], :, :], mat_coeff)
+                          dtype=mat_coeff.dtype).scatter_(-1, self._forced_coeff_indices[:ctr.shape[0], :, :], mat_coeff)
 
         applied_ctr = torch.matmul(ctr, mat)
 
@@ -266,7 +328,7 @@ class deep_koopman:
     def parameters(self):
         """Returns the parameters of internal neural networks."""
         params = []
-        modules = self.decomposer, self.reconstructor, self.dynamics, self.ctr_input
+        modules = self.decomposer, self.reconstructor, self.dynamics, self.force_coupler
         for module in modules: params.extend(list(module.parameters()))
         return params
 
@@ -284,6 +346,10 @@ class deep_koopman:
 # - eigenfunction
 
 class eigenfunction:
+    # we are working with radial eigenfunctions, and these can be described in
+    # a two-dimensional phase space
+    rad_dims_n = 2
+
     def __init__(self, timeseries_dims_n: int = 2, eigenfunc_dims_n: int = 2, inversed: bool = False):
         """
         Constructs a fully-connected neural network that transforms input timeseries into
@@ -329,14 +395,10 @@ class eigenvalue:
         Koopman eigenfunctions into eigenvalues.
         """
 
-        # eigenvalues will be derived from radial eigenfunctions, and these
-        # can be described in a two-dimensional space
-        self.rad_dims_n = 2
-
         # since an eigenfunction may have more dimensions than 2, a respective number of
         # neural networks is created to process two-dimensional parts
         # of the eigenfunction space in parallel
-        nets_n = int(efn_dims_n / self.rad_dims_n)
+        nets_n = int(efn_dims_n / eigenfunction.rad_dims_n)
         self.nets = [utils.fcnn(
             features=[1, 128, self.eva_props_n],
             actfunc='relu') for _ in range(nets_n)]
@@ -349,7 +411,7 @@ class eigenvalue:
         """
 
         # split an eigenfunction into two-dimensional radial subfunctions
-        eigenfuncs_rad = torch.split(eigenfunctions, self.rad_dims_n, dim=2)
+        eigenfuncs_rad = torch.split(eigenfunctions, eigenfunction.rad_dims_n, dim=2)
 
         # apply a dedicated neural network to each two-dimensional eigenfunction
         #
@@ -360,11 +422,12 @@ class eigenvalue:
         return torch.cat([
             net(self.constrain_rad(efn)) for net, efn in zip(self.nets, eigenfuncs_rad)], dim=2)
 
-    def to_rotation_diag(self, eigenvalues: torch.Tensor):
+    @staticmethod
+    def to_rotation_diag(eigenvalues: torch.Tensor):
         """Uses ``eigenvalues`` to assemble a matrix with 2x2 rotation matrices on its diagonal."""
 
         # split incoming eigenvalues along the last, i.e. channel, dimension
-        evas = torch.split(eigenvalues, self.eva_props_n, dim=-1)
+        evas = torch.split(eigenvalues, eigenvalue.eva_props_n, dim=-1)
 
         return torch.block_diag(*[utils.make_rotation(
             exponent=eva[0, 0],
@@ -387,26 +450,30 @@ class eigenvalue:
 
 
 # ---------------------------------------------------------------------------*/
-# - control input matrix
+# - 
 
-class control_matrix:
-    def __init__(self, ctr_dims_n: int = 1, efn_dims_n: int = 2, mat_dims_n: int = 1) -> None:
+class forced_eigenfunction:
+    def __init__(self, force_dims_n: int = 1, efn_dims_n: int = 2) -> None:
 
-        # control will be applied to radial eigenfunctions, and these
-        # are described in a two-dimensional space
-        rad_dims_n = 2
+        # there are n neural networks serving each pair of radial eigenfunctions
+        nets_n = int(efn_dims_n / eigenfunction.rad_dims_n)
 
-        # there will be n neural networks
-        nets_n = int(efn_dims_n / rad_dims_n)
-
+        # construct n fully-connected neural networks
+        #
+        # note that currently the output of these networks is one-dimensional, i.e.
+        # this output applies only to one dimension of a radial eigenfunction,
+        # the other one will be simply zeroed; TODO: change this if need be
         self.nets = [utils.fcnn(
-            features=[ctr_dims_n, 128, mat_dims_n],
+            features=[force_dims_n, 128, 1],
             actfunc='relu') for _ in range(nets_n)]
 
-    def __call__(self, control: torch.Tensor) -> torch.Tensor:
+    def __call__(self, force: torch.Tensor) -> torch.Tensor:
 
-        return torch.cat([
-            net(control) for net in self.nets], dim=2)
+        # pass input force through neural networks to get force/coupling coefficients
+        #
+        # note that the outputs of the networks are concatenated along the last,
+        # i.e. channel, dimension
+        return torch.cat([net(force) for net in self.nets], dim=-1)
 
     def parameters(self):
         """Returns the parameters of internal neural networks."""
