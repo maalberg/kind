@@ -115,13 +115,8 @@ class deep_koopman:
         forced_coeff_start = torch.gather(forced_coeff, -1, self._ctr_start_indices[:forced_coeff.shape[0], :, :])
 
         horizon = self.cfg['horizon']
-        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon, eigenvalues_start, forced_coeff_start)
-
-        applied_ctr = self._apply_ctr(
-            force,
-            torch.gather(eigenvalues, -1, self._eva_f_indices[:eigenvalues.shape[0], :, :]))
-
-        eigenfunctions_pred = eigenfunctions_pred + applied_ctr
+        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon,
+                                                eigenvalues_start, force, forced_coeff_start)
 
         # reconstruct timeseries
         timeseries_recon = self.reconstructor(eigenfunctions_pred)
@@ -176,13 +171,8 @@ class deep_koopman:
         forced_coeff_start = self.force_coupler(force)
 
         # predict eigenfunctions from start up to horizon
-        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon, eigenvalues_start, forced_coeff_start)
-
-        applied_ctr = self._apply_ctr(
-            force,
-            torch.gather(eigenvalues_start, -1, self._eva_f_indices[:eigenvalues_start.shape[0], :, :]))
-
-        eigenfunctions_pred = eigenfunctions_pred + applied_ctr
+        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon,
+                                                eigenvalues_start, force, forced_coeff_start)
 
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfunctions_pred)
@@ -208,12 +198,6 @@ class deep_koopman:
                 torch.linalg.matrix_power(mat, h), -2, -1) for h in range(1, horizon)], dim=1)
 
     def _build_mat_b(self, forced_coeff: torch.Tensor, mat_a: torch.Tensor) -> torch.Tensor:
-
-        # gather the starting points of every batch element, i.e. of every force trajectory
-        #
-        # the points are shaped as [B, 1, C_force], where B and C_force are the number of
-        # batch elements and force data channels, respectively
-        #force_start = torch.gather(force, -1, self._ctr_start_indices[:force.shape[0], :, :])
 
         # scatter forced coefficients in a zero-filled matrix
         #
@@ -241,24 +225,23 @@ class deep_koopman:
         # by the previous dynamics, i.e. by the previous version of matrix A, so
         # corresponding matrices B must be transformed by the right A's
         #
-        # here, matrices A start with A^1, A^2 and so on, so we multiply these matrices
-        # to get A*B, A^2*B and so on, excluding the final matrix A^(H - 1),
-        # where H is the horizon of prediction, so the shape
-        # must be [B, H - 2, C_efn, 1]
-        mat_ab = torch.matmul(mat_a[:, :-1, :, :], mat_b)
-
-        print(mat_b.shape)
-        print(mat_ab.shape)
-        print(tata.shape)
+        # here, matrices A start with A^1, A^2, etc., and these matrices are transposed (!), so
+        # we multiply these matrices with transposed matrices B to get B*A, B*A^2 and so on,
+        # excluding the final matrix A^(H - 1), where H is the horizon of prediction
+        #
+        # finally, matrices BA must be shaped as [B, H - 2, 1, C_efn]
+        mat_ab = torch.matmul(mat_b, mat_a[:, :-1, :, :])
 
         # return the final version of matrices B by concatenating the first matrix B, which
         # has no previous matrix A influence, and the rest of matrices B,
         # which have this influence
         #
-        # matrices B must now be shaped as [B, H - 1, C_efn, 1]
+        # matrices B must now be shaped as [B, H - 1, 1, C_efn]
         return torch.cat([mat_b, mat_ab], dim=1)
 
-    def _predict_efn(self, start: torch.Tensor, horizon: int, eva: torch.Tensor, forced_coeff: torch.Tensor) -> torch.Tensor:
+    def _predict_efn(self,
+                     start: torch.Tensor, horizon: int,
+                     eva: torch.Tensor, force: torch.Tensor, forced_coeff: torch.Tensor) -> torch.Tensor:
         """
         Predicts eigenfunction from a start point ``efn_start`` up to ``horizon``. The start
         point ``efn_start`` must be shaped as [B, 1, C], where B and C_efn are the
@@ -267,52 +250,33 @@ class deep_koopman:
         """
 
         mat_a = self._build_mat_a(eva, horizon)
-        #mat_b = self._build_mat_b(forced_coeff, mat_a)
+        mat_b = self._build_mat_b(forced_coeff, mat_a)
 
-        # starting values are shaped as [B, 1, 1, C_efn] to allow tensor broadcasting when
-        # multiplying by rotation matrices
-        efn_start = torch.unsqueeze(start, 1)
+        print(mat_a.shape)
+        print(mat_b.shape)
+        print(mat_b[0])
+        print(tata.shape)
+
+        # starting values of eigenfunctions are reshaped as [B, 1, 1, C_efn] to allow tensor broadcasting
+        # when multiplying by rotation matrices
+        #
+        # this basically means that for every trajectory we have one start value shaped as [1, C_efn]
+        start = torch.unsqueeze(start, -2)
+
+        # force values are reshaped as [B, H - 1, 1, C_force] to multiply them by B matrices one to one
+        force = torch.unsqueeze(force[:, :horizon-1, :], -2)
 
         # predict eigenfunctions by multiplying their starting values by powered rotation matrices
         #
         # both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, C_efn], i.e.
         # batches with eigenfunction trajectories consisting of inidividual points [1, C_efn]
-        efn_pred = torch.matmul(efn_start, mat_a)
+        efn_pred = torch.matmul(start, mat_a) + torch.matmul(force, mat_b)
 
         # remove singleton dimensions that were needed for the broadcasting of multiplication
-        efn_start = torch.squeeze(efn_start, 1)
+        start = torch.squeeze(start, -2)
         efn_pred  = torch.squeeze(efn_pred, -2)
 
-        return torch.cat([efn_start, efn_pred], dim=1)
-
-    def _apply_ctr(self, ctr: torch.Tensor, eva_f: torch.Tensor) -> torch.Tensor:
-
-        # gather the starting points of every batch element, i.e. of every control trajectory
-        #
-        # the points are shaped as [B, 1, C_ctr], where B and C_ctr are the number of
-        # batch elements and control data channels, respectively
-        ctr_start = torch.gather(ctr, -1, self._ctr_start_indices[:ctr.shape[0], :, :])
-
-        # transform the starting points into a B matrix coefficient
-        #
-        # The idea is that a 2x2 system matrix A is accompanied by a 2x1 input matrix B, and
-        # the first row of matrix B is a zero. So a neural network derives the second
-        # row element. Accordingly, this derived coefficient is shaped as [B, 1, 1].
-        #k = self.ctr_input(ctr_start)
-
-        #mat_coeff = -k * torch.square(eva_f)
-        mat_coeff = self.force_coupler(ctr_start)
-
-        mat = torch.zeros(ctr.shape[0],
-                          1,
-                          self.cfg['efn_dims_n'],
-                          dtype=mat_coeff.dtype).scatter_(-1, self._forced_coeff_indices[:ctr.shape[0], :, :], mat_coeff)
-
-        applied_ctr = torch.matmul(ctr, mat)
-
-        self.k = torch.mean(mat_coeff)
-
-        return applied_ctr
+        return torch.cat([start, efn_pred], dim=1)
 
     def _get_mode_err(self, efn: torch.Tensor, eva: torch.Tensor) -> torch.Tensor:
 
