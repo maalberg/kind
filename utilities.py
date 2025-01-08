@@ -47,7 +47,6 @@ class fcnn(torch.nn.Module):
         'relu'    torch.nn.ReLU
         'tanh'    torch.nn.Tanh
         'linear'  torch.nn.Identity
-        'prune'   utilities.feature_prune
         """
         super().__init__()        
 
@@ -83,8 +82,6 @@ class fcnn(torch.nn.Module):
             a = torch.nn.Tanh
         elif name == 'linear':
             a = torch.nn.Identity
-        elif name == 'prune':
-            a = feature_prune
         else:
             raise ValueError(f'unknown activation function passed: {name}')
         return a()
