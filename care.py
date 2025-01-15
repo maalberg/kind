@@ -54,8 +54,11 @@ class deep_koopman:
 
         eva_all_dims_n = modes_n * eigenvalue.eva_props_n
 
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(ctr_dims_n)]), dim=0), dim=0)
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(modes_n)]), dim=0), dim=0)
         self._ctr_start_indices = indices.repeat(starts_n, 1, 1)
+
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([2*i+1 for i in range(modes_n)]), dim=0), dim=0)
+        self._forced_coeff_indices = indices.repeat(starts_n, 1, 1)
 
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(data_dims_n)]), dim=0), dim=0)
         self._ts_start_indices = indices.repeat(starts_n, 1, 1)
@@ -65,9 +68,6 @@ class deep_koopman:
 
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(eva_all_dims_n)]), dim=0), dim=0)
         self._eva_start_indices = indices.repeat(starts_n, 1, 1)
-
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([2*i+1 for i in range(modes_n)]), dim=0), dim=0)
-        self._forced_coeff_indices = indices.repeat(starts_n, 1, 1)
 
         # assemble indices to extract frequency properties of eigenvalues
         #
