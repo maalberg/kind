@@ -48,7 +48,7 @@ class fcnn(torch.nn.Module):
         'tanh'    torch.nn.Tanh
         'linear'  torch.nn.Identity
         """
-        super().__init__()        
+        super().__init__()
 
         # use a helper constant to define the number of hidden layers
         hidden_n = len(features) - 2
@@ -95,3 +95,7 @@ def make_rotation(exponent: torch.Tensor = torch.tensor(0.), angle: torch.Tensor
         torch.stack([torch.cos(angle), -torch.sin(angle)]),
         torch.stack([torch.sin(angle),  torch.cos(angle)])])
 
+def make_a(q, w):
+    return torch.stack([
+        torch.stack([torch.tensor(0.), torch.tensor(1.)]),
+        torch.stack([-torch.square(w),  -w/q])])

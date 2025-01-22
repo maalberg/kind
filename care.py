@@ -1,4 +1,5 @@
 import torch
+from matplotlib import pyplot as plt
 
 import utilities as utils
 
@@ -6,7 +7,7 @@ import utilities as utils
 # ---------------------------------------------------------------------------*/
 # - deep Koopman neural network for a dynamic mode decomposition
 
-class deep_koopman:
+class deep_koopman(torch.nn.Module):
     """
     Creates an autoencoder-based neural network that is expected to decompose
     dynamical modes of a system from simulated or experimental data.
@@ -16,8 +17,13 @@ class deep_koopman:
         Constructs an instance of a dynamic mode decomposition based on the given ``configuration``.
         The ``configuration`` is a dictionary with key-value pairs.
         """
+        super().__init__()
 
         self._init(configuration)
+
+        #self.k = torch.nn.Parameter(torch.ones(1))
+        #self.q = torch.nn.Parameter(torch.ones(1))
+        self.w = torch.nn.Parameter(torch.ones(1))
 
         efn_dims_n  = self.cfg['efn_dims_n']
         data_dims_n = self.cfg['data_dims_n']
@@ -32,9 +38,9 @@ class deep_koopman:
         self.reconstructor = eigenfunction(data_dims_n, efn_dims_n, inversed=True)
 
         # create a neural network that will derive dynamics from the decomposed eigenfunctions
-        self.dynamics = eigenvalue(efn_dims_n)
+        #self.dynamics = eigenvalue(efn_dims_n)
 
-        self.force_coupler = forced_eigenfunction(force_dims_n=ctr_dims_n, efn_dims_n=efn_dims_n)
+        #self.force_coupler = forced_eigenfunction(force_dims_n=ctr_dims_n, efn_dims_n=efn_dims_n)
 
     def _init(self, configuration: dict) -> None:
         """Initializes the ``configuration`` of this class."""
@@ -86,7 +92,7 @@ class deep_koopman:
             torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
         self._eva_f_targets = torch.unsqueeze(targets, 1)
 
-    def fit(self, timeseries: torch.Tensor, force: torch.Tensor) -> torch.Tensor:
+    def fit(self, timeseries: torch.Tensor, dxdt: torch.Tensor, force: torch.Tensor, now) -> torch.Tensor:
         """
         """
 
@@ -100,16 +106,18 @@ class deep_koopman:
         # is the number of channels in an eigenvalue
         #
         # these complete eigenvalue trajectories are further used throughout this method
-        eigenvalues = self.dynamics(eigenfunctions)
-
-        forced_coeff = self.force_coupler(force)
+        #eigenvalues = self.dynamics(eigenfunctions)
+        eigenvalues_start = torch.unsqueeze(torch.unsqueeze(torch.tensor([10., self.w*0.001]), dim=0), dim=0)
+        eigenvalues_start = eigenvalues_start.repeat(timeseries.shape[0], 1, 1)
 
         # gather the starting points of eigenfunctions with their corresponding eigenvalues
         #
         # the indices of starting points must be corrected according to the current number of batch elements
         eigenfunctions_start = torch.gather(eigenfunctions, -1, self._efn_start_indices[:eigenfunctions.shape[0], :, :])
-        eigenvalues_start = torch.gather(eigenvalues, -1, self._eva_start_indices[:eigenvalues.shape[0], :, :])
-        forced_coeff_start = torch.gather(forced_coeff, -1, self._ctr_start_indices[:forced_coeff.shape[0], :, :])
+        #eigenvalues_start = torch.gather(eigenvalues, -1, self._eva_start_indices[:eigenvalues.shape[0], :, :])
+
+        forced_coeff_start = torch.unsqueeze(torch.unsqueeze(torch.tensor(1.), dim=0), dim=0)
+        forced_coeff_start = forced_coeff_start.repeat(timeseries.shape[0], 1, 1)
 
         horizon = self.cfg['horizon']
         eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon,
@@ -118,13 +126,40 @@ class deep_koopman:
         # reconstruct timeseries
         timeseries_recon = self.reconstructor(eigenfunctions_pred)
 
-        err_mode = self._get_mode_err(eigenfunctions, eigenvalues)
 
-        # prediction loss
-        err_pred = torch.mean(torch.square(eigenfunctions[:, 1:horizon, :] - eigenfunctions_pred[:, 1:horizon, :]))
+
+        dzdx = torch.autograd.grad(eigenfunctions, timeseries, torch.ones_like(eigenfunctions), create_graph=True)[0]
+        dzdt = dzdx * dxdt
+
+        dz1dt_ode = eigenfunctions[:,:,1]
+        dz2dt_ode = -torch.square(eigenvalues_start[:,:,1]) * eigenfunctions[:,:,0] - (eigenvalues_start[:,:,1]/eigenvalues_start[:,:,0]) * eigenfunctions[:,:,1] - forced_coeff_start[:,:,0] * torch.square(eigenvalues_start[:,:,1]) * force[:,:,0]
+
+        dzdt_ode = torch.stack([dz1dt_ode, dz2dt_ode], dim=2)
+
+        if now:
+            with torch.no_grad():
+                plt.figure()
+                #plt.plot(dxdt[0, :, 0])
+                plt.plot(dzdt[0, :, 0])
+                plt.plot(dzdt_ode[0, :, 0])
+                #plt.legend()
+                plt.show()
+                #print(self.q)
+                print(self.w)
+                #print(self.k)
+
+        criterion_phys = torch.nn.MSELoss(reduction='mean')
+        err_phys = criterion_phys(dzdt, dzdt_ode)
+
+
+
+        # linearity loss
+        criterion_lin = torch.nn.MSELoss(reduction='mean')
+        err_lin = criterion_lin(eigenfunctions[:, 1:horizon, :], eigenfunctions_pred[:, 1:horizon, :])
 
         # reconstruction loss
-        err_recon = torch.mean(torch.square(timeseries[:, :horizon, :] - timeseries_recon))
+        criterion_recon = torch.nn.MSELoss(reduction='mean')
+        err_recon = criterion_recon(timeseries[:, :horizon, :], timeseries_recon)
 
         # L2 regularization to avoid big weights
         err_big_weights = torch.sum(
@@ -137,21 +172,21 @@ class deep_koopman:
                 [torch.abs(param.view(-1)) for param in self.parameters()]))
 
         hp_recon          = self.cfg['loss_hp_recon']
-        hp_pred           = self.cfg['loss_hp_pred']
-        hp_mode           = self.cfg['loss_hp_mode']
+        hp_lin            = self.cfg['loss_hp_lin']
+        hp_phys           = self.cfg['loss_hp_phys']
         hp_big_weights    = self.cfg['loss_hp_big_weights']
         hp_sparse_weights = self.cfg['loss_hp_sparse_weights']
 
         err_recon          = hp_recon * err_recon
-        err_pred           = hp_pred * err_pred
-        err_mode           = hp_mode * err_mode
+        err_lin            = hp_lin * err_lin
+        err_phys           = hp_phys * err_phys
         err_big_weights    = hp_big_weights * err_big_weights
         err_sparse_weights = hp_sparse_weights * err_sparse_weights
 
-        loss = err_recon + err_pred + err_mode + err_big_weights + err_sparse_weights
+        loss = err_recon + err_lin + err_big_weights + err_sparse_weights + err_phys
 
         # return the sum of all losses
-        return loss, err_recon, err_pred, err_mode
+        return loss, err_recon, err_lin, err_phys
 
     def predict(self, timeseries: torch.Tensor, force: torch.Tensor, horizon: int) -> torch.Tensor:
         """
@@ -159,16 +194,20 @@ class deep_koopman:
 
         # decompose starting values into corresponding eigenfunctions
         eigenfunctions = self.decomposer(timeseries)
-        eigenvalues = self.dynamics(eigenfunctions)
-        forced_coeff = self.force_coupler(force)
+
+        eva = torch.unsqueeze(torch.unsqueeze(torch.tensor([10., self.w*0.001]), dim=0), dim=0)
+        eva = eva.repeat(timeseries.shape[0], 1, 1)
+
+        forced_coeff_start = torch.unsqueeze(torch.unsqueeze(torch.tensor(1.), dim=0), dim=0)
+        forced_coeff_start = forced_coeff_start.repeat(timeseries.shape[0], 1, 1)
 
         # take the starting values of the given timeseries while keeping the batch structure
         start = torch.gather(eigenfunctions, -1, self._efn_start_indices[:eigenfunctions.shape[0], :, :])
-        eva = torch.gather(eigenvalues, -1, self._eva_start_indices[:eigenvalues.shape[0], :, :])
+        #eva = torch.gather(eigenvalues, -1, self._eva_start_indices[:eigenvalues.shape[0], :, :])
 
         # predict eigenfunctions from start up to horizon
         eigenfunctions_pred = self._predict_efn(start, horizon,
-                                                eva, force, forced_coeff)
+                                                eva, force, forced_coeff_start)
 
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfunctions_pred)
@@ -211,7 +250,7 @@ class deep_koopman:
                             self.cfg['efn_dims_n'],
                             dtype=forced_coeff.dtype).scatter_(-1,
                                                                self._forced_coeff_indices[:bch_n, :, :],
-                                                               forced_coeff)
+                                                               -forced_coeff)
 
         # add an extra singleton dimension after the batch dimension to allow broadcasting
         # during multiplication with matrix A
@@ -281,6 +320,10 @@ class deep_koopman:
 
         return torch.cat([x, x_pred], dim=1)
 
+    def _calc_mode_deriv(self, efn: torch.Tensor, w, q, k, u) -> torch.Tensor:
+
+        pass
+
     def _get_mode_err(self, efn: torch.Tensor, eva: torch.Tensor) -> torch.Tensor:
 
         # correct the size of indices according to the actual size of input eigenvalues
@@ -291,13 +334,6 @@ class deep_koopman:
         targets = self._eva_f_targets[:eva.shape[0], :, :]
 
         return torch.mean(torch.square(targets - evas))
-
-    def parameters(self):
-        """Returns the parameters of internal neural networks."""
-        params = []
-        modules = self.decomposer, self.reconstructor, self.dynamics, self.force_coupler
-        for module in modules: params.extend(list(module.parameters()))
-        return params
 
     @staticmethod
     def start_of(timeseries: torch.Tensor) -> torch.Tensor:
@@ -312,7 +348,7 @@ class deep_koopman:
 # ---------------------------------------------------------------------------*/
 # - eigenfunction
 
-class eigenfunction:
+class eigenfunction(torch.nn.Module):
     # we are working with radial eigenfunctions, and these can be described in
     # a two-dimensional phase space
     rad_dims_n = 2
@@ -326,9 +362,10 @@ class eigenfunction:
         parameters ``timeseries_dims_n`` and
         ``eigenfunc_dims_n``, respectively.
         """
+        super().__init__()
 
         # define the structure of a fully-connected neural network
-        net_features = [timeseries_dims_n, 32, 32, eigenfunc_dims_n]
+        net_features = [timeseries_dims_n, 64, 64, eigenfunc_dims_n]
 
         # create a fully-connected neural network that will learn the transformation from input
         # data to Koopman eigenfunctions
@@ -343,10 +380,6 @@ class eigenfunction:
         batches, time steps and data channels, respectively.
         """
         return self.net(timeseries)
-
-    def parameters(self):
-        """Returns the parameters of internal neural networks."""
-        return self.net.parameters()
 
 
 # ---------------------------------------------------------------------------*/
@@ -396,9 +429,9 @@ class eigenvalue:
         # split incoming eigenvalues along the last, i.e. channel, dimension
         evas = torch.split(eigenvalues, eigenvalue.eva_props_n, dim=-1)
 
-        return torch.block_diag(*[utils.make_rotation(
-            exponent=eva[0, 0],
-            angle=eva[0, 1]) for eva in evas])
+        return torch.block_diag(*[utils.make_a(
+            eva[0, 0],
+            eva[0, 1]) for eva in evas])
 
     def parameters(self):
         """Returns the parameters of internal neural networks."""
