@@ -29,8 +29,10 @@ class deep_koopman(torch.nn.Module):
         data_dims_n = self.cfg['data_dims_n']
         ctr_dims_n  = self.cfg['ctr_dims_n']
 
-        self.encoder = eigenfunction(data_dims_n, efn_dims_n)
-        self.decoder = eigenfunction(data_dims_n, efn_dims_n, inversed=True)
+        self.ae = utils.autoencoder(data_dims_n, efn_dims_n)
+
+        #self.encoder = eigenfunction(data_dims_n, efn_dims_n)
+        #self.decoder = eigenfunction(data_dims_n, efn_dims_n, inversed=True)
 
     def _init(self, configuration: dict) -> None:
         """Initializes the ``configuration`` of this class."""
@@ -90,8 +92,8 @@ class deep_koopman(torch.nn.Module):
         #
         # eigenfunctions are shaped as [B, T, C_efn], where C_efn denotes the number of
         # channels in eigenfunctions, i.e. in the latent space of this autoencoder
-        z = self.encoder(x)
-        x_ae = self.decoder(z)
+        z = self.ae.enc(x)
+        x_ae = self.ae.dec(z)
 
         loss_fn_ae = torch.nn.MSELoss(reduction='mean')
         loss_ae = loss_fn_ae(x_ae, x)
@@ -117,7 +119,7 @@ class deep_koopman(torch.nn.Module):
                                                 eigenvalues_start, u, forced_coeff_start)
 
         # reconstruct timeseries
-        timeseries_recon = self.decoder(eigenfunctions_pred)
+        timeseries_recon = self.ae.dec(eigenfunctions_pred)
 
 
 
@@ -342,43 +344,6 @@ class deep_koopman(torch.nn.Module):
 
 
 # ---------------------------------------------------------------------------*/
-# - eigenfunction
-
-class eigenfunction(torch.nn.Module):
-    # we are working with radial eigenfunctions, and these can be described in
-    # a two-dimensional phase space
-    rad_dims_n = 2
-
-    def __init__(self, timeseries_dims_n: int = 2, eigenfunc_dims_n: int = 2, inversed: bool = False):
-        """
-        Constructs a fully-connected neural network that transforms input timeseries into
-        Koopman eigenfunctions (or vice versa if ``inversed`` is set to True).
-        The underlying neural network is parameterized by the number of
-        dimensions in timeseries and eigenfunction, represented by
-        parameters ``timeseries_dims_n`` and
-        ``eigenfunc_dims_n``, respectively.
-        """
-        super().__init__()
-
-        # define the structure of a fully-connected neural network
-        net_features = [timeseries_dims_n, 64, 64, eigenfunc_dims_n]
-
-        # create a fully-connected neural network that will learn the transformation from input
-        # data to Koopman eigenfunctions
-        self.net = utils.fcnn(
-            features=net_features if inversed==False else list(reversed(net_features)),
-            actfunc='relu')
-
-    def __call__(self, timeseries: torch.Tensor) -> torch.Tensor:
-        """
-        Decomposes ``timeseries`` into eigenfunctions. Input ``timeseries`` are expected
-        to be formatted as [B, T, C], where B, T, and C are the number of
-        batches, time steps and data channels, respectively.
-        """
-        return self.net(timeseries)
-
-
-# ---------------------------------------------------------------------------*/
 # - eigenvalue
 
 class eigenvalue:
@@ -443,37 +408,4 @@ class eigenvalue:
         time steps, respectively. Radius is derived from 2 dimensions.
         """
         return torch.sum(torch.square(eigenfunctions), dim=-1, keepdim=True)
-
-
-# ---------------------------------------------------------------------------*/
-# - 
-
-class forced_eigenfunction:
-    def __init__(self, force_dims_n: int = 1, efn_dims_n: int = 2) -> None:
-
-        # there are n neural networks serving each pair of radial eigenfunctions
-        nets_n = int(efn_dims_n / eigenfunction.rad_dims_n)
-
-        # construct n fully-connected neural networks
-        #
-        # note that currently the output of these networks is one-dimensional, i.e.
-        # this output applies only to one dimension of a radial eigenfunction,
-        # the other one will be simply zeroed; TODO: change this if need be
-        self.nets = [utils.fcnn(
-            features=[force_dims_n, 128, 1],
-            actfunc='relu') for _ in range(nets_n)]
-
-    def __call__(self, force: torch.Tensor) -> torch.Tensor:
-
-        # pass input force through neural networks to get force/coupling coefficients
-        #
-        # note that the outputs of the networks are concatenated along the last,
-        # i.e. channel, dimension
-        return torch.cat([net(force) for net in self.nets], dim=-1)
-
-    def parameters(self):
-        """Returns the parameters of internal neural networks."""
-        params = []
-        for net in self.nets: params.extend(list(net.parameters()))
-        return params
 

@@ -21,6 +21,9 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     return torch.reshape(data, (datachunks_n, datachunk_len, data.shape[1]))
 
 
+# ---------------------------------------------------------------------------*/
+# - write data to a file
+
 def write_datafile(name: str, data) -> None:
     filedata = np.reshape(data, (data.shape[0] * data.shape[1], data.shape[2]))
     np.savetxt('./data/' + name + '.csv', filedata, fmt='%.14f', delimiter=',')
@@ -30,7 +33,7 @@ def write_datafile(name: str, data) -> None:
 # - fully-connected neural network
 
 class fcnn(torch.nn.Module):
-    def __init__(self, features: list[int] = [1, 16 , 1], actfunc: str = 'relu', actfunc_out: str = 'linear') -> None:
+    def __init__(self, features: list[int] = [1, 16 , 1], act_fn_hidden: str = 'relu', act_fn_out: str = 'linear') -> None:
         """
         Constructs a fully-connected neural network with specified ``features`` and ``activation``.
 
@@ -39,10 +42,10 @@ class fcnn(torch.nn.Module):
         input, the network has one hidden layer with 16 neurons, and the
         network produces a one-dimensional output.
 
-        The ``actfunc`` is a string name for activation functions, e.g. a string 'relu'
+        The ``act_fn_hidden`` is a string name for activation functions, e.g. a string 'relu'
         translates into the torch class torch.nn.ReLU. The network will have one
-        single ``actfunc`` everywhere, except for the output layer - this
-        one can be specified using ``actfunc_out``. Currently
+        single ``act_fn_hidden`` everywhere, except for an output layer -
+        this one can be specified using ``act_fn_out``. Currently
         supported activation strings/functions are:
         'relu'    torch.nn.ReLU
         'tanh'    torch.nn.Tanh
@@ -57,7 +60,7 @@ class fcnn(torch.nn.Module):
         # note that the number of hidden layers is incremented to accomodate the output layer,
         # so as long as we are counting hidden layers, these are set to user-specified
         # activation, but when we reach the output layer, it is set to user-defined string
-        activations = [actfunc if i < hidden_n else actfunc_out for i in range(hidden_n + 1)]
+        activations = [act_fn_hidden if i < hidden_n else act_fn_out for i in range(hidden_n + 1)]
 
         # construct a neural network;
         # note that the bias of all layers, the output included, is set to true
@@ -85,6 +88,28 @@ class fcnn(torch.nn.Module):
         else:
             raise ValueError(f'unknown activation function passed: {name}')
         return a()
+
+
+# ---------------------------------------------------------------------------*/
+# autoencoder based on fully-connected neural networks
+
+class autoencoder(torch.nn.Module):
+    def __init__(self, x_dims_n: int = 2, z_dims_n: int = 2) -> None:
+        super().__init__()
+
+        # define the structure of a fully-connected neural network
+        net_features = [x_dims_n, 64, 64, z_dims_n]
+
+        self.enc = fcnn(features=net_features, act_fn_hidden='relu')
+        self.dec = fcnn(features=list(reversed(net_features)), act_fn_hidden='relu')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encodes timeseries ``x`` into a latent space z and then immediately decodes z back to ``x``.
+        Input ``x`` is expected to be formatted as [B, T, C], where B, T, and C are
+        the number of batches, time steps and data channels, respectively.
+        """
+        return self.dec(self.enc(x))
 
 
 # ---------------------------------------------------------------------------*/
