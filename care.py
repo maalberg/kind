@@ -21,18 +21,15 @@ class deep_koopman(torch.nn.Module):
 
         self._init(configuration)
 
-        #self.k = torch.nn.Parameter(torch.ones(1))
-        #self.q = torch.nn.Parameter(torch.ones(1))
+        self.k = torch.nn.Parameter(torch.ones(1))
+        self.q = torch.nn.Parameter(torch.ones(1))
         self.w = torch.nn.Parameter(torch.ones(1))
 
         efn_dims_n  = self.cfg['efn_dims_n']
         data_dims_n = self.cfg['data_dims_n']
         ctr_dims_n  = self.cfg['ctr_dims_n']
 
-        self.ae = utils.autoencoder(data_dims_n, efn_dims_n)
-
-        #self.encoder = eigenfunction(data_dims_n, efn_dims_n)
-        #self.decoder = eigenfunction(data_dims_n, efn_dims_n, inversed=True)
+        self.autoencoder = utils.autoencoder(data_dims_n, efn_dims_n)
 
     def _init(self, configuration: dict) -> None:
         """Initializes the ``configuration`` of this class."""
@@ -88,73 +85,64 @@ class deep_koopman(torch.nn.Module):
         """
         """
 
+        loss_ae = self._fit_autoencoder(x)
+        loss_phys_dz, loss_phys_dx = self._fit_physics(x, dxdt, u, now)
+
         # decompose timeseries into eigenfunctions
         #
         # eigenfunctions are shaped as [B, T, C_efn], where C_efn denotes the number of
         # channels in eigenfunctions, i.e. in the latent space of this autoencoder
-        z = self.ae.enc(x)
-        x_ae = self.ae.dec(z)
+        #z = self.ae.enc(x)
+        #x_ae = self.ae.dec(z)
 
-        loss_fn_ae = torch.nn.MSELoss(reduction='mean')
-        loss_ae = loss_fn_ae(x_ae, x)
+        #coeffs = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w, self.k]), dim=0), dim=0)
+        #coeffs = coeffs.repeat(x.shape[0], 1, 1)
 
         # derive complete trajectories of eigenvalues that are shaped as [B, T, C_eva], where C_eva
         # is the number of channels in an eigenvalue
         #
         # these complete eigenvalue trajectories are further used throughout this method
         #eigenvalues = self.dynamics(eigenfunctions)
-        eigenvalues_start = torch.unsqueeze(torch.unsqueeze(torch.tensor([10., self.w*0.001]), dim=0), dim=0)
-        eigenvalues_start = eigenvalues_start.repeat(x.shape[0], 1, 1)
+        #eigenvalues_start = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w]), dim=0), dim=0)
+        #eigenvalues_start = eigenvalues_start.repeat(x.shape[0], 1, 1)
 
         # gather the starting points of eigenfunctions with their corresponding eigenvalues
         #
         # the indices of starting points must be corrected according to the current number of batch elements
-        eigenfunctions_start = torch.gather(z, -1, self._efn_start_indices[:z.shape[0], :, :])
 
-        forced_coeff_start = torch.unsqueeze(torch.unsqueeze(torch.tensor(1.), dim=0), dim=0)
-        forced_coeff_start = forced_coeff_start.repeat(x.shape[0], 1, 1)
+        #forced_coeff_start = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.k]), dim=0), dim=0)
+        #forced_coeff_start = forced_coeff_start.repeat(x.shape[0], 1, 1)
 
-        horizon = self.cfg['horizon']
-        eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon,
-                                                eigenvalues_start, u, forced_coeff_start)
+        #horizon = self.cfg['horizon']
+        #eigenfunctions_start = torch.gather(z, -1, self._efn_start_indices[:z.shape[0], :, :])
+        #eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon,
+                                                #eigenvalues_start, u, forced_coeff_start)
 
         # reconstruct timeseries
-        timeseries_recon = self.ae.dec(eigenfunctions_pred)
+        #timeseries_recon = self.ae.dec(eigenfunctions_pred)
 
 
 
-        dzdx = torch.autograd.grad(z, x, torch.ones_like(z), retain_graph=True)[0]
-        dzdt = dzdx * dxdt
+        #dzdx = torch.autograd.grad(z, x, torch.ones_like(z), retain_graph=True)[0]
+        #dzdt = dzdx * dxdt
 
-        dz1dt_ode = z[:,:,1]
-        dz2dt_ode = -torch.square(eigenvalues_start[:,:,1]) * z[:,:,0] - (eigenvalues_start[:,:,1]/eigenvalues_start[:,:,0]) * z[:,:,1] - forced_coeff_start[:,:,0] * torch.square(eigenvalues_start[:,:,1]) * u[:,:,0]
+        #dz1dt_ode = z[:,:,1]
+        #dz2dt_ode = -torch.square(coeffs[:,:,1]) * z[:,:,0] - (coeffs[:,:,1]/coeffs[:,:,0]) * z[:,:,1] - coeffs[:,:,2] * torch.square(coeffs[:,:,1]) * u[:,:,0]
 
-        dzdt_ode = torch.stack([dz1dt_ode, dz2dt_ode], dim=2)
+        #dzdt_ode = torch.stack([dz1dt_ode, dz2dt_ode], dim=2)
 
-        if now:
-            with torch.no_grad():
-                plt.figure()
-                #plt.plot(dxdt[0, :, 0])
-                plt.plot(dzdt[0, :, 0])
-                plt.plot(dzdt_ode[0, :, 0])
-                #plt.legend()
-                plt.show()
-                #print(self.q)
-                print(self.w)
-                #print(self.k)
-
-        loss_fn_phys = torch.nn.MSELoss(reduction='mean')
-        loss_phys = loss_fn_phys(dzdt, dzdt_ode)
+        #loss_fn_phys = torch.nn.MSELoss(reduction='mean')
+        #loss_phys = loss_fn_phys(dzdt, dzdt_ode)
 
 
 
         # linearity loss
-        criterion_lin = torch.nn.MSELoss(reduction='mean')
-        err_lin = criterion_lin(z[:, 1:horizon, :], eigenfunctions_pred[:, 1:horizon, :])
+        #criterion_lin = torch.nn.MSELoss(reduction='mean')
+        #err_lin = criterion_lin(z[:, 1:horizon, :], eigenfunctions_pred[:, 1:horizon, :])
 
         # reconstruction loss
-        criterion_recon = torch.nn.MSELoss(reduction='mean')
-        err_recon = criterion_recon(x[:, :horizon, :], timeseries_recon)
+        #criterion_recon = torch.nn.MSELoss(reduction='mean')
+        #err_recon = criterion_recon(x[:, :horizon, :], timeseries_recon)
 
         # L2 regularization to avoid big weights
         err_big_weights = torch.sum(
@@ -169,22 +157,22 @@ class deep_koopman(torch.nn.Module):
         loss_wt_ae       = self.cfg['loss_wt_ae']
         loss_wt_phys     = self.cfg['loss_wt_phys']
 
-        hp_recon          = self.cfg['loss_hp_recon']
-        hp_lin            = self.cfg['loss_hp_lin']
+        #hp_recon          = self.cfg['loss_hp_recon']
+        #hp_lin            = self.cfg['loss_hp_lin']
         hp_big_weights    = self.cfg['loss_hp_big_weights']
         hp_sparse_weights = self.cfg['loss_hp_sparse_weights']
 
         loss_ae            = loss_wt_ae * loss_ae
-        loss_phys          = loss_wt_phys * loss_phys
-        err_recon          = hp_recon * err_recon
-        err_lin            = hp_lin * err_lin
+        loss_phys          = loss_wt_phys * (loss_phys_dz + loss_phys_dx)
+        #err_recon          = hp_recon * err_recon
+        #err_lin            = hp_lin * err_lin
         err_big_weights    = hp_big_weights * err_big_weights
         err_sparse_weights = hp_sparse_weights * err_sparse_weights
 
-        loss = loss_ae + err_recon + err_lin + err_big_weights + err_sparse_weights + loss_phys
+        loss = loss_ae + err_big_weights + err_sparse_weights + loss_phys
 
         # return the sum of all losses
-        return loss, err_recon, err_lin, loss_phys
+        return loss, loss_phys
 
     def predict(self, timeseries: torch.Tensor, force: torch.Tensor, horizon: int) -> torch.Tensor:
         """
@@ -209,6 +197,56 @@ class deep_koopman(torch.nn.Module):
 
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfunctions_pred)
+
+    def _fit_autoencoder(self, x):
+        x_ae = self.autoencoder(x)
+
+        loss_fn = torch.nn.MSELoss(reduction='mean')
+        return loss_fn(x_ae, x)
+
+    def _fit_physics(self, x, dx, u, now):
+
+        # prepare the coefficients of differential equations
+        ode_coeffs = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w, self.k]), dim=0), dim=0)
+        ode_coeffs = ode_coeffs.repeat(x.shape[0], 1, 1)
+        q  = ode_coeffs[:, :, 0]
+        w  = ode_coeffs[:, :, 1]
+        k  = ode_coeffs[:, :, 2]
+
+        z = self.autoencoder.enc(x)
+        x_ae = self.autoencoder.dec(z)
+
+        # prepare the variables of differential equations
+        z1 = z[:, :, 0]
+        z2 = z[:, :, 1]
+        u  = u[:, :, 0]
+
+        # compute the differential equations of a mechanical cavity model
+        dz1_ode = z2
+        dz2_ode = -torch.square(w) * z1 - (w/q) * z2 - k * torch.square(w) * u
+        dz_ode  = torch.stack([dz1_ode, dz2_ode], dim=2)
+
+        dz_ae = torch.autograd.grad(z, x, torch.ones_like(z), retain_graph=True)[0]
+        dz_ae = dz_ae * dx
+
+        dx_ae = torch.autograd.grad(x_ae, z, torch.ones_like(z), retain_graph=True)[0]
+        dx_ae = dx_ae * dz_ode
+
+        if now:
+            with torch.no_grad():
+                plt.figure()
+                #plt.plot(dxdt[0, :, 0])
+                plt.plot(dz_ae[0, :, 0])
+                plt.plot(dz_ode[0, :, 0])
+                #plt.legend()
+                plt.show()
+                print(f'q is {self.q}')
+                print(f'w is {self.w}')
+                print(f'k is {self.k}')
+
+        loss_fn_dz = torch.nn.MSELoss(reduction='mean')
+        loss_fn_dx = torch.nn.MSELoss(reduction='mean')
+        return loss_fn_dz(dz_ae, dz_ode), loss_fn_dx(dx_ae, dx)
 
     def _build_mat_a(self, eva: torch.Tensor, horizon: int) -> torch.Tensor:
 
@@ -317,10 +355,6 @@ class deep_koopman(torch.nn.Module):
         x_pred  = torch.squeeze(x_pred, -2)
 
         return torch.cat([x, x_pred], dim=1)
-
-    def _calc_mode_deriv(self, efn: torch.Tensor, w, q, k, u) -> torch.Tensor:
-
-        pass
 
     def _get_mode_err(self, efn: torch.Tensor, eva: torch.Tensor) -> torch.Tensor:
 

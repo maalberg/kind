@@ -83,6 +83,8 @@ class fcnn(torch.nn.Module):
             a = torch.nn.ReLU
         elif name == 'tanh':
             a = torch.nn.Tanh
+        elif name == 'sigmoid':
+            a = torch.nn.Sigmoid
         elif name == 'linear':
             a = torch.nn.Identity
         else:
