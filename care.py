@@ -86,7 +86,7 @@ class deep_koopman(torch.nn.Module):
         """
 
         loss_ae = self._fit_autoencoder(x)
-        loss_phys_dz, loss_phys_dx = self._fit_physics(x, dxdt, u, now)
+        loss_phys_enc, loss_phys_dec = self._fit_physics(x, dxdt, u, now)
 
         # decompose timeseries into eigenfunctions
         #
@@ -145,34 +145,36 @@ class deep_koopman(torch.nn.Module):
         #err_recon = criterion_recon(x[:, :horizon, :], timeseries_recon)
 
         # L2 regularization to avoid big weights
-        err_big_weights = torch.sum(
-            torch.cat(
-                [torch.square(param.view(-1)) for param in self.parameters()]))
+        #err_big_weights = torch.sum(
+            #torch.cat(
+                #[torch.square(param.view(-1)) for param in self.parameters()]))
 
         # L1 regularization
-        err_sparse_weights = torch.sum(
-            torch.cat(
-                [torch.abs(param.view(-1)) for param in self.parameters()]))
+        #err_sparse_weights = torch.sum(
+            #torch.cat(
+                #[torch.abs(param.view(-1)) for param in self.parameters()]))
 
-        loss_wt_ae       = self.cfg['loss_wt_ae']
-        loss_wt_phys     = self.cfg['loss_wt_phys']
+        loss_wt_ae           = self.cfg['loss_wt_ae']
+        loss_wt_phys_enc     = self.cfg['loss_wt_phys_enc']
+        loss_wt_phys_dec     = self.cfg['loss_wt_phys_dec']
 
         #hp_recon          = self.cfg['loss_hp_recon']
         #hp_lin            = self.cfg['loss_hp_lin']
-        hp_big_weights    = self.cfg['loss_hp_big_weights']
-        hp_sparse_weights = self.cfg['loss_hp_sparse_weights']
+        #hp_big_weights    = self.cfg['loss_hp_big_weights']
+        #hp_sparse_weights = self.cfg['loss_hp_sparse_weights']
 
         loss_ae            = loss_wt_ae * loss_ae
-        loss_phys          = loss_wt_phys * (loss_phys_dz + loss_phys_dx)
+        loss_phys_enc      = loss_wt_phys_enc * loss_phys_enc 
+        loss_phys_dec      = loss_wt_phys_dec * loss_phys_dec
         #err_recon          = hp_recon * err_recon
         #err_lin            = hp_lin * err_lin
-        err_big_weights    = hp_big_weights * err_big_weights
-        err_sparse_weights = hp_sparse_weights * err_sparse_weights
+        #err_big_weights    = hp_big_weights * err_big_weights
+        #err_sparse_weights = hp_sparse_weights * err_sparse_weights
 
-        loss = loss_ae + err_big_weights + err_sparse_weights + loss_phys
+        loss = loss_ae + loss_phys_enc + loss_phys_dec
 
         # return the sum of all losses
-        return loss, loss_phys
+        return loss
 
     def predict(self, timeseries: torch.Tensor, force: torch.Tensor, horizon: int) -> torch.Tensor:
         """
@@ -201,17 +203,17 @@ class deep_koopman(torch.nn.Module):
     def _fit_autoencoder(self, x):
         x_ae = self.autoencoder(x)
 
-        loss_fn = torch.nn.MSELoss(reduction='mean')
+        loss_fn = torch.nn.MSELoss(reduction='sum')
         return loss_fn(x_ae, x)
 
     def _fit_physics(self, x, dx, u, now):
 
         # prepare the coefficients of differential equations
-        ode_coeffs = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w, self.k]), dim=0), dim=0)
-        ode_coeffs = ode_coeffs.repeat(x.shape[0], 1, 1)
-        q  = ode_coeffs[:, :, 0]
-        w  = ode_coeffs[:, :, 1]
-        k  = ode_coeffs[:, :, 2]
+        coeffs = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w, self.k]), dim=0), dim=0)
+        coeffs = coeffs.repeat(x.shape[0], 1, 1)
+        q  = coeffs[:, :, 0]
+        w  = coeffs[:, :, 1]
+        k  = coeffs[:, :, 2]
 
         z = self.autoencoder.enc(x)
         x_ae = self.autoencoder.dec(z)
@@ -221,32 +223,40 @@ class deep_koopman(torch.nn.Module):
         z2 = z[:, :, 1]
         u  = u[:, :, 0]
 
-        # compute the differential equations of a mechanical cavity model
-        dz1_ode = z2
-        dz2_ode = -torch.square(w) * z1 - (w/q) * z2 - k * torch.square(w) * u
-        dz_ode  = torch.stack([dz1_ode, dz2_ode], dim=2)
+        # compute the differential equations of a mechanical cavity model based on an encoded latent space
+        dz1 = z2
+        dz2 = -torch.square(w) * z1 - (w/q) * z2 - k * torch.square(w) * u
+        dz  = torch.stack([dz1, dz2], dim=2)
 
-        dz_ae = torch.autograd.grad(z, x, torch.ones_like(z), retain_graph=True)[0]
+        # compute a time derivative from a given input x to the output of our encoder
+        dz_ae = torch.autograd.grad(z, x, grad_outputs=torch.ones_like(z), retain_graph=True)[0]
         dz_ae = dz_ae * dx
 
-        dx_ae = torch.autograd.grad(x_ae, z, torch.ones_like(z), retain_graph=True)[0]
-        dx_ae = dx_ae * dz_ode
+        # compute a time derivative from a latent space z to the output of our decoder
+        dx_ae = torch.autograd.grad(x_ae, z, grad_outputs=torch.ones_like(x_ae), retain_graph=True)[0]
+        dx_ae = dx_ae * dz
 
+        # test
         if now:
             with torch.no_grad():
                 plt.figure()
-                #plt.plot(dxdt[0, :, 0])
-                plt.plot(dz_ae[0, :, 0])
-                plt.plot(dz_ode[0, :, 0])
-                #plt.legend()
+                plt.plot(dz_ae[0, :, 1], label='dz_ae')
+                plt.plot(dz[0, :, 1], label='dz')
+                #plt.plot(dx_ae[0, :, 0], label='dx_ae')
+                #plt.plot(dx[0, :, 0], label='dx')
+                plt.legend()
                 plt.show()
                 print(f'q is {self.q}')
                 print(f'w is {self.w}')
                 print(f'k is {self.k}')
 
-        loss_fn_dz = torch.nn.MSELoss(reduction='mean')
-        loss_fn_dx = torch.nn.MSELoss(reduction='mean')
-        return loss_fn_dz(dz_ae, dz_ode), loss_fn_dx(dx_ae, dx)
+        loss_fn_enc = torch.nn.MSELoss(reduction='sum')
+        loss_fn_dec = torch.nn.MSELoss(reduction='sum')
+
+        loss_enc = loss_fn_enc(dz_ae, dz)
+        loss_dec = loss_fn_dec(dx_ae, dx)
+
+        return loss_enc, loss_dec
 
     def _build_mat_a(self, eva: torch.Tensor, horizon: int) -> torch.Tensor:
 
