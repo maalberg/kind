@@ -25,27 +25,27 @@ class deep_koopman(torch.nn.Module):
         self.q = torch.nn.Parameter(torch.ones(1))
         self.w = torch.nn.Parameter(torch.ones(1))
 
-        efn_dims_n  = self.cfg['efn_dims_n']
-        data_dims_n = self.cfg['data_dims_n']
-        ctr_dims_n  = self.cfg['ctr_dims_n']
+        z_dims_n  = self.cfg['z_dims_n']
+        x_dims_n  = self.cfg['x_dims_n']
+        u_dims_n  = self.cfg['u_dims_n']
 
-        self.autoencoder = utils.autoencoder(data_dims_n, efn_dims_n)
+        self.autoencoder = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n)
 
     def _init(self, configuration: dict) -> None:
         """Initializes the ``configuration`` of this class."""
 
         self.cfg = configuration
 
-        data_dims_n = self.cfg['data_dims_n']
-        ctr_dims_n  = self.cfg['ctr_dims_n']
+        data_dims_n = self.cfg['x_dims_n']
+        ctr_dims_n  = self.cfg['u_dims_n']
         modes       = self.cfg['modes']
         modes_n     = len(modes)
         starts_n    = self.cfg['batch_size']
         targets_n   = self.cfg['batch_size']
 
-        efn_dims_n  = modes_n * 2
+        efn_dims_n  = modes_n * 2 + 1
 
-        self.cfg['efn_dims_n'] = efn_dims_n
+        self.cfg['z_dims_n'] = efn_dims_n
 
         eva_all_dims_n = modes_n * eigenvalue.eva_props_n
 
@@ -81,12 +81,12 @@ class deep_koopman(torch.nn.Module):
             torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
         self._eva_f_targets = torch.unsqueeze(targets, 1)
 
-    def fit(self, x: torch.Tensor, dxdt: torch.Tensor, u: torch.Tensor, now) -> torch.Tensor:
+    def fit(self, x: torch.Tensor, dx: torch.Tensor, u: torch.Tensor, du: torch.Tensor, now) -> torch.Tensor:
         """
         """
 
-        loss_ae = self._fit_autoencoder(x)
-        loss_phys_enc, loss_phys_dec = self._fit_physics(x, dxdt, u, now)
+        loss_ae = self._fit_autoencoder(x, u)
+        loss_phys_enc, loss_phys_dec = self._fit_physics(x, dx, u, du, now)
 
         # decompose timeseries into eigenfunctions
         #
@@ -200,13 +200,20 @@ class deep_koopman(torch.nn.Module):
         # reconstruct a predicted eigenfunction back into timeseries
         return self.reconstructor(eigenfunctions_pred)
 
-    def _fit_autoencoder(self, x):
-        x_ae = self.autoencoder(x)
+    def _fit_autoencoder(self, x, u):
+
+        # our autoencoder receives a multi-dimensional input that combines state x and control u
+        xu = torch.cat([x, u], dim=-1)
+
+        xu_ae = self.autoencoder(xu)
 
         loss_fn = torch.nn.MSELoss(reduction='sum')
-        return loss_fn(x_ae, x)
+        return loss_fn(xu_ae, xu)
 
-    def _fit_physics(self, x, dx, u, now):
+    def _fit_physics(self, x, dx, u, du, now):
+
+        # our autoencoder receives a multi-dimensional input that combines state x and control u
+        xu = torch.cat([x, u], dim=-1)
 
         # prepare the coefficients of differential equations
         coeffs = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w, self.k]), dim=0), dim=0)
@@ -215,37 +222,49 @@ class deep_koopman(torch.nn.Module):
         w  = coeffs[:, :, 1]
         k  = coeffs[:, :, 2]
 
-        z = self.autoencoder.enc(x)
-        x_ae = self.autoencoder.dec(z)
+        z = self.autoencoder.enc(xu)
+        xu_ae = self.autoencoder.dec(z)
 
         # prepare the variables of differential equations
         z1 = z[:, :, 0]
         z2 = z[:, :, 1]
+        z3 = z[:, :, 2]
         u  = u[:, :, 0]
 
         # compute the differential equations of a mechanical cavity model based on an encoded latent space
         dz1 = z2
-        dz2 = -torch.square(w) * z1 - (w/q) * z2 - k * torch.square(w) * u
+        dz2 = -torch.square(w) * z1 - (w/q) * z2 - k * torch.square(w) * torch.square(z3)
         dz  = torch.stack([dz1, dz2], dim=2)
 
-        # compute a time derivative from a given input x to the output of our encoder
-        dz_ae = torch.autograd.grad(z, x, grad_outputs=torch.ones_like(z), retain_graph=True)[0]
-        dz_ae = dz_ae * dx
+        dz_ae = torch.autograd.grad(z, xu, grad_outputs=torch.ones_like(z), retain_graph=True)[0]
+
+        dzdx_ae = dz_ae[:, :, :2]
+        dzdx_ae = dzdx_ae * dx
+
+        dzdu_ae = dz_ae[:, :, -1:]
+        dzdu_ae = dzdu_ae * du
+
+        dz_ae = dzdx_ae + dzdu_ae
 
         # compute a time derivative from a latent space z to the output of our decoder
-        dx_ae = torch.autograd.grad(x_ae, z, grad_outputs=torch.ones_like(x_ae), retain_graph=True)[0]
-        dx_ae = dx_ae * dz
+        dx_ae = torch.autograd.grad(xu_ae, z, grad_outputs=torch.ones_like(xu_ae), retain_graph=True)[0]
+        dx_ae = dx_ae[:, :, :2] * dz
 
         # test
         if now:
             with torch.no_grad():
                 plt.figure()
-                plt.plot(dz_ae[0, :, 1], label='dz_ae')
-                plt.plot(dz[0, :, 1], label='dz')
-                #plt.plot(dx_ae[0, :, 0], label='dx_ae')
-                #plt.plot(dx[0, :, 0], label='dx')
+                plt.plot(dz_ae[0, :, 0], label='dz_ae')
+                plt.plot(dz[0, :, 0], label='dz')
                 plt.legend()
                 plt.show()
+
+                plt.figure()
+                plt.plot(dx_ae[0, :, 0], label='dx_ae')
+                plt.plot(dx[0, :, 0], label='dx')
+                plt.legend()
+                plt.show()
+
                 print(f'q is {self.q}')
                 print(f'w is {self.w}')
                 print(f'k is {self.k}')
