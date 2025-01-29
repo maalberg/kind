@@ -21,15 +21,12 @@ class deep_koopman(torch.nn.Module):
 
         self._init(configuration)
 
-        self.k = torch.nn.Parameter(torch.ones(1))
-        self.q = torch.nn.Parameter(torch.ones(1))
-        self.w = torch.nn.Parameter(torch.ones(1))
-
         z_dims_n  = self.cfg['z_dims_n']
         x_dims_n  = self.cfg['x_dims_n']
         u_dims_n  = self.cfg['u_dims_n']
 
         self.autoencoder = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n)
+        self.ode_params = utils.fcnn(features=[x_dims_n + u_dims_n, 128, 3])
 
     def _init(self, configuration: dict) -> None:
         """Initializes the ``configuration`` of this class."""
@@ -53,13 +50,13 @@ class deep_koopman(torch.nn.Module):
         self._ctr_start_indices = indices.repeat(starts_n, 1, 1)
 
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([2*i+1 for i in range(modes_n)]), dim=0), dim=0)
-        self._forced_coeff_indices = indices.repeat(starts_n, 1, 1)
+        self._param_k_indices = indices.repeat(starts_n, 1, 1)
 
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(data_dims_n)]), dim=0), dim=0)
         self._ts_start_indices = indices.repeat(starts_n, 1, 1)
 
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(efn_dims_n)]), dim=0), dim=0)
-        self._efn_start_indices = indices.repeat(starts_n, 1, 1)
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(efn_dims_n-1)]), dim=0), dim=0)
+        self._z_ic_indices = indices.repeat(starts_n, 1, 1)
 
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(eva_all_dims_n)]), dim=0), dim=0)
         self._eva_start_indices = indices.repeat(starts_n, 1, 1)
@@ -81,11 +78,12 @@ class deep_koopman(torch.nn.Module):
             torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
         self._eva_f_targets = torch.unsqueeze(targets, 1)
 
-    def fit(self, x: torch.Tensor, dx: torch.Tensor, u: torch.Tensor, du: torch.Tensor, now) -> torch.Tensor:
+    def fit(self, x, dx, u, du, now) -> torch.Tensor:
         """
         """
 
         loss_ae = self._fit_autoencoder(x, u)
+        #loss_lin = self._fit_linearity(x, u)
         loss_phys_enc, loss_phys_dec = self._fit_physics(x, dx, u, du, now)
 
         # decompose timeseries into eigenfunctions
@@ -155,6 +153,7 @@ class deep_koopman(torch.nn.Module):
                 #[torch.abs(param.view(-1)) for param in self.parameters()]))
 
         loss_wt_ae           = self.cfg['loss_wt_ae']
+        #loss_wt_lin          = self.cfg['loss_wt_lin']
         loss_wt_phys_enc     = self.cfg['loss_wt_phys_enc']
         loss_wt_phys_dec     = self.cfg['loss_wt_phys_dec']
 
@@ -164,6 +163,7 @@ class deep_koopman(torch.nn.Module):
         #hp_sparse_weights = self.cfg['loss_hp_sparse_weights']
 
         loss_ae            = loss_wt_ae * loss_ae
+        #loss_lin           = loss_wt_lin * loss_lin
         loss_phys_enc      = loss_wt_phys_enc * loss_phys_enc 
         loss_phys_dec      = loss_wt_phys_dec * loss_phys_dec
         #err_recon          = hp_recon * err_recon
@@ -215,26 +215,33 @@ class deep_koopman(torch.nn.Module):
         # our autoencoder receives a multi-dimensional input that combines state x and control u
         xu = torch.cat([x, u], dim=-1)
 
-        # prepare the coefficients of differential equations
-        coeffs = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w, self.k]), dim=0), dim=0)
-        coeffs = coeffs.repeat(x.shape[0], 1, 1)
-        q  = coeffs[:, :, 0]
-        w  = coeffs[:, :, 1]
-        k  = coeffs[:, :, 2]
-
         z = self.autoencoder.enc(xu)
         xu_ae = self.autoencoder.dec(z)
 
+        # retrieve parameters q, w and k from z and take the mean of resulting parameter trajectories
+        params = torch.mean(self.ode_params(z), dim=1, keepdim=True)
+
+        # split parameters into q, w and k
+        param_q, param_w, param_k = torch.split(params, 1, dim=-1)
+
+        # prepare the coefficients of differential equations
+        #coeffs = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w, self.k]), dim=0), dim=0)
+        #coeffs = coeffs.repeat(x.shape[0], 1, 1)
+        #q  = coeffs[:, :, 0]
+        #w  = coeffs[:, :, 1]
+        #k  = coeffs[:, :, 2]
+
         # prepare the variables of differential equations
-        z1 = z[:, :, 0]
-        z2 = z[:, :, 1]
-        z3 = z[:, :, 2]
-        u  = u[:, :, 0]
+        z1, z2, z3 = torch.split(z, 1, dim=-1)
+        #z1 = z[:, :, 0]
+        #z2 = z[:, :, 1]
+        #z3 = z[:, :, 2]
+        #u  = u[:, :, 0]
 
         # compute the differential equations of a mechanical cavity model based on an encoded latent space
         dz1 = z2
-        dz2 = -torch.square(w) * z1 - (w/q) * z2 - k * torch.square(w) * torch.square(z3)
-        dz  = torch.stack([dz1, dz2], dim=2)
+        dz2 = -torch.square(param_w) * z1 - (param_w/param_q) * z2 + param_k * torch.square(param_w) * torch.square(z3)
+        dz  = torch.cat([dz1, dz2], dim=2)
 
         dz_ae = torch.autograd.grad(z, xu, grad_outputs=torch.ones_like(z), retain_graph=True)[0]
 
@@ -254,20 +261,36 @@ class deep_koopman(torch.nn.Module):
         if now:
             with torch.no_grad():
                 plt.figure()
-                plt.plot(dz_ae[0, :, 0], label='dz_ae')
-                plt.plot(dz[0, :, 0], label='dz')
+                plt.plot(dz_ae[0, :, 0], label='dz1_ae')
+                plt.plot(dz[0, :, 0], label='dz1')
                 plt.legend()
+                plt.tight_layout()
                 plt.show()
 
                 plt.figure()
-                plt.plot(dx_ae[0, :, 0], label='dx_ae')
-                plt.plot(dx[0, :, 0], label='dx')
+                plt.plot(dz_ae[0, :, 1], label='dz2_ae')
+                plt.plot(dz[0, :, 1], label='dz2')
                 plt.legend()
+                plt.tight_layout()
                 plt.show()
 
-                print(f'q is {self.q}')
-                print(f'w is {self.w}')
-                print(f'k is {self.k}')
+                plt.figure()
+                plt.plot(dx_ae[0, :, 0], label='dx1_ae')
+                plt.plot(dx[0, :, 0], label='dx1')
+                plt.legend()
+                plt.tight_layout()
+                plt.show()
+
+                plt.figure()
+                plt.plot(dx_ae[0, :, 1], label='dx2_ae')
+                plt.plot(dx[0, :, 1], label='dx2')
+                plt.legend()
+                plt.tight_layout()
+                plt.show()
+
+                print(f'q is {param_q[0, 0, 0]}')
+                print(f'w is {param_w[0, 0, 0]}')
+                print(f'k is {param_k[0, 0, 0]}')
 
         loss_fn_enc = torch.nn.MSELoss(reduction='sum')
         loss_fn_dec = torch.nn.MSELoss(reduction='sum')
@@ -277,16 +300,95 @@ class deep_koopman(torch.nn.Module):
 
         return loss_enc, loss_dec
 
-    def _build_mat_a(self, eva: torch.Tensor, horizon: int) -> torch.Tensor:
+    def _fit_linearity(self, x, u):
 
-        # build a rotation matrix for every provided eigenvalue
+        # our autoencoder receives a multi-dimensional input that combines state x and control u
+        xu = torch.cat([x, u], dim=-1)
+
+        # encode a latent space z
+        z = self.autoencoder.enc(xu)
+
+        # retrieve parameters q, w and k from z and take the mean of resulting parameter trajectories
+        params = torch.mean(self.ode_params(z), dim=1, keepdim=True)
+
+        # split parameters into a q, w pair and a k
+        param_qw, param_k = torch.split(params, 2, dim=-1)
+
+        # construct matrices A raised to powers that cover the entire horizon
+        horizon = self.cfg['predict_horizon']
+        mat_a = self._construct_mat_a_pow(param_qw, horizon)
+
+        # here, u is the last dimension of z
         #
-        # built matrices are shaped as [B, C_efn, C_efn], where B and C_efn are the number of batches
-        # and eigenfunction channels, respectively
-        dt = self.cfg['timestep']
-        mat = torch.stack([eigenvalue.to_rotation_diag(eva_i[torch.newaxis, 0] * dt) for eva_i in eva], dim=0)
+        # u values are also reshaped as [B, H, 1, C_u] to allow broadcasting when multiplying by matrix B
+        u = z[:, :, 2:]
+        u = torch.unsqueeze(u, -2)
 
-        # raise built matrices to powers covering all horizon
+        # for every horizon position there must be a history of u values multiplied by corresponding ab matrices,
+        # so we do the construction of matrices B and a multiplication Bu in one step
+        bu = torch.cat([
+            torch.sum(
+                torch.matmul(
+                    u[:, :i, :, :],
+                    self._construct_mat_b(
+                        param_k,
+                        mat_a[:, :i, :, :])), 1, keepdim=True) for i in range(1, horizon)], dim=1)
+
+        # also here, predicted values, or x, are the first two dimensions of z
+        #
+        # moreover, note that x is represented by the initial conditions (ic) of x trajectories
+        #
+        # furthermore, initial conditions (ic) of x are reshaped as [B, 1, 1, C_z] to allow tensor broadcasting
+        # when multiplying by matrices A, which basically means that for every 
+        # trajectory we have one initial condition shaped as [1, C_z],
+        # where C_z denotes the number of dimensions in z
+        x_ic = torch.gather(z, -1, self._z_ic_indices[:z.shape[0], :, :])
+        x_ic = torch.unsqueeze(x_ic, -2)
+
+        # predict z (denoted here as x) by multiplying initial conditions of its trajectories by powered matrices A
+        #
+        # both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, C_efn], i.e.
+        # batches with z trajectories consisting of inidividual points [1, C_z]
+        #
+        # the result is then summed with Bu product
+        x_pred = torch.matmul(x_ic, mat_a) + bu
+
+        # remove extra singleton dimensions that were needed for the broadcasting of multiplication
+        x_pred = torch.squeeze(x_pred, -2)
+
+        # extract 'original' x values to compare with predicted ones
+        # note that the initial conditions of x trajectories are omitted
+        x = z[:, 1:horizon, :2]
+
+        loss_fn = torch.nn.MSELoss(reduction='sum')
+        return loss_fn(x_pred, x)
+
+    def _construct_mat_a(self, q, w):
+        return torch.stack([
+            torch.stack([ torch.tensor(0.),  torch.tensor(1.)]),
+            torch.stack([-torch.square(w),  -w/q             ])])
+
+    def _construct_mat_a_diag(self, param):
+
+        qw_dims_n =  2
+        ch_dim    = -1
+
+        # split pairs of q, w parameters along the last, i.e. channel, dimension
+        params = torch.split(param, qw_dims_n, dim=ch_dim)
+
+        return torch.block_diag(*[self._construct_mat_a(
+            param[0, 0],
+            param[0, 1]) for param in params])
+
+    def _construct_mat_a_pow(self, params, horizon):
+
+        # construct a matrix for every provided pair of q w parameters
+        #
+        # constructed matrices are shaped as [B, C_efn, C_efn], where B and C_efn are the number of batches
+        # and eigenfunction channels, respectively
+        mat = torch.stack([self._construct_mat_a_diag(param[torch.newaxis, 0]) for param in params], dim=0)
+
+        # raise constructed matrices to powers covering all horizon
         #
         # powered matrices are shaped as [B, H - 1, C_efn, C_efn], where H is the number of horizon steps and -1
         # is because we do not predict the first time step
@@ -297,25 +399,26 @@ class deep_koopman(torch.nn.Module):
             torch.transpose(
                 torch.linalg.matrix_power(mat, i), -2, -1) for i in range(1, horizon)], dim=1)
 
-    def _build_mat_b(self, forced_coeff: torch.Tensor, mat_a: torch.Tensor) -> torch.Tensor:
+    def _construct_mat_b(self, param_b, mat_a):
 
-        # scatter forced coefficients in a zero-filled matrix
+        # scatter b matrix parameters in a zero-filled matrix
         #
-        # note that matrix B is constructed as transposed, i.e. shaped as [1, C_efn],
-        # where C_efn is the number of eigenfunction channels
+        # note that matrix B is constructed as transposed, i.e. shaped as [1, C_z],
+        # where C_z is the number of channels in a z latent space
         #
         # next, by zero-filling this B matrix right from the start, we declare that
-        # the first column of a 1x2 matrix B is a zero, and the forced
-        # coefficient goes into the second column
+        # the first column of a 1x2 matrix B is a zero, and the b
+        # parameter goes into the second column
         #
-        # so matrix B is shaped as [B, 1, C_efn], where B is the number of batches
-        bch_n = forced_coeff.shape[0]
+        # so matrix B is shaped as [B, 1, C_z], where B is the number of batches
+        bch_n = param_b.shape[0]
         mat_b = torch.zeros(bch_n,
                             1,
-                            self.cfg['efn_dims_n'],
-                            dtype=forced_coeff.dtype).scatter_(-1,
-                                                               self._forced_coeff_indices[:bch_n, :, :],
-                                                               -forced_coeff)
+                            2, # fixme
+                            dtype=param_b.dtype).scatter_(-1,
+                                                          self._param_k_indices[:bch_n, :, :],
+                                                          -param_b)
+
 
         # add an extra singleton dimension after the batch dimension to allow broadcasting
         # during multiplication with matrix A
@@ -334,12 +437,12 @@ class deep_koopman(torch.nn.Module):
         # we multiply these matrices with transposed matrices B to get B*A, B*A^2 and so on,
         # excluding the final matrix A^(H - 1), where H is the horizon of prediction
         #
-        # finally, matrices BA must be shaped as [B, H - 2, 1, C_efn]
+        # finally, matrices BA must be shaped as [B, H - 2, 1, C_z]
         mat_ab = torch.matmul(mat_b, mat_a[:, :-1, :, :])
 
         # return the final version of matrices B by concatenating matrices AB with a plain matrix B
         #
-        # matrices B must now be shaped as [B, H - 1, 1, C_efn]
+        # matrices B must now be shaped as [B, H - 1, 1, C_z]
         #
         # matrix B is positioned last to allow a multiplication with u values such that u_(k + h - 1)
         # value, i.e. the one before a horizon h, is multiplied with the plain matrix B
