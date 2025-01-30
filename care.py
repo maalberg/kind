@@ -240,7 +240,7 @@ class deep_koopman(torch.nn.Module):
 
         # compute the differential equations of a mechanical cavity model based on an encoded latent space
         dz1 = z2
-        dz2 = -torch.square(param_w) * z1 - (param_w/param_q) * z2 + param_k * torch.square(param_w) * torch.square(z3)
+        dz2 = -torch.square(param_w) * z1 - (param_w/param_q) * z2 - param_k * torch.square(param_w) * torch.square(z3)
         dz  = torch.cat([dz1, dz2], dim=2)
 
         dz_ae = torch.autograd.grad(z, xu, grad_outputs=torch.ones_like(z), retain_graph=True)[0]
