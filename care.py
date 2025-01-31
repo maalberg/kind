@@ -26,7 +26,7 @@ class deep_koopman(torch.nn.Module):
         u_dims_n  = self.cfg['u_dims_n']
 
         self.autoencoder = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n)
-        self.ode_params = utils.fcnn(features=[x_dims_n + u_dims_n, 128, 3])
+        self.ode_params = utils.fcnn(features=[x_dims_n, 128, 3])
 
     def _init(self, configuration: dict) -> None:
         """Initializes the ``configuration`` of this class."""
@@ -40,7 +40,7 @@ class deep_koopman(torch.nn.Module):
         starts_n    = self.cfg['batch_size']
         targets_n   = self.cfg['batch_size']
 
-        efn_dims_n  = modes_n * 2 + 1
+        efn_dims_n  = modes_n * 2
 
         self.cfg['z_dims_n'] = efn_dims_n
 
@@ -174,7 +174,7 @@ class deep_koopman(torch.nn.Module):
         loss = loss_ae + loss_phys_enc + loss_phys_dec
 
         # return the sum of all losses
-        return loss
+        return loss, loss_ae, loss_phys_enc, loss_phys_dec
 
     def predict(self, timeseries: torch.Tensor, force: torch.Tensor, horizon: int) -> torch.Tensor:
         """
@@ -232,7 +232,7 @@ class deep_koopman(torch.nn.Module):
         #k  = coeffs[:, :, 2]
 
         # prepare the variables of differential equations
-        z1, z2, z3 = torch.split(z, 1, dim=-1)
+        z1, z2 = torch.split(z, 1, dim=-1)
         #z1 = z[:, :, 0]
         #z2 = z[:, :, 1]
         #z3 = z[:, :, 2]
@@ -240,7 +240,7 @@ class deep_koopman(torch.nn.Module):
 
         # compute the differential equations of a mechanical cavity model based on an encoded latent space
         dz1 = z2
-        dz2 = -torch.square(param_w) * z1 - (param_w/param_q) * z2 - param_k * torch.square(param_w) * torch.square(z3)
+        dz2 = -torch.square(param_w) * z1 - (param_w/param_q) * z2 - param_k * torch.square(param_w) * torch.square(u)
         dz  = torch.cat([dz1, dz2], dim=2)
 
         dz_ae = torch.autograd.grad(z, xu, grad_outputs=torch.ones_like(z), retain_graph=True)[0]
