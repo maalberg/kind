@@ -26,7 +26,7 @@ class deep_koopman(torch.nn.Module):
         u_dims_n  = self.cfg['u_dims_n']
 
         self.autoencoder = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n)
-        self.ode_params = utils.fcnn(features=[x_dims_n, 128, 3])
+        self.ode_params = utils.fcnn(features=[x_dims_n, 64, 64, 3], act_fn_hidden='tanh')
 
     def _init(self, configuration: dict) -> None:
         """Initializes the ``configuration`` of this class."""
@@ -176,6 +176,13 @@ class deep_koopman(torch.nn.Module):
         # return the sum of all losses
         return loss, loss_ae, loss_phys_enc, loss_phys_dec
 
+    def fit_autoencoder(self, x, u):
+        loss_ae    = self._fit_autoencoder(x, u)
+        loss_wt_ae = self.cfg['loss_wt_ae']
+        loss_ae    = loss_wt_ae * loss_ae
+
+        return loss_ae
+
     def predict(self, timeseries: torch.Tensor, force: torch.Tensor, horizon: int) -> torch.Tensor:
         """
         """
@@ -207,7 +214,7 @@ class deep_koopman(torch.nn.Module):
 
         xu_ae = self.autoencoder(xu)
 
-        loss_fn = torch.nn.MSELoss(reduction='sum')
+        loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(xu_ae, xu)
 
     def _fit_physics(self, x, dx, u, du, now):
@@ -292,8 +299,8 @@ class deep_koopman(torch.nn.Module):
                 print(f'w is {param_w[0, 0, 0]}')
                 print(f'k is {param_k[0, 0, 0]}')
 
-        loss_fn_enc = torch.nn.MSELoss(reduction='sum')
-        loss_fn_dec = torch.nn.MSELoss(reduction='sum')
+        loss_fn_enc = torch.nn.MSELoss(reduction='mean')
+        loss_fn_dec = torch.nn.MSELoss(reduction='mean')
 
         loss_enc = loss_fn_enc(dz_ae, dz)
         loss_dec = loss_fn_dec(dx_ae, dx)
