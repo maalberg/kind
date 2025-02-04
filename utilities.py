@@ -29,6 +29,26 @@ def write_datafile(name: str, data) -> None:
     np.savetxt('./data/' + name + '.csv', filedata, fmt='%.14f', delimiter=',')
 
 
+# --!------------------------------------------------------------------------*/
+# --! random fourier features
+
+class rff:
+    def __init__(self, features: list[int] = [1, 64], sigma: float = 1.0) -> None:
+        super().__init__()
+
+        x_dims_n = features[0]
+        z_dims_n = features[1]
+
+        self.w = torch.nn.Linear(x_dims_n, z_dims_n, bias=False)
+        torch.nn.init.normal_(self.w.weight, std=sigma)
+
+    def __call__(self, x):
+        z = self.w(x)
+        return torch.cat([
+            torch.cos(2 * torch.pi * z),
+            torch.sin(2 * torch.pi * z)], dim=-1)
+
+
 # ---------------------------------------------------------------------------*/
 # - fully-connected neural network
 
