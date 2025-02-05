@@ -116,14 +116,19 @@ class fcnn(torch.nn.Module):
 # autoencoder based on fully-connected neural networks
 
 class autoencoder(torch.nn.Module):
-    def __init__(self, x_dims_n: int = 2, z_dims_n: int = 2) -> None:
+    def __init__(self, x_dims_n: int = 2, z_dims_n: int = 2, y_dims_n: int = 2) -> None:
         super().__init__()
 
         # define the structure of a fully-connected neural network
         net_features = [x_dims_n, 64, 64, z_dims_n]
 
         self.enc = fcnn(features=net_features, act_fn_hidden='relu')
-        self.dec = fcnn(features=list(reversed(net_features)), act_fn_hidden='relu')
+
+        if y_dims_n == x_dims_n:
+            net_features = list(reversed(net_features))
+        else:
+            net_features = [z_dims_n, 64, 64, y_dims_n]
+        self.dec = fcnn(features=net_features, act_fn_hidden='relu')
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
