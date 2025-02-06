@@ -25,8 +25,9 @@ class deep_koopman(torch.nn.Module):
         x_dims_n  = self.cfg['x_dims_n']
         u_dims_n  = self.cfg['u_dims_n']
 
-        self.autoencoder = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n, y_dims_n=x_dims_n)
-        self.estimator   = param_estimator(z_dims_n + u_dims_n, param_dims_n=3)
+        self.autoencoder   = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n, y_dims_n=x_dims_n)
+        self.param_est     = parameter_estimator(z_dims_n + u_dims_n, param_dims_n=3)
+        self.force_preproc = force_preprocessor()
 
     def _init(self, configuration: dict) -> None:
         """Initializes the ``configuration`` of this class."""
@@ -97,7 +98,7 @@ class deep_koopman(torch.nn.Module):
 
         # --! according to the differential equation of a mechanical cavity model,
         # --! input u must be squared
-        u = torch.square(u)
+        u = self.force_preproc(u)
 
         # --! the input of an autoencoder must contain driving force u
         xu = torch.cat([x, u], dim=-1)
@@ -122,7 +123,7 @@ class deep_koopman(torch.nn.Module):
         z_ic = torch.gather(z, -1, self._z_ic_indices[:z.shape[0], :, :])
 
         # --! 
-        params = self.estimator(torch.cat([z, u], dim=-1))
+        params = self.param_est(torch.cat([z, u], dim=-1))
         params = torch.unsqueeze(params, 1)
 
         # --! having all required data, we predict the trajectory of our latent space z and
@@ -609,7 +610,7 @@ class eigenvalue(torch.nn.Module):
         return torch.sum(torch.square(eigenfunctions), dim=-1, keepdim=True)
 
 
-class param_estimator(torch.nn.Module):
+class parameter_estimator(torch.nn.Module):
     def __init__(self, x_dims_n, z_dims_n: int = 64, param_dims_n: int = 1):
         super().__init__()
 
@@ -621,4 +622,13 @@ class param_estimator(torch.nn.Module):
         rnn_out, _ = self.rnn(x)
         out = self.fc(rnn_out[:, -1, :])
         return out
+
+
+class force_preprocessor(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = utils.fcnn(features=[1, 32, 32, 1], act_fn_hidden='relu')
+
+    def forward(self, x):
+        return self.net(torch.square(x))
 
