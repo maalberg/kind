@@ -4,19 +4,11 @@ from matplotlib import pyplot as plt
 import utilities as utils
 
 
-# ---------------------------------------------------------------------------*/
-# - deep Koopman neural network for a dynamic mode decomposition
+# --!--------------------------------------------------------------------------
+#
 
 class deep_koopman(torch.nn.Module):
-    """
-    Creates an autoencoder-based neural network that is expected to decompose
-    dynamical modes of a system from simulated or experimental data.
-    """
     def __init__(self, configuration: dict) -> None:
-        """
-        Constructs an instance of a dynamic mode decomposition based on the given ``configuration``.
-        The ``configuration`` is a dictionary with key-value pairs.
-        """
         super().__init__()
 
         self._init(configuration)
@@ -30,54 +22,22 @@ class deep_koopman(torch.nn.Module):
         self.force_preproc = force_preprocessor()
 
     def _init(self, configuration: dict) -> None:
-        """Initializes the ``configuration`` of this class."""
 
         self.cfg = configuration
 
-        data_dims_n = self.cfg['x_dims_n']
-        ctr_dims_n  = self.cfg['u_dims_n']
         modes       = self.cfg['modes']
         modes_n     = len(modes)
         starts_n    = self.cfg['batch_size']
-        targets_n   = self.cfg['batch_size']
 
         efn_dims_n  = modes_n * 2
 
         self.cfg['z_dims_n'] = efn_dims_n
 
-        eva_all_dims_n = modes_n * eigenvalue.eva_props_n
-
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(modes_n)]), dim=0), dim=0)
-        self._u_0_indices = indices.repeat(starts_n, 1, 1)
-
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([2*i+1 for i in range(modes_n)]), dim=0), dim=0)
         self._param_k_indices = indices.repeat(starts_n, 1, 1)
 
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(data_dims_n)]), dim=0), dim=0)
-        self._ts_start_indices = indices.repeat(starts_n, 1, 1)
-
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(efn_dims_n)]), dim=0), dim=0)
         self._z_ic_indices = indices.repeat(starts_n, 1, 1)
-
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(eva_all_dims_n)]), dim=0), dim=0)
-        self._eva_start_indices = indices.repeat(starts_n, 1, 1)
-
-        # assemble indices to extract frequency properties of eigenvalues
-        #
-        # since an angular frequency is the second property of an eigenvalue, then
-        # the indices of a channel dimension are all odd indices
-        #
-        # by unsqueezing we establish a batch structure in the assembled indices
-        indices = torch.unsqueeze(torch.unsqueeze(
-            torch.tensor([2*m + 1 for m in range(len(modes))]), dim=0), dim=0)
-
-        # repeat the batch dimension to comply with the number of actual batches/targets
-        self._eva_f_indices = indices.repeat(targets_n, 1, 1)
-
-        # 
-        targets = torch.cat([
-            torch.randn(targets_n, 1) * modes[m][1] + modes[m][0] for m in range(len(modes))], dim=1)
-        self._eva_f_targets = torch.unsqueeze(targets, 1)
 
     def fit(self, x, dx, u, du, pretrain_autoencoder: bool = False, now: bool = False) -> torch.Tensor:
 
@@ -86,11 +46,10 @@ class deep_koopman(torch.nn.Module):
         # --!
 
         # --! prepare loss weights
-        loss_w_ae       = self.cfg['loss_w_ae']
-        loss_w_lin      = self.cfg['loss_w_lin']
-        loss_w_pred     = self.cfg['loss_w_pred']
-        loss_w_phys_enc = self.cfg['loss_w_phys_enc']
-        loss_w_phys_dec = self.cfg['loss_w_phys_dec']
+        loss_w_ae    = self.cfg['loss_w_ae']
+        loss_w_lin   = self.cfg['loss_w_lin']
+        loss_w_pred  = self.cfg['loss_w_pred']
+        loss_w_phys  = self.cfg['loss_w_phys']
 
         # --!------------------------------------------------------------------
         # --! algorithm
@@ -134,6 +93,7 @@ class deep_koopman(torch.nn.Module):
         # --! fit the losses of linearity and prediction
         loss_lin   = loss_w_lin * self._fit_linearity(z, z_pred)
         loss_pred  = loss_w_pred * self._fit_prediction(x, x_pred)
+        loss_phys  = loss_w_phys * self._fit_physics(z, u, params, now)
 
         # --!------------------------------------------------------------------
         # --! output
@@ -153,7 +113,7 @@ class deep_koopman(torch.nn.Module):
 
                 plt.figure()
                 plt.plot(z[0, :, 1], label='z2')
-                plt.plot(z_pred[0, :, 1], label='z2', linestyle='dashed')
+                plt.plot(z_pred[0, :, 1], label='z2_pred', linestyle='dashed')
                 plt.legend()
                 plt.show()
 
@@ -170,188 +130,13 @@ class deep_koopman(torch.nn.Module):
                 plt.show()
 
         # --! sum losses together and return the sum
-        loss = loss_ae + loss_lin + loss_pred
-        return loss, loss_ae, loss_lin, loss_pred
-
-        #loss_phys_enc, loss_phys_dec = self._fit_physics(x, dx, u, du, now)
-
-        # decompose timeseries into eigenfunctions
-        #
-        # eigenfunctions are shaped as [B, T, C_efn], where C_efn denotes the number of
-        # channels in eigenfunctions, i.e. in the latent space of this autoencoder
-        #z = self.ae.enc(x)
-        #x_ae = self.ae.dec(z)
-
-        #coeffs = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w, self.k]), dim=0), dim=0)
-        #coeffs = coeffs.repeat(x.shape[0], 1, 1)
-
-        # derive complete trajectories of eigenvalues that are shaped as [B, T, C_eva], where C_eva
-        # is the number of channels in an eigenvalue
-        #
-        # these complete eigenvalue trajectories are further used throughout this method
-        #eigenvalues = self.dynamics(eigenfunctions)
-        #eigenvalues_start = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w]), dim=0), dim=0)
-        #eigenvalues_start = eigenvalues_start.repeat(x.shape[0], 1, 1)
-
-        # gather the starting points of eigenfunctions with their corresponding eigenvalues
-        #
-        # the indices of starting points must be corrected according to the current number of batch elements
-
-        #forced_coeff_start = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.k]), dim=0), dim=0)
-        #forced_coeff_start = forced_coeff_start.repeat(x.shape[0], 1, 1)
-
-        #horizon = self.cfg['horizon']
-        #eigenfunctions_start = torch.gather(z, -1, self._efn_start_indices[:z.shape[0], :, :])
-        #eigenfunctions_pred = self._predict_efn(eigenfunctions_start, horizon,
-                                                #eigenvalues_start, u, forced_coeff_start)
-
-        # reconstruct timeseries
-        #timeseries_recon = self.ae.dec(eigenfunctions_pred)
-
-
-
-        #dzdx = torch.autograd.grad(z, x, torch.ones_like(z), retain_graph=True)[0]
-        #dzdt = dzdx * dxdt
-
-        #dz1dt_ode = z[:,:,1]
-        #dz2dt_ode = -torch.square(coeffs[:,:,1]) * z[:,:,0] - (coeffs[:,:,1]/coeffs[:,:,0]) * z[:,:,1] - coeffs[:,:,2] * torch.square(coeffs[:,:,1]) * u[:,:,0]
-
-        #dzdt_ode = torch.stack([dz1dt_ode, dz2dt_ode], dim=2)
-
-        #loss_fn_phys = torch.nn.MSELoss(reduction='mean')
-        #loss_phys = loss_fn_phys(dzdt, dzdt_ode)
-
-
-
-        # linearity loss
-        #criterion_lin = torch.nn.MSELoss(reduction='mean')
-        #err_lin = criterion_lin(z[:, 1:horizon, :], eigenfunctions_pred[:, 1:horizon, :])
-
-        # reconstruction loss
-        #criterion_recon = torch.nn.MSELoss(reduction='mean')
-        #err_recon = criterion_recon(x[:, :horizon, :], timeseries_recon)
-
-        # L2 regularization to avoid big weights
-        #err_big_weights = torch.sum(
-            #torch.cat(
-                #[torch.square(param.view(-1)) for param in self.parameters()]))
-
-        # L1 regularization
-        #err_sparse_weights = torch.sum(
-            #torch.cat(
-                #[torch.abs(param.view(-1)) for param in self.parameters()]))
-
-        #loss_phys_enc      = loss_wt_phys_enc * loss_phys_enc 
-        #loss_phys_dec      = loss_wt_phys_dec * loss_phys_dec
-
-        # loss_phys_enc + loss_phys_dec
-
-    def predict(self, x, u, horizon):
-
-        # our autoencoder receives a multi-dimensional input that combines state x and control u
-        xu = torch.cat([x, u], dim=-1)
-
-        z = self.autoencoder.enc(xu)
-        z_pred = self._predict_z(z, u)
-
-        xu_pred = self.autoencoder.dec(z_pred)
-        x, u = torch.split(xu_pred, 2, dim=-1)
-        return x, u
+        loss = loss_ae + loss_lin + loss_pred + loss_phys
+        return loss, loss_ae, loss_lin, loss_pred, loss_phys
 
     def _fit_autoencoder(self, x, x_ae):
 
         loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(x_ae, x)
-
-    def _fit_physics(self, x, dx, u, du, now):
-
-        # our autoencoder receives a multi-dimensional input that combines state x and control u
-        xu = torch.cat([x, u], dim=-1)
-
-        z = self.autoencoder.enc(xu)
-        xu_ae = self.autoencoder.dec(z)
-
-        # retrieve parameters q, w and k from z and take the mean of resulting parameter trajectories
-        params = torch.mean(self.ode_params(z), dim=1, keepdim=True)
-
-        # split parameters into q, w and k
-        param_q, param_w, param_k = torch.split(params, 1, dim=-1)
-
-        # prepare the coefficients of differential equations
-        #coeffs = torch.unsqueeze(torch.unsqueeze(torch.tensor([self.q, self.w, self.k]), dim=0), dim=0)
-        #coeffs = coeffs.repeat(x.shape[0], 1, 1)
-        #q  = coeffs[:, :, 0]
-        #w  = coeffs[:, :, 1]
-        #k  = coeffs[:, :, 2]
-
-        # prepare the variables of differential equations
-        z1, z2 = torch.split(z, 1, dim=-1)
-        #z1 = z[:, :, 0]
-        #z2 = z[:, :, 1]
-        #z3 = z[:, :, 2]
-        #u  = u[:, :, 0]
-
-        # compute the differential equations of a mechanical cavity model based on an encoded latent space
-        dz1 = z2
-        dz2 = -torch.square(param_w) * z1 - (param_w/param_q) * z2 - param_k * torch.square(param_w) * torch.square(u)
-        dz  = torch.cat([dz1, dz2], dim=2)
-
-        dz_ae = torch.autograd.grad(z, xu, grad_outputs=torch.ones_like(z), retain_graph=True)[0]
-
-        dzdx_ae = dz_ae[:, :, :2]
-        dzdx_ae = dzdx_ae * dx
-
-        dzdu_ae = dz_ae[:, :, -1:]
-        dzdu_ae = dzdu_ae * du
-
-        dz_ae = dzdx_ae + dzdu_ae
-
-        # compute a time derivative from a latent space z to the output of our decoder
-        dx_ae = torch.autograd.grad(xu_ae, z, grad_outputs=torch.ones_like(xu_ae), retain_graph=True)[0]
-        dx_ae = dx_ae[:, :, :2] * dz
-
-        # test
-        if now:
-            with torch.no_grad():
-                plt.figure()
-                plt.plot(dz_ae[0, :, 0], label='dz1_ae')
-                plt.plot(dz[0, :, 0], label='dz1')
-                plt.legend()
-                plt.tight_layout()
-                plt.show()
-
-                plt.figure()
-                plt.plot(dz_ae[0, :, 1], label='dz2_ae')
-                plt.plot(dz[0, :, 1], label='dz2')
-                plt.legend()
-                plt.tight_layout()
-                plt.show()
-
-                plt.figure()
-                plt.plot(dx_ae[0, :, 0], label='dx1_ae')
-                plt.plot(dx[0, :, 0], label='dx1')
-                plt.legend()
-                plt.tight_layout()
-                plt.show()
-
-                plt.figure()
-                plt.plot(dx_ae[0, :, 1], label='dx2_ae')
-                plt.plot(dx[0, :, 1], label='dx2')
-                plt.legend()
-                plt.tight_layout()
-                plt.show()
-
-                print(f'q is {param_q[0, 0, 0]}')
-                print(f'w is {param_w[0, 0, 0]}')
-                print(f'k is {param_k[0, 0, 0]}')
-
-        loss_fn_enc = torch.nn.MSELoss(reduction='mean')
-        loss_fn_dec = torch.nn.MSELoss(reduction='mean')
-
-        loss_enc = loss_fn_enc(dz_ae, dz)
-        loss_dec = loss_fn_dec(dx_ae, dx)
-
-        return loss_enc, loss_dec
 
     def _fit_linearity(self, z, z_pred):
 
@@ -364,6 +149,51 @@ class deep_koopman(torch.nn.Module):
         horizon = self.cfg['predict_horizon']
         loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(x_pred, x[:, :horizon, :])
+
+    def _fit_physics(self, z, u, params, now):
+
+        t_dim = 1
+        dt    = self.cfg['timestep']
+
+        dz1, dz2 = torch.split(torch.diff(z, n=1, dim=t_dim) / dt, 1, dim=-1)
+
+        q, w, k = torch.split(params, 1, dim=-1)
+        z1, z2  = torch.split(z, 1, dim=-1)
+
+        forced   =  -k * u[:, :-1, :]
+        unforced = dz2 + q * z2[:, :-1, :] + torch.square(w) * z1[:, :-1, :]
+        de = unforced + forced
+        de_zero = torch.zeros_like(de)
+
+        # test
+        if now:
+            with torch.no_grad():
+                plt.figure()
+                plt.plot(unforced[0, :, 0], label='unforced')
+                plt.legend()
+                plt.tight_layout()
+                plt.show()
+
+                plt.figure()
+                plt.plot(forced[0, :, 0], label='forced')
+                plt.legend()
+                plt.tight_layout()
+                plt.show()
+
+        loss_fn = torch.nn.L1Loss(reduction='mean')
+        return loss_fn(de, de_zero)
+
+    def predict(self, x, u, horizon):
+
+        # our autoencoder receives a multi-dimensional input that combines state x and control u
+        xu = torch.cat([x, u], dim=-1)
+
+        z = self.autoencoder.enc(xu)
+        z_pred = self._predict_z(z, u)
+
+        xu_pred = self.autoencoder.dec(z_pred)
+        x, u = torch.split(xu_pred, 2, dim=-1)
+        return x, u
 
     def _predict_z(self, z_ic, u, params):
 
@@ -378,10 +208,10 @@ class deep_koopman(torch.nn.Module):
         # --! and since the eigenvalue comes first and has two values
         # --! the size of the split sections is set to 2
         splitsec_sz = 2
-        eva, k  = torch.split(params, splitsec_sz, dim=-1)
+        qw, k  = torch.split(params, splitsec_sz, dim=-1)
 
         # --! construct matrices A raised to powers that cover the entire horizon
-        mat_a = self._construct_mat_a_pow(eva * dt, horizon)
+        mat_a = self._construct_mat_a_pow(qw, horizon)
 
         # u values are also reshaped as [B, H, 1, C_u] to allow broadcasting when multiplying by matrix B
         u = torch.unsqueeze(u, -2)
@@ -418,50 +248,13 @@ class deep_koopman(torch.nn.Module):
 
         return torch.cat([z_ic, z_pred], dim=1)
 
-    def _predict_efn(self,
-                     start: torch.Tensor, horizon: int,
-                     eva: torch.Tensor, force: torch.Tensor, forced_coeff: torch.Tensor) -> torch.Tensor:
-        """
-        Predicts eigenfunction from a start point ``efn_start`` up to ``horizon``. The start
-        point ``efn_start`` must be shaped as [B, 1, C], where B and C_efn are the
-        number of batch elements and eigenfunction channels, respectively.
-        The predicted eigenfunction is shaped as [B, horizon, C_efn].
-        """
-
-        # starting values of eigenfunctions are reshaped as [B, 1, 1, C_efn] to allow tensor broadcasting
-        # when multiplying by rotation matrices, which basically means that for every 
-        # trajectory we have one start value shaped as [1, C_efn]
-        #
-        # also, force input values are reshaped [B, H, 1, C_force]
-        x = torch.unsqueeze(start, -2)
-        u = torch.unsqueeze(force, -2)
-
-        mat_a = self._build_mat_a(eva, horizon)
-
-        bu = torch.cat([
-            torch.sum(
-                torch.matmul(
-                    u[:, :i, :, :],
-                    self._build_mat_b(
-                        forced_coeff,
-                        mat_a[:, :i, :, :])), 1, keepdim=True) for i in range(1, horizon)], dim=1)
-
-        # predict eigenfunctions by multiplying their starting values by powered rotation matrices
-        #
-        # both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, C_efn], i.e.
-        # batches with eigenfunction trajectories consisting of inidividual points [1, C_efn]
-        x_pred = torch.matmul(x, mat_a) + bu
-
-        # remove singleton dimensions that were needed for the broadcasting of multiplication
-        x = torch.squeeze(x, -2)
-        x_pred  = torch.squeeze(x_pred, -2)
-
-        return torch.cat([x, x_pred], dim=1)
-
     def _construct_mat_a(self, q, w):
-        return torch.exp(q) * torch.stack([
-            torch.stack([torch.cos(w), -torch.sin(w)]),
-            torch.stack([torch.sin(w),  torch.cos(w)])])
+        #return torch.exp(q) * torch.stack([
+            #torch.stack([torch.cos(w), -torch.sin(w)]),
+            #torch.stack([torch.sin(w),  torch.cos(w)])])
+        return torch.stack([
+            torch.stack([  torch.tensor(0.) ,   torch.tensor(1.)]),
+            torch.stack([ -torch.square(w)  ,  -q               ])])
 
     def _construct_mat_a_diag(self, param):
 
