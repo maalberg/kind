@@ -18,7 +18,7 @@ class deep_koopman(torch.nn.Module):
         u_dims_n  = self.cfg['u_dims_n']
 
         self.autoencoder   = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n, y_dims_n=x_dims_n)
-        self.param_est     = parameter_estimator(z_dims_n + u_dims_n, param_dims_n=3)
+        self.param_est     = parameter_estimator(1 + u_dims_n, param_dims_n=3)
         self.force_preproc = force_preprocessor()
 
     def _init(self, configuration: dict) -> None:
@@ -83,7 +83,9 @@ class deep_koopman(torch.nn.Module):
         z_ic = torch.gather(z, -1, self._z_ic_indices[:z.shape[0], :, :])
 
         # --! 
-        params = self.param_est(torch.cat([z, u], dim=-1))
+        z1, z2 = torch.split(z, 1, dim=-1)
+        pha = torch.atan2(z1, z2)
+        params = self.param_est(torch.cat([pha, u], dim=-1))
         params = torch.unsqueeze(params, 1)
 
         # --! having all required data, we predict the trajectory of our latent space z and
@@ -122,12 +124,6 @@ class deep_koopman(torch.nn.Module):
                 plt.figure()
                 plt.plot(x[0, :, 0], label='x1')
                 plt.plot(x_pred[0, :, 0], label='x1_pred', linestyle='dashed')
-                plt.legend()
-                plt.show()
-
-                plt.figure()
-                plt.plot(x[0, :, 1], label='x2')
-                plt.plot(x_pred[0, :, 1], label='x2_pred', linestyle='dashed')
                 plt.legend()
                 plt.show()
 
@@ -211,7 +207,9 @@ class deep_koopman(torch.nn.Module):
         z = self.autoencoder.enc(torch.cat([x, u], dim=-1))
 
         # --! 
-        params = self.param_est(torch.cat([z, u], dim=-1))
+        z1, z2 = torch.split(z, 1, dim=-1)
+        pha = torch.atan2(z1, z2)
+        params = self.param_est(torch.cat([pha, u], dim=-1))
         params = torch.unsqueeze(params, 1)
 
         z_ic = torch.gather(z, -1, self._z_ic_indices[:z.shape[0], :, :])
