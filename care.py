@@ -101,7 +101,7 @@ class deep_koopman(torch.nn.Module):
         loss_lin    = loss_w_lin * self._fit_linearity(z, z_pred)
         loss_pred   = loss_w_pred * self._fit_prediction(x, x_pred)
         #loss_params = loss_w_params * self._fit_params(params)
-        #loss_phys  = loss_w_phys * self._fit_physics(z, u, params, now)
+        loss_phys  = loss_w_phys * self._fit_physics(z, u, a, b, now)
 
         # --!------------------------------------------------------------------
         # --! output
@@ -139,8 +139,8 @@ class deep_koopman(torch.nn.Module):
                 plt.show()
 
         # --! sum losses together and return the sum
-        loss = loss_ae + loss_lin + loss_pred# + loss_params# + loss_phys
-        return loss, loss_ae, loss_lin, loss_pred, 0.
+        loss = loss_ae + loss_lin + loss_pred + loss_phys# + loss_params#
+        return loss, loss_ae, loss_lin, loss_pred, loss_phys
 
     def _fit_autoencoder(self, x, x_ae):
 
@@ -169,7 +169,7 @@ class deep_koopman(torch.nn.Module):
 
         return omega_range.sum()
 
-    def _fit_physics(self, z, u, params, now):
+    def _fit_physics(self, z, u, a, b, now):
 
         t_dim = 1
         dt    = self.cfg['timestep']
@@ -180,10 +180,11 @@ class deep_koopman(torch.nn.Module):
         dz1    = torch.diff(z1, n=1, dim=t_dim) / dt
         dz2    = torch.diff(z1, n=2, dim=t_dim) / dt**2
 
-        q, w, k = torch.split(params, 1, dim=-1)
+        mu, w = torch.split(a, 1, dim=-1)
+        b1, b2 = torch.split(b, 1, dim=-1)
 
-        unforced = dz2 + q * dz1[:, :-1, :] + torch.square(w) * z1[:, :-2, :]
-        forced   = k * u[:, :-2, :]
+        unforced = dz2 + mu * dz1[:, :-1, :] + torch.square(w) * z1[:, :-2, :]
+        forced   = b2 * u[:, :-2, :]
         res      = unforced + forced
 
         # test
