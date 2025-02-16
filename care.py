@@ -442,16 +442,16 @@ class parameter_estimator(torch.nn.Module):
     def __init__(self, x_dims_n, z_dims_n: int = 32, param_dims_n: int = 1):
         super().__init__()
 
-        #self.net = utils.fcnn(features=[x_dims_n, 32, 32, param_dims_n], act_fn_hidden='relu')
+        self.net = utils.fcnn(features=[x_dims_n, 32, 32, param_dims_n], act_fn_hidden='relu')
 
-        self.rnn = torch.nn.LSTM(x_dims_n, z_dims_n, batch_first=True)
-        self.fc = torch.nn.Linear(z_dims_n, param_dims_n)
+        #self.rnn = torch.nn.LSTM(x_dims_n, z_dims_n, batch_first=True)
+        #self.fc = torch.nn.Linear(z_dims_n, param_dims_n)
 
     def forward(self, x):
-        #return torch.mean(self.net(x), dim=1)
-        rnn_out, _ = self.rnn(x)
-        out = self.fc(rnn_out[:, -1, :])
-        return out
+        return torch.mean(self.net(x), dim=1)
+        #rnn_out, _ = self.rnn(x)
+        #out = self.fc(rnn_out[:, -1, :])
+        #return out
 
 
 class force_preprocessor(torch.nn.Module):
