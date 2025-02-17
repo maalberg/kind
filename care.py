@@ -20,7 +20,7 @@ class deep_koopman(torch.nn.Module):
         self.autoencoder   = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n, y_dims_n=x_dims_n)
         self.a_est         = parameter_estimator(1, param_dims_n=2)
         self.b_est         = parameter_estimator(1, param_dims_n=2)
-        self.force_preproc = force_preprocessor()
+        #self.force_preproc = force_preprocessor()
 
     def _init(self, configuration: dict) -> None:
 
@@ -58,7 +58,8 @@ class deep_koopman(torch.nn.Module):
 
         # --! actuation u is preprocessed first to stress the nonlinear nature
         # --! of u, so the preprocessed u is in fact u^2
-        u = self.force_preproc(u)
+        #u = self.force_preproc(u)
+        u = torch.square(u)
 
         # --! encoder and decode given inputs
         # --!
@@ -214,7 +215,8 @@ class deep_koopman(torch.nn.Module):
 
         # --! according to the differential equation of a mechanical cavity model,
         # --! input u must be squared
-        u = self.force_preproc(u)
+        #u = self.force_preproc(u)
+        u = torch.square(u)
 
         z = self.autoencoder.enc(torch.cat([x, u], dim=-1))
 
