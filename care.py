@@ -13,14 +13,14 @@ class deep_koopman(torch.nn.Module):
 
         self._init(configuration)
 
+        efns_n    = len(self.cfg['modes'])
         z_dims_n  = self.cfg['z_dims_n']
         x_dims_n  = self.cfg['x_dims_n']
         u_dims_n  = self.cfg['u_dims_n']
 
         self.autoencoder   = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n, y_dims_n=x_dims_n)
-        self.a_est         = parameter_estimator(1, param_dims_n=2)
-        self.b_est         = parameter_estimator(1, param_dims_n=2)
-        #self.force_preproc = force_preprocessor()
+        self.est_as = estimator_pha(efns_n=efns_n, est_dims_n=2)
+        self.est_bs = estimator_amp(efns_n=efns_n, est_dims_n=2)
 
     def _init(self, configuration: dict) -> None:
 
@@ -34,7 +34,6 @@ class deep_koopman(torch.nn.Module):
 
         self.cfg['z_dims_n'] = efn_dims_n
 
-        #indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([2*i+1 for i in range(modes_n)]), dim=0), dim=0)
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(efn_dims_n)]), dim=0), dim=0)
         self._param_b_indices = indices.repeat(starts_n, 1, 1)
 
@@ -81,17 +80,8 @@ class deep_koopman(torch.nn.Module):
         # --! prediction starts from an initial condition (ic) of our latent space
         z_ic = torch.gather(z, -1, self._z_ic_indices[:z.shape[0], :, :])
 
-        # --! calculate the amplitude and the phase of a latent space z
-        # --!
-        # --! the amplitude is used to parameterize a mapping from z to
-        # --! matrix B, whereas the amplitude - to parameterize
-        # --! the mapping from z to matrix A
-        z1, z2 = torch.split(z, 1, dim=-1)
-        amp    = torch.square(z1) + torch.square(z2)
-        pha    = torch.atan2(z1, z2)
-
-        a   = torch.unsqueeze(self.a_est(pha), 1)
-        b   = torch.unsqueeze(self.b_est(amp), 1)
+        a   = torch.unsqueeze(self.est_as(z), 1)
+        b   = torch.unsqueeze(self.est_bs(z), 1)
 
         # --! having all required data, we predict the trajectory of our latent space z and
         # --! decode it back to the original space
@@ -141,8 +131,8 @@ class deep_koopman(torch.nn.Module):
 
         # --! sum losses together and return the sum
         loss = loss_ae + loss_lin + loss_pred + loss_phys# + loss_params#
-        return loss, loss_ae, loss_lin, loss_pred, loss_phys
-
+        return loss, loss_ae, loss_lin, loss_pred, loss_phys        
+        
     def _fit_autoencoder(self, x, x_ae):
 
         loss_fn = torch.nn.MSELoss(reduction='mean')
@@ -219,14 +209,8 @@ class deep_koopman(torch.nn.Module):
         u = torch.square(u)
 
         z = self.autoencoder.enc(torch.cat([x, u], dim=-1))
-
-        # --! 
-        z1, z2 = torch.split(z, 1, dim=-1)
-        amp    = torch.square(z1) + torch.square(z2)
-        pha    = torch.atan2(z1, z2)
-
-        a   = torch.unsqueeze(self.a_est(pha), 1)
-        b   = torch.unsqueeze(self.b_est(amp), 1)
+        a = torch.unsqueeze(self.est_as(z), 1)
+        b = torch.unsqueeze(self.est_bs(z), 1)
 
         z_ic = torch.gather(z, -1, self._z_ic_indices[:z.shape[0], :, :])
 
@@ -440,27 +424,42 @@ class eigenvalue(torch.nn.Module):
         return torch.sum(torch.square(eigenfunctions), dim=-1, keepdim=True)
 
 
-class parameter_estimator(torch.nn.Module):
-    def __init__(self, x_dims_n, z_dims_n: int = 32, param_dims_n: int = 1):
+class estimator(torch.nn.Module):
+    def __init__(self, efns_n: int=1, efn_dims_n: int=2, est_dims_n: int=1):
         super().__init__()
+        self.efn_dims_n = efn_dims_n
+        self.nets       = torch.nn.ModuleList(
+            [utils.fcnn(features=[efn_dims_n, 32, 32, est_dims_n], act_fn_hidden='relu') for _ in range(efns_n)])
 
-        self.net = utils.fcnn(features=[x_dims_n, 32, 32, param_dims_n], act_fn_hidden='relu')
-
-        #self.rnn = torch.nn.LSTM(x_dims_n, z_dims_n, batch_first=True)
-        #self.fc = torch.nn.Linear(z_dims_n, param_dims_n)
-
-    def forward(self, x):
-        return torch.mean(self.net(x), dim=1)
-        #rnn_out, _ = self.rnn(x)
-        #out = self.fc(rnn_out[:, -1, :])
-        #return out
+    def forward(self, z):
+        efns = torch.split(z, self.efn_dims_n, dim=-1)
+        return torch.cat([torch.mean(net(efn), dim=1) for net, efn in zip(self.nets, efns)], dim=-1)
 
 
-class force_preprocessor(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = utils.fcnn(features=[1, 32, 32, 1], act_fn_hidden='relu')
+class estimator_pha(estimator):
+    def __init__(self, efns_n: int=1, est_dims_n: int=1):
+        super().__init__(efns_n=efns_n, efn_dims_n=1, est_dims_n=est_dims_n)
 
-    def forward(self, x):
-        return self.net(torch.square(x))
+    def forward(self, z):
+        efns = torch.split(z, 2, dim=-1)
+        efns_pha = torch.cat([self._parameterize_pha(efn) for efn in efns], dim=-1)
+        return super().forward(efns_pha)
+
+    def _parameterize_pha(self, z):
+        z1, z2 = torch.split(z, 1, dim=-1)
+        return torch.atan2(z1, z2)
+
+
+class estimator_amp(estimator):
+    def __init__(self, efns_n: int=1, est_dims_n: int=1):
+        super().__init__(efns_n=efns_n, efn_dims_n=1, est_dims_n=est_dims_n)
+
+    def forward(self, z):
+        efns = torch.split(z, 2, dim=-1)
+        efns_pha = torch.cat([self._parameterize_amp(efn) for efn in efns], dim=-1)
+        return super().forward(efns_pha)
+
+    def _parameterize_amp(self, z):
+        z1, z2 = torch.split(z, 1, dim=-1)
+        return torch.square(z1) + torch.square(z2)
 
