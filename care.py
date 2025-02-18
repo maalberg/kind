@@ -1,6 +1,9 @@
 import torch
 from matplotlib import pyplot as plt
 
+from abc import abstractmethod
+from abc import ABCMeta as interface
+
 import utilities as utils
 
 
@@ -424,28 +427,36 @@ class eigenvalue(torch.nn.Module):
         return torch.sum(torch.square(eigenfunctions), dim=-1, keepdim=True)
 
 
-class estimator(torch.nn.Module):
+class estimator(torch.nn.Module, metaclass=interface):
+    """
+    Abstract estimator class that follows the template design pattern. Its ``forward``
+    method defines the structure, or template, of an estimation algorithm.
+    Subclasses then provide the details of this algorithm.
+    """
     def __init__(self, efns_n: int=1, efn_dims_n: int=2, est_dims_n: int=1):
         super().__init__()
-        self.efn_dims_n = efn_dims_n
-        self.nets       = torch.nn.ModuleList(
+        self.nets = torch.nn.ModuleList(
             [utils.fcnn(features=[efn_dims_n, 32, 32, est_dims_n], act_fn_hidden='relu') for _ in range(efns_n)])
 
     def forward(self, z):
-        efns = torch.split(z, self.efn_dims_n, dim=-1)
-        return torch.cat([torch.mean(net(efn), dim=1) for net, efn in zip(self.nets, efns)], dim=-1)
+        efns = torch.split(z, 2, dim=-1)
+
+        return torch.cat(
+            [torch.mean(
+                net(self._parameterize(efn)), dim=1) for net, efn in zip(self.nets, efns)], dim=-1)
+
+    @abstractmethod
+    def _parameterize(self, z):
+        """Parameterizes estimation algorithm. Subclasses must implement this abstract method."""
+        raise NotImplementedError
 
 
 class estimator_pha(estimator):
     def __init__(self, efns_n: int=1, est_dims_n: int=1):
         super().__init__(efns_n=efns_n, efn_dims_n=1, est_dims_n=est_dims_n)
 
-    def forward(self, z):
-        efns = torch.split(z, 2, dim=-1)
-        efns_pha = torch.cat([self._parameterize_pha(efn) for efn in efns], dim=-1)
-        return super().forward(efns_pha)
-
-    def _parameterize_pha(self, z):
+    def _parameterize(self, z):
+        """Parameterizes estimation with the phase of ``z`` latent space."""
         z1, z2 = torch.split(z, 1, dim=-1)
         return torch.atan2(z1, z2)
 
@@ -454,12 +465,8 @@ class estimator_amp(estimator):
     def __init__(self, efns_n: int=1, est_dims_n: int=1):
         super().__init__(efns_n=efns_n, efn_dims_n=1, est_dims_n=est_dims_n)
 
-    def forward(self, z):
-        efns = torch.split(z, 2, dim=-1)
-        efns_pha = torch.cat([self._parameterize_amp(efn) for efn in efns], dim=-1)
-        return super().forward(efns_pha)
-
-    def _parameterize_amp(self, z):
+    def _parameterize(self, z):
+        """Parameterizes estimation with the amplitude of ``z`` latent space."""
         z1, z2 = torch.split(z, 1, dim=-1)
         return torch.square(z1) + torch.square(z2)
 
