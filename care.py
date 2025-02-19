@@ -12,41 +12,33 @@ class detuning(torch.nn.Module):
     An autoencoder-based model for a cavity resonance detuning.
     """
 
+    # --! number of dimensions in one eigenfunction - an n-dimensional
+    # --! eigenfunction represents one oscillator
     efn_dims_n = 2
+
+    # --! number of parameters that allow building A and B matrices
     a_params_n = 2
     b_params_n = 2
 
-    def __init__(self, configuration: dict) -> None:
+    def __init__(self, config) -> None:
         super().__init__()
 
-        self._init(configuration)
+        starts_n  = config['batch_size']
+        x_dims_n  = config['x_dims_n']
+        u_dims_n  = config['u_dims_n']
+        efns_n    = config['modes_n']
+        z_dims_n  = efns_n * detuning.efn_dims_n
 
-        efns_n    = len(self.cfg['modes'])
-        z_dims_n  = self.cfg['z_dims_n']
-        x_dims_n  = self.cfg['x_dims_n']
-        u_dims_n  = self.cfg['u_dims_n']
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(z_dims_n)]), dim=0), dim=0)
+        self._param_b_indices = indices.repeat(starts_n, 1, 1)
+        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(z_dims_n)]), dim=0), dim=0)
+        self._z_ic_indices = indices.repeat(starts_n, 1, 1)
+
+        self.cfg = config
 
         self.autoencoder = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n, y_dims_n=x_dims_n)
         self.est_as = _estimator_pha(efns_n=efns_n, est_dims_n=detuning.a_params_n)
         self.est_bs = _estimator_amp(efns_n=efns_n, est_dims_n=detuning.b_params_n)
-
-    def _init(self, configuration: dict) -> None:
-
-        self.cfg = configuration
-
-        modes       = self.cfg['modes']
-        modes_n     = len(modes)
-        starts_n    = self.cfg['batch_size']
-
-        efn_dims_n  = modes_n * 2
-
-        self.cfg['z_dims_n'] = efn_dims_n
-
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(efn_dims_n)]), dim=0), dim=0)
-        self._param_b_indices = indices.repeat(starts_n, 1, 1)
-
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(efn_dims_n)]), dim=0), dim=0)
-        self._z_ic_indices = indices.repeat(starts_n, 1, 1)
 
     def fit(self, x, u, pretrain_autoencoder: bool = False, now: bool = False) -> torch.Tensor:
 
