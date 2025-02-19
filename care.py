@@ -6,17 +6,21 @@ from abc import ABCMeta as interface
 
 import utilities as utils
 
-
 class detuning(torch.nn.Module):
     """
     An autoencoder-based model for a cavity resonance detuning.
     """
 
-    # --! number of dimensions in one eigenfunction - an n-dimensional
-    # --! eigenfunction represents one oscillator
+    # --! number of dimensions in one eigenfunction, such
+    # --! that an n-dimensional eigenfunction represents one oscillator
+    # --!
+    # --! current eigenfunction format includes two dimensions for the
+    # --! displacement and velocity of an oscillator,
+    # --! plus one dimesions to describe a force
+    # --! that drives this oscillator
     efn_dims_n = 2
 
-    # --! number of parameters that allow building A and B matrices
+    # --! number of parameters that are involved in building A and B matrices
     a_params_n = 2
     b_params_n = 2
 
@@ -55,7 +59,7 @@ class detuning(torch.nn.Module):
         # --!------------------------------------------------------------------
         # --! algorithm
 
-        # --! 
+        # --! according to physics equations, u is squared
         u = torch.square(u)
 
         # --! encode and decode given inputs
@@ -78,8 +82,8 @@ class detuning(torch.nn.Module):
         # --! prediction starts from an initial condition (ic) of our latent space
         z_ic = torch.gather(z, -1, self._z_ic_indices[:z.shape[0], :, :])
 
-        a   = torch.unsqueeze(self.est_as(z), 1)
-        b   = torch.unsqueeze(self.est_bs(z), 1)
+        a = torch.unsqueeze(self.est_as(z), 1)
+        b = torch.unsqueeze(self.est_bs(z), 1)
 
         # --! having all required data, we predict the trajectory of our latent space z and
         # --! decode it back to the original space
@@ -283,17 +287,11 @@ class detuning(torch.nn.Module):
         return torch.exp(mu*dt) * torch.stack([
             torch.stack([torch.cos(omega*dt), -torch.sin(omega*dt)]),
             torch.stack([torch.sin(omega*dt),  torch.cos(omega*dt)])])
-        #return torch.stack([
-            #torch.stack([  torch.tensor(0.) ,   torch.tensor(1.)]),
-            #torch.stack([  torch.square(w)  ,   w/q             ])])
 
     def _construct_mat_a_diag(self, param):
 
-        qw_dims_n =  2
-        ch_dim    = -1
-
         # split pairs of q, w parameters along the last, i.e. channel, dimension
-        params = torch.split(param, qw_dims_n, dim=ch_dim)
+        params = torch.split(param, detuning.a_params_n, dim=-1)
 
         return torch.block_diag(*[self._construct_mat_a(
             param[0, 0],
@@ -333,7 +331,7 @@ class detuning(torch.nn.Module):
         bch_n = param_b.shape[0]
         mat_b = torch.zeros(bch_n,
                             1,
-                            2, # fixme
+                            param_b.shape[-1],
                             dtype=param_b.dtype).scatter_(-1,
                                                           self._param_b_indices[:bch_n, :, :],
                                                           param_b)
@@ -399,7 +397,7 @@ class _estimator_pha(_estimator):
 
     def _parameterize(self, z):
         """Parameterizes estimation with the phase of ``z`` latent space."""
-        z1, z2 = torch.split(z, 1, dim=-1)
+        z1, z2, _ = torch.split(z, [1, 1, detuning.efn_dims_n - 2], dim=-1)
         return torch.atan2(z1, z2)
 
 
@@ -409,6 +407,6 @@ class _estimator_amp(_estimator):
 
     def _parameterize(self, z):
         """Parameterizes estimation with the amplitude of ``z`` latent space."""
-        z1, z2 = torch.split(z, 1, dim=-1)
+        z1, z2, _ = torch.split(z, [1, 1, detuning.efn_dims_n - 2], dim=-1)
         return torch.square(z1) + torch.square(z2)
 
