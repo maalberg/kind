@@ -7,10 +7,15 @@ from abc import ABCMeta as interface
 import utilities as utils
 
 
-# --!--------------------------------------------------------------------------
-#
+class detuning(torch.nn.Module):
+    """
+    An autoencoder-based model for a cavity resonance detuning.
+    """
 
-class deep_koopman(torch.nn.Module):
+    efn_dims_n = 2
+    a_params_n = 2
+    b_params_n = 2
+
     def __init__(self, configuration: dict) -> None:
         super().__init__()
 
@@ -21,9 +26,9 @@ class deep_koopman(torch.nn.Module):
         x_dims_n  = self.cfg['x_dims_n']
         u_dims_n  = self.cfg['u_dims_n']
 
-        self.autoencoder   = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n, y_dims_n=x_dims_n)
-        self.est_as = estimator_pha(efns_n=efns_n, est_dims_n=2)
-        self.est_bs = estimator_amp(efns_n=efns_n, est_dims_n=2)
+        self.autoencoder = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n, y_dims_n=x_dims_n)
+        self.est_as = _estimator_pha(efns_n=efns_n, est_dims_n=detuning.a_params_n)
+        self.est_bs = _estimator_amp(efns_n=efns_n, est_dims_n=detuning.b_params_n)
 
     def _init(self, configuration: dict) -> None:
 
@@ -58,12 +63,10 @@ class deep_koopman(torch.nn.Module):
         # --!------------------------------------------------------------------
         # --! algorithm
 
-        # --! actuation u is preprocessed first to stress the nonlinear nature
-        # --! of u, so the preprocessed u is in fact u^2
-        #u = self.force_preproc(u)
+        # --! 
         u = torch.square(u)
 
-        # --! encoder and decode given inputs
+        # --! encode and decode given inputs
         # --!
         # --! this encoder is not symmetric, since it encodes x and u, but
         # --! decodes only the x back
@@ -164,6 +167,18 @@ class deep_koopman(torch.nn.Module):
         return omega_range.sum()
 
     def _fit_physics(self, z, u, a, b, now):
+
+        # --! split z latent space as well as system matrices a and b according to eigenfunction dimensions
+        efns   = torch.split(z, detuning.efn_dims_n, dim=-1)
+        efn_as = torch.split(a, detuning.a_params_n, dim=-1)
+        efn_bs = torch.split(b, detuning.b_params_n, dim=-1)
+
+        # --! fit physics to every eigenfunction
+        return torch.sum(
+            torch.stack([self._fit_physics_efn(
+                efn, u, efn_a, efn_b, now) for efn, efn_a, efn_b in zip(efns, efn_as, efn_bs)]))
+
+    def _fit_physics_efn(self, z, u, a, b, now):
 
         t_dim = 1
         dt    = self.cfg['timestep']
@@ -360,78 +375,13 @@ class deep_koopman(torch.nn.Module):
         return torch.cat([mat_ab, mat_b], dim=1)
 
 
-class eigenfunction:
-    rad_dims_n = 2
-
-# ---------------------------------------------------------------------------*/
-# - eigenvalue
-
-class eigenvalue(torch.nn.Module):
-    # an eigenvalue has two properties: scaling mu and angular frequency omega
-    eva_props_n = 2
-
-    def __init__(self, efn_dims_n: int = 2) -> None:
-        """
-        Creates a fully-connected neural network-based operator to transform
-        Koopman eigenfunctions into eigenvalues.
-        """
-        super().__init__()
-
-        self.fourier = utils.rff(features=[2, 128], sigma=5.)
-
-        # since an eigenfunction may have more dimensions than 2, a respective number of
-        # neural networks is created to process two-dimensional parts
-        # of the eigenfunction space in parallel
-        nets_n = int(efn_dims_n / eigenfunction.rad_dims_n)
-        self.nets = [utils.fcnn(
-            features=[256, 128, 64, self.eva_props_n],
-            act_fn_hidden='tanh') for _ in range(nets_n)]
-
-    def forward(self, eigenfunctions: torch.Tensor) -> torch.Tensor:
-        """
-        Transforms Koopman ``eigenfunctions`` into eigenvalues. Input ``eigenfunctions`` are expected
-        to be shaped as [B, T, C], where B, T and C are the number of batches, time steps
-        and eigenfunction channels, respectively.
-        """
-
-        # split an eigenfunction into two-dimensional radial subfunctions
-        eigenfuncs_rad = torch.split(eigenfunctions, eigenfunction.rad_dims_n, dim=2)
-
-        # apply a dedicated neural network to each two-dimensional eigenfunction
-        #
-        # note how a two-dimensional eigenfunction is first constrained to respect radial symmetry
-        #
-        # also note how eigenvalues for each radial eigenfunction are concatenated as columns
-        # to the result
-        return torch.cat([
-            net(self.fourier(efn)) for net, efn in zip(self.nets, eigenfuncs_rad)], dim=2)
-
-    @staticmethod
-    def to_rotation_diag(eigenvalues: torch.Tensor):
-        """Uses ``eigenvalues`` to assemble a matrix with 2x2 rotation matrices on its diagonal."""
-
-        # split incoming eigenvalues along the last, i.e. channel, dimension
-        evas = torch.split(eigenvalues, eigenvalue.eva_props_n, dim=-1)
-
-        return torch.block_diag(*[utils.make_a(
-            eva[0, 0],
-            eva[0, 1]) for eva in evas])
-
-    @staticmethod
-    def constrain_rad(eigenfunctions: torch.Tensor) -> torch.Tensor:
-        """
-        Constrains an ``eigenfunction`` by its radius. Input ``eigenfunctions`` are expected
-        to be shaped as [B, T, 2], where B and T are the number of batches and
-        time steps, respectively. Radius is derived from 2 dimensions.
-        """
-        return torch.sum(torch.square(eigenfunctions), dim=-1, keepdim=True)
-
-
-class estimator(torch.nn.Module, metaclass=interface):
+class _estimator(torch.nn.Module, metaclass=interface):
     """
-    Abstract estimator class that follows the template design pattern. Its ``forward``
-    method defines the structure, or template, of an estimation algorithm.
-    Subclasses then provide the details of this algorithm.
+    An internal neural network to help estimate the parameters of system matrices.
+
+    This abstract class follows the template design pattern. Specifically, its ``forward``
+    method defines the structure, or template, of an estimation algorithm, so
+    that its subclasses must provide the details of this algorithm.
     """
     def __init__(self, efns_n: int=1, efn_dims_n: int=2, est_dims_n: int=1):
         super().__init__()
@@ -439,7 +389,7 @@ class estimator(torch.nn.Module, metaclass=interface):
             [utils.fcnn(features=[efn_dims_n, 32, 32, est_dims_n], act_fn_hidden='relu') for _ in range(efns_n)])
 
     def forward(self, z):
-        efns = torch.split(z, 2, dim=-1)
+        efns = torch.split(z, detuning.efn_dims_n, dim=-1)
 
         return torch.cat(
             [torch.mean(
@@ -451,7 +401,7 @@ class estimator(torch.nn.Module, metaclass=interface):
         raise NotImplementedError
 
 
-class estimator_pha(estimator):
+class _estimator_pha(_estimator):
     def __init__(self, efns_n: int=1, est_dims_n: int=1):
         super().__init__(efns_n=efns_n, efn_dims_n=1, est_dims_n=est_dims_n)
 
@@ -461,7 +411,7 @@ class estimator_pha(estimator):
         return torch.atan2(z1, z2)
 
 
-class estimator_amp(estimator):
+class _estimator_amp(_estimator):
     def __init__(self, efns_n: int=1, est_dims_n: int=1):
         super().__init__(efns_n=efns_n, efn_dims_n=1, est_dims_n=est_dims_n)
 
