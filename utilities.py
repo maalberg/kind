@@ -2,9 +2,6 @@ import numpy as np
 import torch
 
 
-# ---------------------------------------------------------------------------*/
-# - read data from a file
-
 def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     """
     Reads data from a file called ``name`` and formats the data based on ``datachunk_len``,
@@ -21,16 +18,10 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     return torch.reshape(data, (datachunks_n, datachunk_len, data.shape[1]))
 
 
-# ---------------------------------------------------------------------------*/
-# - write data to a file
-
 def write_datafile(name: str, data) -> None:
     filedata = np.reshape(data, (data.shape[0] * data.shape[1], data.shape[2]))
     np.savetxt('./data/' + name + '.csv', filedata, fmt='%.14f', delimiter=',')
 
-
-# --!------------------------------------------------------------------------*/
-# --! random fourier features
 
 class rff:
     def __init__(self, features: list[int] = [1, 64], sigma: float = 1.0) -> None:
@@ -49,11 +40,11 @@ class rff:
             torch.sin(2 * torch.pi * z)], dim=-1)
 
 
-# ---------------------------------------------------------------------------*/
-# - fully-connected neural network
-
 class fcnn(torch.nn.Module):
-    def __init__(self, features: list[int] = [1, 16 , 1], act_fn_hidden: str = 'relu', act_fn_out: str = 'linear') -> None:
+    """
+    A fully-connected neural network.
+    """
+    def __init__(self, features: list[int]=[1, 16 , 1], act_fn_hidden: str='relu', act_fn_out: str='linear') -> None:
         """
         Constructs a fully-connected neural network with specified ``features`` and ``activation``.
 
@@ -110,44 +101,3 @@ class fcnn(torch.nn.Module):
         else:
             raise ValueError(f'unknown activation function passed: {name}')
         return a()
-
-
-# ---------------------------------------------------------------------------*/
-# autoencoder based on fully-connected neural networks
-
-class autoencoder(torch.nn.Module):
-    def __init__(self, x_dims_n: int = 2, z_dims_n: int = 2, y_dims_n: int = 2) -> None:
-        super().__init__()
-
-        # define the structure of a fully-connected neural network
-        net_features = [x_dims_n, 64, 64, z_dims_n]
-
-        self.enc = fcnn(features=net_features, act_fn_hidden='relu')
-
-        if y_dims_n == x_dims_n:
-            net_features = list(reversed(net_features))
-        else:
-            net_features = [z_dims_n, 64, 64, y_dims_n]
-        self.dec = fcnn(features=net_features, act_fn_hidden='relu')
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Encodes timeseries ``x`` into a latent space z and then immediately decodes z back to ``x``.
-        Input ``x`` is expected to be formatted as [B, T, C], where B, T, and C are
-        the number of batches, time steps and data channels, respectively.
-        """
-        return self.dec(self.enc(x))
-
-
-# ---------------------------------------------------------------------------*/
-# - make a rotation matrix
-
-def make_rotation(exponent: torch.Tensor = torch.tensor(0.), angle: torch.Tensor = torch.tensor(0.)) -> torch.Tensor:
-    return torch.exp(exponent) * torch.stack([
-        torch.stack([torch.cos(angle), -torch.sin(angle)]),
-        torch.stack([torch.sin(angle),  torch.cos(angle)])])
-
-def make_a(q, w):
-    return torch.stack([
-        torch.stack([torch.tensor(0.), torch.tensor(1.)]),
-        torch.stack([-torch.square(w),  -w/q])])

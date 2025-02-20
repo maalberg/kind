@@ -15,9 +15,7 @@ class detuning(torch.nn.Module):
     # --! that an n-dimensional eigenfunction represents one oscillator
     # --!
     # --! current eigenfunction format includes two dimensions for the
-    # --! displacement and velocity of an oscillator,
-    # --! plus one dimesions to describe a force
-    # --! that drives this oscillator
+    # --! displacement and velocity of an oscillator
     efn_dims_n = 2
 
     # --! number of parameters that are involved in building A and B matrices
@@ -40,7 +38,8 @@ class detuning(torch.nn.Module):
 
         self.cfg = config
 
-        self.autoencoder = utils.autoencoder(x_dims_n + u_dims_n, z_dims_n, y_dims_n=x_dims_n)
+        self.enc    = _encoder(x_dims_n, z_dims_n)
+        self.dec    = _decoder(z_dims_n, x_dims_n)
         self.est_as = _estimator_pha(efns_n=efns_n, est_dims_n=detuning.a_params_n)
         self.est_bs = _estimator_amp(efns_n=efns_n, est_dims_n=detuning.b_params_n)
 
@@ -62,12 +61,9 @@ class detuning(torch.nn.Module):
         # --! according to physics equations, u is squared
         u = torch.square(u)
 
-        # --! encode and decode given inputs
-        # --!
-        # --! this encoder is not symmetric, since it encodes x and u, but
-        # --! decodes only the x back
-        z = self.autoencoder.enc(torch.cat([x, u], dim=-1))
-        x_ae = self.autoencoder.dec(z)
+        # --! encode and decode input x
+        z = self.enc(x)
+        x_ae = self.dec(z)
 
         # --! fit the loss of the autoencoder
         loss_ae = loss_w_ae * self._fit_autoencoder(x, x_ae)
@@ -88,7 +84,7 @@ class detuning(torch.nn.Module):
         # --! having all required data, we predict the trajectory of our latent space z and
         # --! decode it back to the original space
         z_pred  = self._predict_z(z_ic, u, a, b)
-        x_pred = self.autoencoder.dec(z_pred)
+        x_pred = self.dec(z_pred)
 
         # --! fit the losses of linearity and prediction
         loss_lin    = loss_w_lin * self._fit_linearity(z, z_pred)
@@ -222,7 +218,7 @@ class detuning(torch.nn.Module):
         #u = self.force_preproc(u)
         u = torch.square(u)
 
-        z = self.autoencoder.enc(torch.cat([x, u], dim=-1))
+        z = self.enc(x)
         a = torch.unsqueeze(self.est_as(z), 1)
         b = torch.unsqueeze(self.est_bs(z), 1)
 
@@ -231,7 +227,7 @@ class detuning(torch.nn.Module):
         # --! having all required data, we predict the trajectory of our latent space z and
         # --! decode it back to the original space
         z_pred  = self._predict_z(z_ic, u, a, b)
-        x_pred = self.autoencoder.dec(z_pred)
+        x_pred = self.dec(z_pred)
 
         return x_pred
 
@@ -363,6 +359,24 @@ class detuning(torch.nn.Module):
         # matrix B is positioned last to allow a multiplication with u values such that u_(k + h - 1)
         # value, i.e. the one before a horizon h, is multiplied with the plain matrix B
         return torch.cat([mat_ab, mat_b], dim=1)
+
+
+class _encoder(torch.nn.Module):
+    def __init__(self, x_dims_n: int=2, z_dims_n: int=2):
+        super().__init__()
+        self.net = utils.fcnn(features=[x_dims_n, 64, 64, z_dims_n], act_fn_hidden='relu')
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _decoder(torch.nn.Module):
+    def __init__(self, z_dims_n: int=2, x_dims_n: int=2):
+        super().__init__()
+        self.net = utils.fcnn(features=[z_dims_n, 64, 64, x_dims_n], act_fn_hidden='relu')
+
+    def forward(self, z):
+        return self.net(z)
 
 
 class _estimator(torch.nn.Module, metaclass=interface):
