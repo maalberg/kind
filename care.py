@@ -22,6 +22,8 @@ class detuning(torch.nn.Module):
     a_params_n = 2
     b_params_n = 2
 
+    u_dims_n   = 1
+
     def __init__(self, config) -> None:
         super().__init__()
 
@@ -30,16 +32,17 @@ class detuning(torch.nn.Module):
         u_dims_n  = config['u_dims_n']
         efns_n    = config['modes_n']
         z_dims_n  = efns_n * detuning.efn_dims_n
+        y_dims_n  = efns_n * u_dims_n
 
-        indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(z_dims_n)]), dim=0), dim=0)
-        self._param_b_indices = indices.repeat(starts_n, 1, 1)
         indices = torch.unsqueeze(torch.unsqueeze(torch.tensor([i for i in range(z_dims_n)]), dim=0), dim=0)
         self._z_ic_indices = indices.repeat(starts_n, 1, 1)
 
         self.cfg = config
 
-        self.enc    = _encoder(x_dims_n, z_dims_n)
-        self.dec    = _decoder(z_dims_n, x_dims_n)
+        self.enc_xs = _encoder(x_dims_n, z_dims_n)
+        self.dec_xs = _decoder(z_dims_n, x_dims_n)
+        self.enc_us = _encoder(u_dims_n, y_dims_n, hidden_sz=32)
+        self.dec_us = _decoder(y_dims_n, u_dims_n, hidden_sz=32)
         self.est_as = _estimator_pha(efns_n=efns_n, est_dims_n=detuning.a_params_n)
         self.est_bs = _estimator_amp(efns_n=efns_n, est_dims_n=detuning.b_params_n)
 
@@ -56,17 +59,21 @@ class detuning(torch.nn.Module):
         loss_w_phys   = self.cfg['loss_w_phys']
 
         # --!------------------------------------------------------------------
-        # --! algorithm
+        # --! use an autoencoder to decompose x and u into modes
 
-        # --! according to physics equations, u is squared
+        # --! decompose x into modes and reconstruct back
+        z = self.enc_xs(x)
+        x_ae = self.dec_xs(z)
+
+        # --! then, according to physics equations, u is squared
         u = torch.square(u)
 
-        # --! encode and decode input x
-        z = self.enc(x)
-        x_ae = self.dec(z)
+        # --! decompose squared u into modes and reconstruct back
+        y = self.enc_us(u)
+        u_ae = self.dec_us(y)
 
-        # --! fit the loss of the autoencoder
-        loss_ae = loss_w_ae * self._fit_autoencoder(x, x_ae)
+        # --! fit the loss of decomposition
+        loss_ae = loss_w_ae * self._fit_decomposition(x, x_ae, u, u_ae)
 
         # --! if the autoencoder is to be trained first, then exit here
         if pretrain_autoencoder:
@@ -83,14 +90,16 @@ class detuning(torch.nn.Module):
 
         # --! having all required data, we predict the trajectory of our latent space z and
         # --! decode it back to the original space
-        z_pred  = self._predict_z(z_ic, u, a, b)
-        x_pred = self.dec(z_pred)
+        z_pred  = self._predict_z(z_ic, y, a, b)
+        x_pred = self.dec_xs(z_pred)
 
         # --! fit the losses of linearity and prediction
         loss_lin    = loss_w_lin * self._fit_linearity(z, z_pred)
         loss_pred   = loss_w_pred * self._fit_prediction(x, x_pred)
-        #loss_params = loss_w_params * self._fit_params(params)
-        loss_phys  = loss_w_phys * self._fit_physics(z, u, a, b, now)
+
+        #loss_params = loss_w_params * self._fit_params(a)
+
+        loss_phys   = loss_w_phys * self._fit_physics(z, y, a, b, now)
 
         # --!------------------------------------------------------------------
         # --! output
@@ -131,10 +140,15 @@ class detuning(torch.nn.Module):
         loss = loss_ae + loss_lin + loss_pred + loss_phys# + loss_params#
         return loss, loss_ae, loss_lin, loss_pred, loss_phys        
         
-    def _fit_autoencoder(self, x, x_ae):
+    def _fit_decomposition(self, x, x_ae, u, u_ae):
 
-        loss_fn = torch.nn.MSELoss(reduction='mean')
-        return loss_fn(x_ae, x)
+        x_loss_fn = torch.nn.MSELoss(reduction='mean')
+        x_loss = x_loss_fn(x_ae, x)
+
+        u_loss_fn = torch.nn.MSELoss(reduction='mean')
+        u_loss = u_loss_fn(u_ae, u)
+
+        return x_loss + u_loss
 
     def _fit_linearity(self, z, z_pred):
 
@@ -162,13 +176,14 @@ class detuning(torch.nn.Module):
 
         # --! split z latent space as well as system matrices a and b according to eigenfunction dimensions
         efns   = torch.split(z, detuning.efn_dims_n, dim=-1)
+        efn_us = torch.split(u, detuning.u_dims_n, dim=-1)
         efn_as = torch.split(a, detuning.a_params_n, dim=-1)
         efn_bs = torch.split(b, detuning.b_params_n, dim=-1)
 
         # --! fit physics to every eigenfunction
         return torch.sum(
             torch.stack([self._fit_physics_efn(
-                efn, u, efn_a, efn_b, now) for efn, efn_a, efn_b in zip(efns, efn_as, efn_bs)]))
+                efn, efn_u, efn_a, efn_b, now) for efn, efn_u, efn_a, efn_b in zip(efns, efn_us, efn_as, efn_bs)]))
 
     def _fit_physics_efn(self, z, u, a, b, now):
 
@@ -215,10 +230,10 @@ class detuning(torch.nn.Module):
 
         # --! according to the differential equation of a mechanical cavity model,
         # --! input u must be squared
-        #u = self.force_preproc(u)
         u = torch.square(u)
 
-        z = self.enc(x)
+        z = self.enc_xs(x)
+        y = self.enc_us(u)
         a = torch.unsqueeze(self.est_as(z), 1)
         b = torch.unsqueeze(self.est_bs(z), 1)
 
@@ -226,8 +241,8 @@ class detuning(torch.nn.Module):
 
         # --! having all required data, we predict the trajectory of our latent space z and
         # --! decode it back to the original space
-        z_pred  = self._predict_z(z_ic, u, a, b)
-        x_pred = self.dec(z_pred)
+        z_pred  = self._predict_z(z_ic, y, a, b)
+        x_pred = self.dec_xs(z_pred)
 
         return x_pred
 
@@ -252,7 +267,7 @@ class detuning(torch.nn.Module):
             torch.sum(
                 torch.matmul(
                     u[:, :i, :, :],
-                    self._construct_mat_b(
+                    self._construct_mat_ab(
                         b,
                         mat_a[:, :i, :, :])), 1, keepdim=True) for i in range(1, horizon)], dim=1)
 
@@ -286,7 +301,7 @@ class detuning(torch.nn.Module):
 
     def _construct_mat_a_diag(self, param):
 
-        # split pairs of q, w parameters along the last, i.e. channel, dimension
+        # split pairs of mu omega parameters along the last, i.e. channel, dimension
         params = torch.split(param, detuning.a_params_n, dim=-1)
 
         return torch.block_diag(*[self._construct_mat_a(
@@ -295,7 +310,7 @@ class detuning(torch.nn.Module):
 
     def _construct_mat_a_pow(self, params, horizon):
 
-        # construct a matrix for every provided pair of q w parameters
+        # construct a matrix for every provided pair of mu omega parameters
         #
         # constructed matrices are shaped as [B, C_efn, C_efn], where B and C_efn are the number of batches
         # and eigenfunction channels, respectively
@@ -312,25 +327,9 @@ class detuning(torch.nn.Module):
             torch.transpose(
                 torch.linalg.matrix_power(mat, i), -2, -1) for i in range(1, horizon)], dim=1)
 
-    def _construct_mat_b(self, param_b, mat_a):
+    def _construct_mat_ab(self, param_b, mat_a):
 
-        # scatter b matrix parameters in a zero-filled matrix
-        #
-        # note that matrix B is constructed as transposed, i.e. shaped as [1, C_z],
-        # where C_z is the number of channels in a z latent space
-        #
-        # next, by zero-filling this B matrix right from the start, we declare that
-        # the first column of a 1x2 matrix B is a zero, and the b
-        # parameter goes into the second column
-        #
-        # so matrix B is shaped as [B, 1, C_z], where B is the number of batches
-        bch_n = param_b.shape[0]
-        mat_b = torch.zeros(bch_n,
-                            1,
-                            param_b.shape[-1],
-                            dtype=param_b.dtype).scatter_(-1,
-                                                          self._param_b_indices[:bch_n, :, :],
-                                                          param_b)
+        mat_b = torch.stack([self._construct_mat_b_diag(param) for param in param_b], dim=0)
 
         # add an extra singleton dimension after the batch dimension to allow broadcasting
         # during multiplication with matrix A
@@ -360,20 +359,33 @@ class detuning(torch.nn.Module):
         # value, i.e. the one before a horizon h, is multiplied with the plain matrix B
         return torch.cat([mat_ab, mat_b], dim=1)
 
+    def _construct_mat_b_diag(self, param):
+
+        # --! split pairs of b parameters along the last, i.e. channel, dimension
+        # --!
+        # --! split parameters are shaped as [1, b_params_n * efns_n], where b_params_n
+        # --! and efns_n are the number of B matrix parameters and
+        # --! eigenfunctions, respectively.
+        params = torch.split(param, detuning.b_params_n, dim=-1)
+
+        # --! construct B matrices in a block-diagonal manner
+        # --!
+        # --! note that the resulting block-diagonal B matrix is transposed
+        return torch.block_diag(*params)
 
 class _encoder(torch.nn.Module):
-    def __init__(self, x_dims_n: int=2, z_dims_n: int=2):
+    def __init__(self, x_dims_n: int=2, z_dims_n: int=2, hidden_sz: int=64):
         super().__init__()
-        self.net = utils.fcnn(features=[x_dims_n, 64, 64, z_dims_n], act_fn_hidden='relu')
+        self.net = utils.fcnn(features=[x_dims_n, hidden_sz, hidden_sz, z_dims_n], act_fn_hidden='relu')
 
     def forward(self, x):
         return self.net(x)
 
 
 class _decoder(torch.nn.Module):
-    def __init__(self, z_dims_n: int=2, x_dims_n: int=2):
+    def __init__(self, z_dims_n: int=2, x_dims_n: int=2, hidden_sz: int=64):
         super().__init__()
-        self.net = utils.fcnn(features=[z_dims_n, 64, 64, x_dims_n], act_fn_hidden='relu')
+        self.net = utils.fcnn(features=[z_dims_n, hidden_sz, hidden_sz, x_dims_n], act_fn_hidden='relu')
 
     def forward(self, z):
         return self.net(z)
