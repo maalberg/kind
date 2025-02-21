@@ -112,29 +112,21 @@ class detuning(torch.nn.Module):
                 print(a[0, 0, :])
                 print(b[0, 0, :])
 
-                plt.figure()
-                plt.plot(z[0, :, 0], label='z1')
-                plt.plot(z_pred[0, :, 0], label='z1_pred', linestyle='dashed')
-                plt.legend()
-                plt.show()
+                z_dims_n = self.cfg['modes_n'] * detuning.efn_dims_n
+                for i in range(z_dims_n):
+                    plt.figure()
+                    plt.plot(z[0, :, i], label=f'z{i+1}')
+                    plt.plot(z_pred[0, :, i], label=f'z{i+1}_pred', linestyle='dashed')
+                    plt.legend()
+                    plt.show()
 
-                plt.figure()
-                plt.plot(z[0, :, 1], label='z2')
-                plt.plot(z_pred[0, :, 1], label='z2_pred', linestyle='dashed')
-                plt.legend()
-                plt.show()
-
-                plt.figure()
-                plt.plot(x[0, :, 0], label='x1')
-                plt.plot(x_pred[0, :, 0], label='x1_pred', linestyle='dashed')
-                plt.legend()
-                plt.show()
-
-                plt.figure()
-                plt.plot(x[0, :, 1], label='x2')
-                plt.plot(x_pred[0, :, 1], label='x2_pred', linestyle='dashed')
-                plt.legend()
-                plt.show()
+                x_dims_n = self.cfg['x_dims_n']
+                for i in range(x_dims_n):
+                    plt.figure()
+                    plt.plot(x[0, :, i], label=f'x{i+1}')
+                    plt.plot(x_pred[0, :, i], label=f'x{i+1}_pred', linestyle='dashed')
+                    plt.legend()
+                    plt.show()
 
         # --! sum losses together and return the sum
         loss = loss_ae + loss_lin + loss_pred + loss_phys# + loss_params#
