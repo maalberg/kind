@@ -18,9 +18,9 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     return torch.reshape(data, (datachunks_n, datachunk_len, data.shape[1]))
 
 
-def write_datafile(name: str, data) -> None:
+def write_datafile(name: str, data, delim: str = ',') -> None:
     filedata = np.reshape(data, (data.shape[0] * data.shape[1], data.shape[2]))
-    np.savetxt('./data/' + name + '.csv', filedata, fmt='%.14f', delimiter=',')
+    np.savetxt('./data/' + name + '.csv', filedata, fmt='%.14f', delimiter=delim)
 
 
 class rff:
