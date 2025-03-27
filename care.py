@@ -13,14 +13,10 @@ class detuning(torch.nn.Module):
 
     # --! number of dimensions in one eigenfunction, which describes
     # --! an n-dimensional latent oscillator
-    #
-    # --! thus, a latent oscillator has state x and is affected by actuation u
-    #
-    # --! furthermore, it is predefined that state x is represented by two dimensions,
-    # --! i.e. a displacement and velocity,
-    # --! whereas actuation u is a one-dimensional signal
-    efn_x_dims_n = 2
-    efn_u_dims_n = 1
+    efn_dims_n = 2
+
+    # --! number of dimensions in z latent space that are occupied by actuation u
+    zu_dims_n = 1
 
     # --! number of parameters that are involved in building A and B matrices
     a_params_n = 2
@@ -29,15 +25,12 @@ class detuning(torch.nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
 
-        # --! derive the total number of eigenfunctions
-        # --! and the total number of dimensions in one eigenfunction
-        efns_n     = config['modes_n']
-        efn_dims_n = detuning.efn_x_dims_n + detuning.efn_u_dims_n
+        # --! dynamic modes determine the number of eigenfunctions
+        efns_n = config['modes_n']
 
         # --! eigenfunctions compose z latent space, so compute the number of z dimensions
-        # --! as well as dimensions in z that represent oscillators
-        z_dims_n  = efns_n * efn_dims_n
-        zx_dims_n = efns_n * detuning.efn_x_dims_n
+        zx_dims_n = efns_n * detuning.efn_dims_n
+        z_dims_n  = zx_dims_n + detuning.zu_dims_n
 
         # --! compute indices that allow making quick gather and scatter operations in pytorch
         #
@@ -47,7 +40,7 @@ class detuning(torch.nn.Module):
         param_b_i = torch.unsqueeze(
             torch.unsqueeze(
                 torch.tensor(
-                    [1 + detuning.efn_x_dims_n * i for i in range(efns_n)]), dim=0), dim=0)
+                    [1 + detuning.efn_dims_n * i for i in range(1)]), dim=0), dim=0)
         zx_ic_i = torch.unsqueeze(
             torch.unsqueeze(
                 torch.tensor(
@@ -62,19 +55,21 @@ class detuning(torch.nn.Module):
         x_dims_n = config['x_dims_n']
         u_dims_n = config['u_dims_n']
 
-        # --! declare internal neural networks
-        self.enc    = _encoder(x_dims_n + u_dims_n, z_dims_n)
-        self.dec    = _decoder(zx_dims_n, x_dims_n)
-        self.est_as = _estimator_pha(efns_n=efns_n, est_dims_n=detuning.a_params_n)
-        self.est_bs = _estimator_amp(efns_n=efns_n, est_dims_n=detuning.b_params_n)
+        # --! encoder/decoder pair
+        self.enc = _encoder(x_dims_n + u_dims_n, z_dims_n)
+        self.dec = _decoder(detuning.efn_dims_n, x_dims_n)
+
+        # --! parameter estimators
+        self.est_as = torch.nn.ModuleList([_estimator_pha(est_dims_n=detuning.a_params_n) for _ in range(efns_n)])
+        self.est_bs = torch.nn.ModuleList([_estimator_amp(est_dims_n=detuning.b_params_n) for _ in range(efns_n)])
 
         self.config = config
 
-        # --! fit statistics
-        self.w_fit = []
-        self.mu_fit = []
+        # --! statistics of fit
+        self.w_fit  = [[] for _ in range(efns_n)]
+        self.mu_fit = [[] for _ in range(efns_n)]
 
-    def fit(self, x, u, pretrain_autoencoder: bool = False, now: bool = False) -> torch.Tensor:
+    def fit(self, x, u, now: bool = False) -> torch.Tensor:
 
         # --!------------------------------------------------------------------
         # --! initialization
@@ -86,46 +81,52 @@ class detuning(torch.nn.Module):
         loss_w_params = self.config['loss_w_params']
         loss_w_phys   = self.config['loss_w_phys']
 
-        # --!------------------------------------------------------------------
-        # --! encoding/decoding of z latent space
-
         # --! according to physics equations, u is squared
         u = torch.square(u)
 
-        # --! encode/decompose x and u into z latent space
+        # --!------------------------------------------------------------------
+        # --! encoding/decoding of z latent space
+
+        # --! encode x and u into z latent space
         z = self.enc(torch.cat([x, u], dim=-1))
 
         efns_n    = self.config['modes_n']
-        zx_dims_n = efns_n * detuning.efn_x_dims_n
-        zu_dims_n = efns_n * detuning.efn_u_dims_n
+        zx_dims_n = efns_n * detuning.efn_dims_n
 
         # --! split z latent space into the states and actuations of latent oscillators
-        zx, zu = torch.split(z, [zx_dims_n, zu_dims_n], dim=-1)
+        zx, zu = torch.split(z, [zx_dims_n, detuning.zu_dims_n], dim=-1)
 
-        x_ae = self.dec(zx)
+        efns_sum = torch.cat([
+            zx[:, :,  ::2].sum(dim=-1, keepdim=True),
+            zx[:, :, 1::2].sum(dim=-1, keepdim=True)], dim=-1)
+
+        x_ae = self.dec(efns_sum)
 
         # --! fit the loss of encoding/decoding
         loss_ae = loss_w_ae * self._fit_autoencoder(x, x_ae)
-
-        # --! if the autoencoder is to be trained first, then exit here
-        if pretrain_autoencoder:
-            loss = loss_ae
-            return loss, loss_ae, 0., 0., 0.
 
         # --!------------------------------------------------------------------
         # --! predicting timeseries x in a linear manner
 
         # --! prediction starts from an initial condition (ic) of z latent space
-        zx_ic = torch.gather(zx, -1, self._zx_ic_i[:z.shape[0], :, :])
+        zx_ic = torch.gather(zx, -1, self._zx_ic_i[:zx.shape[0], :, :])
 
-        # --! based on state x of z latent space estimate matrices A and B
-        a = torch.unsqueeze(self.est_as(zx), 1)
-        b = torch.unsqueeze(self.est_bs(zx), 1)
+        efns    = torch.split(zx, detuning.efn_dims_n, dim=-1)
+        efns_ic = torch.split(zx_ic, detuning.efn_dims_n, dim=-1)
+        efns_a  = [torch.unsqueeze(est_a(efn), 1) for est_a, efn in zip(self.est_as, efns)]
+        efns_b  = [torch.unsqueeze(est_b(efn), 1) for est_b, efn in zip(self.est_bs, efns)]
 
-        # --! predict trajectories in z latent space up to prescribed horizon
+        # --! predict trajectories of eigenfunctions up to a prescribed horizon
         horizon = self.config['fit_horizon']
-        zx_pred = self._predict_z(zx_ic, zu, a, b, horizon)
-        x_pred  = self.dec(zx_pred)
+        zx_pred = torch.cat(
+            [self._predict_efn(
+                efn_ic, zu, efn_a, efn_b, horizon) for efn_ic, efn_a, efn_b in zip(efns_ic, efns_a, efns_b)], dim=-1)
+
+        zx_sum = torch.cat([
+            zx_pred[:, :,  ::2].sum(dim=-1, keepdim=True),
+            zx_pred[:, :, 1::2].sum(dim=-1, keepdim=True)], dim=-1)
+
+        x_pred = self.dec(zx_sum)
 
         # --! fit the losses of linearity and prediction
         loss_lin  = loss_w_lin * self._fit_linearity(zx, zx_pred)
@@ -134,24 +135,26 @@ class detuning(torch.nn.Module):
         # --!------------------------------------------------------------------
         # --! fit physics-informed loss
 
-        loss_phys = loss_w_phys * self._fit_physics(zx, zu, a, b, now)
-
-        #loss_params = loss_w_params * self._fit_params(a)
+        loss_phys = torch.sum(
+            torch.stack(
+                [loss_w_phys * self._fit_physics(efn, zu, efn_a, efn_b, now) for efn, efn_a, efn_b in zip(efns, efns_a, efns_b)]))
 
         # --!------------------------------------------------------------------
         # --! output
 
-        self.w_fit.append(a[0, 0, 1].item()) # item method is not differentiable
-        self.mu_fit.append(a[0, 0, 0].item())
+        for i in range (efns_n):
+            self.w_fit[i].append(efns_a[i][0, 0, 1].item()) # item method is not differentiable
+            self.mu_fit[i].append(efns_a[i][0, 0, 0].item())
 
         # --! test ~ test ~ test
         if now:
             with torch.no_grad():
 
-                print(a[0, 0, :])
-                print(b[0, 0, :])
+                for i in range(efns_n):
+                    print(efns_a[i][0, 0, :])
+                    print(efns_b[i][0, 0, :])
 
-                zx_dims_n = self.config['modes_n'] * detuning.efn_x_dims_n
+                zx_dims_n = self.config['modes_n'] * detuning.efn_dims_n
                 for i in range(zx_dims_n):
                     plt.figure()
                     plt.plot(zx[0, :, i], label=f'zx{i+1}')
@@ -246,24 +249,30 @@ class detuning(torch.nn.Module):
         z = self.enc(torch.cat([x, u], dim=-1))
 
         efns_n    = self.config['modes_n']
-        zx_dims_n = efns_n * detuning.efn_x_dims_n
-        zu_dims_n = efns_n * detuning.efn_u_dims_n
+        zx_dims_n = efns_n * detuning.efn_dims_n
 
         # --! split z latent space into oscillator states and actuation
-        zx, zu = torch.split(z, [zx_dims_n, zu_dims_n], dim=-1)
-
-        a = torch.unsqueeze(self.est_as(zx), 1)
-        b = torch.unsqueeze(self.est_bs(zx), 1)
-
+        zx, zu = torch.split(z, [zx_dims_n, detuning.zu_dims_n], dim=-1)
         zx_ic = torch.gather(zx, -1, self._zx_ic_i[:z.shape[0], :, :])
 
-        # --! 
-        zx_pred = self._predict_z(zx_ic, zu, a, b, horizon)
-        x_pred  = self.dec(zx_pred)
+        efns    = torch.split(zx, detuning.efn_dims_n, dim=-1)
+        efns_ic = torch.split(zx_ic, detuning.efn_dims_n, dim=-1)
+        efns_a  = [torch.unsqueeze(est_a(efn), 1) for est_a, efn in zip(self.est_as, efns)]
+        efns_b  = [torch.unsqueeze(est_b(efn), 1) for est_b, efn in zip(self.est_bs, efns)]
+
+        zx_pred = torch.cat(
+            [self._predict_efn(
+                efn_ic, zu, efn_a, efn_b, horizon) for efn_ic, efn_a, efn_b in zip(efns_ic, efns_a, efns_b)], dim=-1)
+
+        zx_sum = torch.cat([
+            zx_pred[:, :,  ::2].sum(dim=-1, keepdim=True),
+            zx_pred[:, :, 1::2].sum(dim=-1, keepdim=True)], dim=-1)
+
+        x_pred = self.dec(zx_sum)
 
         return x_pred
 
-    def _predict_z(self, z_ic, u, a, b, horizon):
+    def _predict_efn(self, z_ic, u, a, b, horizon):
 
         # --! construct matrices A raised to powers that cover the entire horizon
         mat_a = self._construct_mat_a_pow(a, horizon)
@@ -339,19 +348,16 @@ class detuning(torch.nn.Module):
 
     def _construct_mat_ab(self, param_b, mat_a):
 
-        efns_n     = self.config['modes_n']
-        zx_dims_n  = efns_n * detuning.efn_x_dims_n
-
         # --! scatter b matrix parameters in a zero-filled matrix
         #
-        # --! note that matrix B is constructed as transposed, i.e. shaped as [1, C_z],
-        # --! where C_z is the number of channels in a z latent space
+        # --! note that matrix B is constructed as transposed, i.e. shaped as [1, C_efn],
+        # --! where C_efn is the number of channels in an eigenfunction
         #
-        # --! so matrix B is shaped as [B, 1, C_z], where B is the number of batches
+        # --! so matrix B is shaped as [B, 1, C_efn], where B is the number of batches
         bch_n = param_b.shape[0]
         mat_b = torch.zeros(bch_n,
                             1,
-                            zx_dims_n,
+                            detuning.efn_dims_n,
                             dtype=param_b.dtype).scatter_(-1,
                                                           self._param_b_i[:bch_n, :, :],
                                                           param_b)
@@ -401,7 +407,7 @@ class detuning(torch.nn.Module):
 class _encoder(torch.nn.Module):
     def __init__(self, x_dims_n: int=2, z_dims_n: int=2):
         super().__init__()
-        self.net = utils.fcnn(features=[x_dims_n, 64, 64, z_dims_n], act_fn_hidden='relu')
+        self.net = utils.fcnn(features=[x_dims_n, 64, z_dims_n], act_fn_hidden='linear')
 
     def forward(self, x):
         return self.net(x)
@@ -410,7 +416,7 @@ class _encoder(torch.nn.Module):
 class _decoder(torch.nn.Module):
     def __init__(self, z_dims_n: int=2, x_dims_n: int=2):
         super().__init__()
-        self.net = utils.fcnn(features=[z_dims_n, 64, 64, x_dims_n], act_fn_hidden='relu')
+        self.net = utils.fcnn(features=[z_dims_n, 64, x_dims_n], act_fn_hidden='linear')
 
     def forward(self, z):
         return self.net(z)
@@ -424,40 +430,34 @@ class _estimator(torch.nn.Module, metaclass=interface):
     method defines the structure, or template, of an estimation algorithm, so
     that its subclasses must provide the details of this algorithm.
     """
-    def __init__(self, efns_n: int=1, efn_dims_n: int=2, est_dims_n: int=1):
+    def __init__(self, efn_dims_n: int=2, est_dims_n: int=1):
         super().__init__()
-        self.nets = torch.nn.ModuleList(
-            [utils.fcnn(features=[efn_dims_n, 32, 32, est_dims_n], act_fn_hidden='relu') for _ in range(efns_n)])
+        self.net = utils.fcnn(features=[efn_dims_n, 32, est_dims_n], act_fn_hidden='relu')
 
-    def forward(self, zx):
-        efns = torch.split(zx, detuning.efn_x_dims_n, dim=-1)
-
-        return torch.cat(
-            [torch.mean(
-                net(self._parameterize(efn)), dim=1) for net, efn in zip(self.nets, efns)], dim=-1)
+    def forward(self, efn):
+        time_dim = 1
+        return torch.mean(self.net(self._parameterize(efn)), dim=time_dim)
 
     @abstractmethod
-    def _parameterize(self, z):
+    def _parameterize(self, efn):
         """Parameterizes estimation algorithm. Subclasses must implement this abstract method."""
         raise NotImplementedError
 
 
 class _estimator_pha(_estimator):
-    def __init__(self, efns_n: int=1, est_dims_n: int=1):
-        super().__init__(efns_n=efns_n, efn_dims_n=1, est_dims_n=est_dims_n)
+    def __init__(self, est_dims_n: int=1):
+        super().__init__(efn_dims_n=1, est_dims_n=est_dims_n)
 
-    def _parameterize(self, z):
-        """Parameterizes estimation with the phase of ``z`` latent space."""
-        z1, z2 = torch.split(z, 1, dim=-1)
+    def _parameterize(self, efn):
+        z1, z2 = torch.split(efn, 1, dim=-1)
         return torch.atan2(z1, z2)
 
 
 class _estimator_amp(_estimator):
-    def __init__(self, efns_n: int=1, est_dims_n: int=1):
-        super().__init__(efns_n=efns_n, efn_dims_n=1, est_dims_n=est_dims_n)
+    def __init__(self, est_dims_n: int=1):
+        super().__init__(efn_dims_n=1, est_dims_n=est_dims_n)
 
-    def _parameterize(self, z):
-        """Parameterizes estimation with the amplitude of ``z`` latent space."""
-        z1, z2 = torch.split(z, 1, dim=-1)
+    def _parameterize(self, efn):
+        z1, z2 = torch.split(efn, 1, dim=-1)
         return torch.square(z1) + torch.square(z2)
 
