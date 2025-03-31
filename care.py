@@ -37,10 +37,7 @@ class detuning(torch.nn.Module):
         # --! for b parameter - this will be every second column in a 1x2 B matrix (transposed!!)
         #
         # --! for the initial conditions of z oscillator space - these are all first values of z oscillator dimensions
-        param_b_i = torch.unsqueeze(
-            torch.unsqueeze(
-                torch.tensor(
-                    [1 + detuning.efn_dims_n * i for i in range(1)]), dim=0), dim=0)
+        param_b_i = torch.unsqueeze(torch.unsqueeze(torch.tensor([1]), dim=0), dim=0)
         zx_ic_i = torch.unsqueeze(
             torch.unsqueeze(
                 torch.tensor(
@@ -78,11 +75,7 @@ class detuning(torch.nn.Module):
         loss_w_ae     = self.config['loss_w_ae']
         loss_w_lin    = self.config['loss_w_lin']
         loss_w_pred   = self.config['loss_w_pred']
-        loss_w_params = self.config['loss_w_params']
         loss_w_phys   = self.config['loss_w_phys']
-
-        # --! according to physics equations, u is squared
-        u = torch.square(u)
 
         # --!------------------------------------------------------------------
         # --! encoding/decoding of z latent space
@@ -120,7 +113,9 @@ class detuning(torch.nn.Module):
         horizon = self.config['fit_horizon']
         zx_pred = torch.cat(
             [self._predict_efn(
-                efn_ic, zu, efn_a, efn_b, horizon) for efn_ic, efn_a, efn_b in zip(efns_ic, efns_a, efns_b)], dim=-1)
+                efn_ic, efn_a, efn_b,
+                zu,
+                horizon) for efn_ic, efn_a, efn_b in zip(efns_ic, efns_a, efns_b)], dim=-1)
 
         zx_sum = torch.cat([
             zx_pred[:, :,  ::2].sum(dim=-1, keepdim=True),
@@ -129,15 +124,18 @@ class detuning(torch.nn.Module):
         x_pred = self.dec(zx_sum)
 
         # --! fit the losses of linearity and prediction
-        loss_lin  = loss_w_lin * self._fit_linearity(zx, zx_pred)
-        loss_pred = loss_w_pred * self._fit_prediction(x, x_pred)
+        loss_lin  = loss_w_lin * self._fit_linearity(zx, zx_pred, horizon)
+        loss_pred = loss_w_pred * self._fit_prediction(x, x_pred, horizon)
 
         # --!------------------------------------------------------------------
         # --! fit physics-informed loss
 
         loss_phys = torch.sum(
             torch.stack(
-                [loss_w_phys * self._fit_physics(efn, zu, efn_a, efn_b, now) for efn, efn_a, efn_b in zip(efns, efns_a, efns_b)]))
+                [loss_w_phys * self._fit_physics(
+                    efn, efn_a, efn_b,
+                    zu,
+                    now) for efn, efn_a, efn_b in zip(efns, efns_a, efns_b)]))
 
         # --!------------------------------------------------------------------
         # --! output
@@ -171,7 +169,7 @@ class detuning(torch.nn.Module):
                     plt.show()
 
         # --! sum losses together and return the sum
-        loss = loss_ae + loss_lin + loss_pred + loss_phys# + loss_params#
+        loss = loss_ae + loss_lin + loss_pred + loss_phys
         return loss, loss_ae, loss_lin, loss_pred, loss_phys        
 
     def _fit_autoencoder(self, x, x_ae):
@@ -179,29 +177,17 @@ class detuning(torch.nn.Module):
         loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(x_ae, x)
 
-    def _fit_linearity(self, z, z_pred):
+    def _fit_linearity(self, z, z_pred, horizon):
 
-        horizon = self.config['fit_horizon']
         loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(z_pred, z[:, :horizon, :])
 
-    def _fit_prediction(self, x, x_pred):
+    def _fit_prediction(self, x, x_pred, horizon):
 
-        horizon = self.config['fit_horizon']
         loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(x_pred, x[:, :horizon, :])
 
-    def _fit_params(self, params):
-        q, w, k = torch.split(params, 1, dim=-1)
-
-        loss_fn = torch.nn.ReLU()
-        omega_lo = loss_fn(2*torch.pi*10 - w)
-        omega_hi = loss_fn(w - 2*torch.pi*50)
-        omega_range = omega_lo + omega_hi
-
-        return omega_range.sum()
-
-    def _fit_physics(self, z, u, a, b, now):
+    def _fit_physics(self, z, a, b, u, now):
 
         t_dim = 1
         dt    = self.config['timestep']
@@ -243,9 +229,6 @@ class detuning(torch.nn.Module):
 
     def predict(self, x, u, horizon):
 
-        # --! actuation u must be squared
-        u = torch.square(u)
-
         z = self.enc(torch.cat([x, u], dim=-1))
 
         efns_n    = self.config['modes_n']
@@ -262,7 +245,9 @@ class detuning(torch.nn.Module):
 
         zx_pred = torch.cat(
             [self._predict_efn(
-                efn_ic, zu, efn_a, efn_b, horizon) for efn_ic, efn_a, efn_b in zip(efns_ic, efns_a, efns_b)], dim=-1)
+                efn_ic, efn_a, efn_b,
+                zu,
+                horizon) for efn_ic, efn_a, efn_b in zip(efns_ic, efns_a, efns_b)], dim=-1)
 
         zx_sum = torch.cat([
             zx_pred[:, :,  ::2].sum(dim=-1, keepdim=True),
@@ -272,7 +257,7 @@ class detuning(torch.nn.Module):
 
         return x_pred
 
-    def _predict_efn(self, z_ic, u, a, b, horizon):
+    def _predict_efn(self, z_ic, a, b, u, horizon):
 
         # --! construct matrices A raised to powers that cover the entire horizon
         mat_a = self._construct_mat_a_pow(a, horizon)
