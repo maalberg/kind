@@ -26,7 +26,7 @@ class detuning(torch.nn.Module):
         super().__init__()
 
         # --! dynamic modes determine the number of eigenfunctions
-        efns_n = config['modes_n']
+        efns_n = len(config['fit_horizon'])
 
         # --! eigenfunctions compose z latent space, so compute the number of z dimensions
         zx_dims_n = efns_n * detuning.efn_dims_n
@@ -83,7 +83,7 @@ class detuning(torch.nn.Module):
         # --! encode x and u into z latent space
         z = self.enc(torch.cat([x, u], dim=-1))
 
-        efns_n    = self.config['modes_n']
+        efns_n    = len(self.config['fit_horizon'])
         zx_dims_n = efns_n * detuning.efn_dims_n
 
         # --! split z latent space into the states and actuations of latent oscillators
@@ -110,22 +110,27 @@ class detuning(torch.nn.Module):
         efns_b  = [torch.unsqueeze(est_b(efn), 1) for est_b, efn in zip(self.est_bs, efns)]
 
         # --! predict trajectories of eigenfunctions up to a prescribed horizon
-        horizon = self.config['fit_horizon']
-        zx_pred = torch.cat(
-            [self._predict_efn(
-                efn_ic, efn_a, efn_b,
-                zu,
-                horizon) for efn_ic, efn_a, efn_b in zip(efns_ic, efns_a, efns_b)], dim=-1)
+        horizons = self.config['fit_horizon']
+        efns_pred = [self._predict_efn(
+            efn_ic, efn_a, efn_b,
+            zu,
+            horizon) for efn_ic, efn_a, efn_b, horizon in zip(efns_ic, efns_a, efns_b, horizons)]
 
-        zx_sum = torch.cat([
-            zx_pred[:, :,  ::2].sum(dim=-1, keepdim=True),
-            zx_pred[:, :, 1::2].sum(dim=-1, keepdim=True)], dim=-1)
+        loss_lin = torch.sum(
+            torch.stack(
+                [loss_w_lin * self._fit_linearity(
+                    efn, efn_pred, horizon) for efn, efn_pred, horizon in zip(efns, efns_pred, horizons)]))
 
-        x_pred = self.dec(zx_sum)
+        xs_pred = [self.dec(efn_pred) for efn_pred in efns_pred]
 
-        # --! fit the losses of linearity and prediction
-        loss_lin  = loss_w_lin * self._fit_linearity(zx, zx_pred, horizon)
-        loss_pred = loss_w_pred * self._fit_prediction(x, x_pred, horizon)
+        horizon_min = torch.min(torch.tensor(self.config['fit_horizon']))
+        x_pred = torch.cat([x_pred[:, :horizon_min, :] for x_pred in xs_pred], dim=-1)
+
+        x_pred = torch.cat([
+            x_pred[:, :,  ::2].sum(dim=-1, keepdim=True),
+            x_pred[:, :, 1::2].sum(dim=-1, keepdim=True)], dim=-1)
+
+        loss_pred = loss_w_pred * self._fit_prediction(x, x_pred, horizon_min)
 
         # --!------------------------------------------------------------------
         # --! fit physics-informed loss
@@ -152,13 +157,13 @@ class detuning(torch.nn.Module):
                     print(efns_a[i][0, 0, :])
                     print(efns_b[i][0, 0, :])
 
-                zx_dims_n = self.config['modes_n'] * detuning.efn_dims_n
-                for i in range(zx_dims_n):
-                    plt.figure()
-                    plt.plot(zx[0, :, i], label=f'zx{i+1}')
-                    plt.plot(zx_pred[0, :, i], label=f'zx{i+1}_pred', linestyle='dashed')
-                    plt.legend()
-                    plt.show()
+                for efn, efn_pred in zip(efns, efns_pred):
+                    for i in range(detuning.efn_dims_n):
+                        plt.figure()
+                        plt.plot(efn[0, :, i], label=f'zx{i+1}')
+                        plt.plot(efn_pred[0, :, i], label=f'zx{i+1}_pred', linestyle='dashed')
+                        plt.legend()
+                        plt.show()
 
                 x_dims_n = self.config['x_dims_n']
                 for i in range(x_dims_n):
@@ -231,7 +236,7 @@ class detuning(torch.nn.Module):
 
         z = self.enc(torch.cat([x, u], dim=-1))
 
-        efns_n    = self.config['modes_n']
+        efns_n    = len(self.config['fit_horizon'])
         zx_dims_n = efns_n * detuning.efn_dims_n
 
         # --! split z latent space into oscillator states and actuation
@@ -243,17 +248,17 @@ class detuning(torch.nn.Module):
         efns_a  = [torch.unsqueeze(est_a(efn), 1) for est_a, efn in zip(self.est_as, efns)]
         efns_b  = [torch.unsqueeze(est_b(efn), 1) for est_b, efn in zip(self.est_bs, efns)]
 
-        zx_pred = torch.cat(
-            [self._predict_efn(
-                efn_ic, efn_a, efn_b,
-                zu,
-                horizon) for efn_ic, efn_a, efn_b in zip(efns_ic, efns_a, efns_b)], dim=-1)
+        # --! predict trajectories of eigenfunctions up to a prescribed horizon
+        efns_pred = [self._predict_efn(
+            efn_ic, efn_a, efn_b,
+            zu,
+            horizon) for efn_ic, efn_a, efn_b in zip(efns_ic, efns_a, efns_b)]
 
-        zx_sum = torch.cat([
-            zx_pred[:, :,  ::2].sum(dim=-1, keepdim=True),
-            zx_pred[:, :, 1::2].sum(dim=-1, keepdim=True)], dim=-1)
+        x_pred = torch.cat([self.dec(efn_pred) for efn_pred in efns_pred], dim=-1)
 
-        x_pred = self.dec(zx_sum)
+        x_pred = torch.cat([
+            x_pred[:, :,  ::2].sum(dim=-1, keepdim=True),
+            x_pred[:, :, 1::2].sum(dim=-1, keepdim=True)], dim=-1)
 
         return x_pred
 
