@@ -451,3 +451,149 @@ class _estimator_amp(_estimator):
         z1, z2 = torch.split(efn, 1, dim=-1)
         return torch.square(z1) + torch.square(z2)
 
+
+class detune(torch.nn.Module):
+    sin_params_n = 2 # amplitude and angular frequency
+    cos_params_n = 2
+    exp_params_n = 1 # power
+
+    # --! number of nonlinear measurement functions
+    meas_funs_n  = 3
+
+    # --! size of dynamic kernels encoded by an encoder from timeseries data
+    #
+    # --! Timeseries are partioned into slices that are encoded by an encoder to
+    # --! produce, so to say, dynamic kernels, or filters. These kernels
+    # --! help extract specific features from the raw timeseries.
+    # --! In constrast to static kernels in convolutional
+    # --! neural networks, the kernels here are dynamic,
+    # --! because they are produced from the timeseries every time.
+    enc_kern_sz = 10
+
+    def __init__(self):
+        super().__init__()
+
+        # --! test
+        timeseries_dims_n = 1 # displacement
+        timeseries_sz     = 100
+
+        self.feats_n      = timeseries_dims_n
+
+        # --! as the input to an encoder we provide flattened timeseries sliced according to kernel sizes
+        enc_inps_n = detune.enc_kern_sz * timeseries_dims_n
+
+        # --! 
+        enc_outs_n = (detune.sin_params_n + detune.cos_params_n + detune.exp_params_n) * detune.enc_kern_sz * timeseries_dims_n
+
+        # --! 
+        dec_inps_n = detune.meas_funs_n * timeseries_dims_n
+        dec_outs_n = detune.enc_kern_sz * timeseries_dims_n
+
+        self.enc = utils.fcnn(features=[enc_inps_n, 64, 64, enc_outs_n], act_fn_hidden='relu')
+        self.dec = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
+
+    def forward(self, timeseries):
+
+        timesteps_dim = 1
+        timesteps_n   = timeseries.shape[timesteps_dim]
+
+        if timesteps_n % detune.enc_kern_sz:
+            print('err > the size of input timeseries is not a multiple of kernel size')
+            return
+
+        # --! reshape input timeseries to work with dynamic kernels
+        #
+        # --! the length of timeseries is reshaped to extract the kernels
+        # --! into the prelast dimension, i.e.
+        # --! [B, T, C] -> [B, T / kern_sz, T_kern, C], where
+        # --! B, T and C are the number of batch elements,
+        # --! timesteps and data channels, respectively.
+        inps = timeseries.reshape(timeseries.shape[0], -1, detune.enc_kern_sz, self.feats_n) # -1 infers the size of a dimension
+        inps = inps.reshape(timeseries.shape[0], -1, detune.enc_kern_sz * self.feats_n)
+
+        # --! split input timeseries into kernel-ready chunks
+        inps = torch.split(inps, 1, dim=timesteps_dim)
+
+        timeseries_recon = torch.cat([self._forward_iter(i) for i in inps], dim=2)
+
+        # --! timeseries are reconstructed as rows, so its shape is [B, C, T],
+        # --! but the input timeseries are shaped as columns,
+        # --! so reshape the reconstructed ones
+        return timeseries_recon.reshape(timeseries_recon.shape[0], -1, self.feats_n)
+
+    def _forward_iter(self, inps):
+
+        # --! encode kernels
+        enc_kerns = self.enc(inps)
+
+        # --! reshape encoded kernels to format their multiplication with inputs, e.g.
+        # --!
+        # --! kernels: [B, T / kern_sz, fun_params_n * kern_sz * C] ->
+        # --! [B, T / kern_sz, fun_params_n, kern_sz, C]
+        # --!
+        # --! inputs: [B, T / kern_sz, kern_sz * C] ->
+        # --! [B, T / kern_sz, kern_sz, C]
+        enc_kerns = enc_kerns.reshape(
+            inps.shape[0], inps.shape[1],
+            detune.sin_params_n + detune.cos_params_n + detune.exp_params_n,
+            detune.enc_kern_sz * self.feats_n)
+        enc_kerns = enc_kerns.reshape(
+            inps.shape[0], inps.shape[1],
+            detune.sin_params_n + detune.cos_params_n + detune.exp_params_n,
+            detune.enc_kern_sz, self.feats_n)
+        inps = inps.reshape(inps.shape[0], inps.shape[1], detune.enc_kern_sz, self.feats_n)
+
+        # --! with the help of kernels extract function parameters from input timeseries
+        fun_params = torch.einsum("blkdf, bldf -> blfk", enc_kerns, inps)
+
+        # --! split the parameters of different measurement functions
+        sin_params, cos_params, exp_params = torch.split(
+            fun_params,
+            [
+                detune.sin_params_n, detune.cos_params_n,
+                detune.exp_params_n],
+            dim=-1)
+
+        # --! measure nonlinear functions at the current slice of timeseries
+        #
+        # --! note that there is one single measurement of each function to describe
+        # --! a slice, so the granularity of slicing can play a role
+        funs = torch.cat([
+            self._meas_sin(sin_params),
+            self._meas_cos(cos_params),
+            self._meas_exp(exp_params)], dim=-1)
+
+        # --! reshape dimensions to go from a shape [B, 1, C, funs_n]
+        # --! to [B, 1, C * func_n]
+        #
+        # --! note that 1 denotes the currently iterated slice
+        funs = funs.reshape(funs.shape[0], funs.shape[1], -1)
+
+        # --! decode nonlinear function measurements back to timeseries
+        inps_recon = self.dec(funs)
+
+        return inps_recon
+
+    def fit(self, timeseries):
+
+        timeseries_recon = self.forward(timeseries)
+
+        return self._fit_autoencoder(timeseries, timeseries_recon)
+
+    def _meas_sin(self, params):
+        amp, freq = torch.split(params, 1, dim=-1)
+        return amp * torch.sin(freq)
+
+    def _meas_cos(self, params):
+        amp, freq = torch.split(params, 1, dim=-1)
+        return amp * torch.cos(freq)
+
+    def _meas_exp(self, params):
+        power = params
+        return torch.exp(power)
+
+    def _fit_autoencoder(self, timeseries, timeseries_recon):
+
+        loss_fn = torch.nn.MSELoss(reduction='mean')
+        return loss_fn(timeseries_recon, timeseries)
+
