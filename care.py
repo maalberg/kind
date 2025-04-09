@@ -468,7 +468,7 @@ class detune(torch.nn.Module):
     # --! In constrast to static kernels in convolutional
     # --! neural networks, the kernels here are dynamic,
     # --! because they are produced from the timeseries every time.
-    enc_kern_sz = 10
+    enc_kern_sz = 5
 
     def __init__(self):
         super().__init__()
@@ -498,7 +498,7 @@ class detune(torch.nn.Module):
         timesteps_n   = timeseries.shape[timesteps_dim]
 
         if timesteps_n % detune.enc_kern_sz:
-            print('err > the size of input timeseries is not a multiple of kernel size')
+            print('err >> the size of input timeseries is not a multiple of kernel size')
             return
 
         # --! reshape input timeseries to work with dynamic kernels
@@ -514,12 +514,8 @@ class detune(torch.nn.Module):
         # --! split input timeseries into kernel-ready chunks
         inps = torch.split(inps, 1, dim=timesteps_dim)
 
-        timeseries_recon = torch.cat([self._forward_iter(i) for i in inps], dim=2)
-
-        # --! timeseries are reconstructed as rows, so its shape is [B, C, T],
-        # --! but the input timeseries are shaped as columns,
-        # --! so reshape the reconstructed ones
-        return timeseries_recon.reshape(timeseries_recon.shape[0], -1, self.feats_n)
+        # --! return a list of tuples containing function parameters, function values, etc.
+        return [self._forward_iter(i) for i in inps]
 
     def _forward_iter(self, inps):
 
@@ -572,11 +568,20 @@ class detune(torch.nn.Module):
         # --! decode nonlinear function measurements back to timeseries
         inps_recon = self.dec(funs)
 
-        return inps_recon
+        return fun_params, funs, inps_recon
 
     def fit(self, timeseries):
 
-        timeseries_recon = self.forward(timeseries)
+        # --! forward input timeseries through the main algorithm and get outputs
+        outs = self.forward(timeseries)
+
+        # --! extract reconstructed timeseries from an output list of tuples
+        timeseries_recon = torch.cat([o[2] for o in outs], dim=-1)
+
+        # --! timeseries are reconstructed as rows, so its shape is [B, C, T],
+        # --! but the input timeseries are shaped as columns,
+        # --! so reshape the reconstructed ones
+        timeseries_recon = timeseries_recon.reshape(timeseries_recon.shape[0], -1, self.feats_n)
 
         return self._fit_autoencoder(timeseries, timeseries_recon)
 
