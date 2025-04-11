@@ -468,7 +468,7 @@ class detune(torch.nn.Module):
     # --! In constrast to static kernels in convolutional
     # --! neural networks, the kernels here are dynamic,
     # --! because they are produced from the timeseries every time.
-    enc_kern_sz = 5
+    enc_kern_sz = 10
 
     def __init__(self):
         super().__init__()
@@ -492,6 +492,10 @@ class detune(torch.nn.Module):
         self.enc = utils.fcnn(features=[enc_inps_n, 64, 64, enc_outs_n], act_fn_hidden='relu')
         self.dec = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
 
+        a = torch.nn.TransformerEncoderLayer(d_model=detune.meas_funs_n, nhead=1, dim_feedforward=128, batch_first=True)
+        self.a = torch.nn.TransformerEncoder(a, num_layers=3)
+        self.b = torch.nn.MultiheadAttention(embed_dim=detune.meas_funs_n, num_heads=1, batch_first=True)
+
     def forward(self, timeseries):
 
         timesteps_dim = 1
@@ -511,13 +515,20 @@ class detune(torch.nn.Module):
         inps = timeseries.reshape(timeseries.shape[0], -1, detune.enc_kern_sz, self.feats_n) # -1 infers the size of a dimension
         inps = inps.reshape(timeseries.shape[0], -1, detune.enc_kern_sz * self.feats_n)
 
-        # --! split input timeseries into kernel-ready chunks
-        inps = torch.split(inps, 1, dim=timesteps_dim)
+        # --! compute nonlinear function embeddings for all chunks
+        #
+        # --! the output embeddings are shaped as [B, T / kern_sz, funs_n]
+        funs = self._embed_functions(inps)
 
-        # --! return a list of tuples containing function parameters, function values, etc.
-        return [self._forward_iter(i) for i in inps]
+        # --! reconstruct function embeddings back to timeseries
+        timeseries_recon = self.dec(funs)
 
-    def _forward_iter(self, inps):
+        # --! since timeseries are reconstructed as rows their shape is [B, C, T],
+        # --! but the input timeseries are shaped as columns,
+        # --! so reshape the reconstructed ones
+        return timeseries_recon.reshape(timeseries_recon.shape[0], -1, self.feats_n)
+
+    def _embed_functions(self, inps):
 
         # --! encode kernels
         enc_kerns = self.enc(inps)
@@ -550,10 +561,10 @@ class detune(torch.nn.Module):
                 detune.exp_params_n],
             dim=-1)
 
-        # --! measure nonlinear functions at the current slice of timeseries
+        # --! measure nonlinear functions, or so-called embeddings, at the current slice of timeseries
         #
         # --! note that there is one single measurement of each function to describe
-        # --! a slice, so the granularity of slicing can play a role
+        # --! a slice, so the granularity of the slicing may play a role
         funs = torch.cat([
             self._meas_sin(sin_params),
             self._meas_cos(cos_params),
@@ -563,25 +574,12 @@ class detune(torch.nn.Module):
         # --! to [B, 1, C * func_n]
         #
         # --! note that 1 denotes the currently iterated slice
-        funs = funs.reshape(funs.shape[0], funs.shape[1], -1)
-
-        # --! decode nonlinear function measurements back to timeseries
-        inps_recon = self.dec(funs)
-
-        return fun_params, funs, inps_recon
+        return funs.reshape(funs.shape[0], funs.shape[1], -1)
 
     def fit(self, timeseries):
 
-        # --! forward input timeseries through the main algorithm and get outputs
-        outs = self.forward(timeseries)
-
-        # --! extract reconstructed timeseries from an output list of tuples
-        timeseries_recon = torch.cat([o[2] for o in outs], dim=-1)
-
-        # --! timeseries are reconstructed as rows, so its shape is [B, C, T],
-        # --! but the input timeseries are shaped as columns,
-        # --! so reshape the reconstructed ones
-        timeseries_recon = timeseries_recon.reshape(timeseries_recon.shape[0], -1, self.feats_n)
+        # --! forward input timeseries to the main algorithm
+        timeseries_recon = self.forward(timeseries)
 
         return self._fit_autoencoder(timeseries, timeseries_recon)
 
