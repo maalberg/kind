@@ -533,6 +533,19 @@ class detune(torch.nn.Module):
         self.cos_freq = []
         self.exp_power = []
 
+    def fit(self, timeseries):
+
+        # --! forward input timeseries to the main algorithm to get fit results
+        funs, funs_pred, timeseries_recon, timeseries_pred = self.forward(timeseries)
+
+        loss_ae   = self._fit_autoencoder(timeseries, timeseries_recon)
+        loss_pred = self._fit_prediction(timeseries, timeseries_pred)
+        loss_lin  = 1e-1 * self._fit_linearity(funs, funs_pred)
+
+        loss = loss_ae + loss_pred + loss_lin
+
+        return loss, loss_ae, loss_pred, loss_lin
+
     def forward(self, timeseries):
 
         timesteps_dim = 1
@@ -572,7 +585,7 @@ class detune(torch.nn.Module):
         timeseries_recon = timeseries_recon.reshape(timeseries_recon.shape[0], -1, self.feats_n)
         timeseries_pred  = timeseries_pred.reshape(timeseries_recon.shape[0], -1, self.feats_n)
 
-        return timeseries_recon, timeseries_pred
+        return funs, funs_pred, timeseries_recon, timeseries_pred
 
     def _embed_functions(self, inps):
 
@@ -682,18 +695,6 @@ class detune(torch.nn.Module):
 
         return torch.cat([funs_ic, funs_pred], dim=1)
 
-    def fit(self, timeseries):
-
-        # --! forward input timeseries to the main algorithm
-        timeseries_recon, timeseries_pred = self.forward(timeseries)
-
-        loss_ae = self._fit_autoencoder(timeseries, timeseries_recon)
-        loss_pred = self._fit_prediction(timeseries, timeseries_pred)
-
-        loss = loss_ae + loss_pred
-
-        return loss, loss_ae, loss_pred
-
     def _meas_sin(self, params):
         amp, freq = torch.split(params, 1, dim=-1)
         return amp * torch.sin(self.timestep * freq)
@@ -715,4 +716,9 @@ class detune(torch.nn.Module):
 
         loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(timeseries_pred, timeseries)
+
+    def _fit_linearity(self, funs, funs_pred):
+
+        loss_fn = torch.nn.MSELoss(reduction='mean')
+        return loss_fn(funs_pred, funs)
 
