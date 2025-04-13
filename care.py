@@ -633,18 +633,41 @@ class detune(torch.nn.Module):
         # --! the query, key and value of an extra attention module
         #
         # --! this produces a square matrix [funs_n, funs_n] that can be
-        # --! used for prediction
+        # --! used for prediction as a system matrix A
         _, funs_dyn_mat = self.funs_dyn(funs_dyn, funs_dyn, funs_dyn)
 
-        # --! take the first slice as an initial condition
-        fun_pred = funs[:, :1]
-        funs_pred = []
-        for i in range(funs.shape[1] - 1):
-            fun_pred = torch.einsum("bnl, blh -> bnh", fun_pred, funs_dyn_mat)
-            funs_pred.append(fun_pred)
-        funs_pred = torch.cat(funs_pred, dim=1)
-        funs_pred = torch.cat([funs[:, :1], funs_pred], dim=1)
-        return funs_pred
+        # --! we take the number of timeseries slices as a prediction horizon
+        horizon = funs.shape[1]
+
+        # --! raise attention matrices to powers covering all prediction horizon
+        #
+        # --! powered matrices are shaped as [B, H - 1, funs_n, funs_n], where H is the number of horizon steps
+        # --! and -1 is because we do not predict the first time step
+        #
+        # --! note that dynamics matrices are also transposed to allow multiplication with functions
+        # --! shaped as rows, i.e. [1, funs_n]
+        funs_dyn_mat = torch.stack([
+            torch.transpose(
+                torch.linalg.matrix_power(funs_dyn_mat, i), -2, -1) for i in range(1, horizon)], dim=1)
+
+        # --! extract the initial conditions of function time (per slice) trajectories
+        #
+        # --! the initial conditions (ic) are shaped as [B, 1, 1, funs_n] to allow tensor broadcasting
+        # --! when multiplying by dynamics matrices
+        funs_ic = torch.unsqueeze(funs[:, :1], -2)
+
+        # --! predict the time (per slice) evolution of functions by multiplying the initial conditions of
+        # --! their trajectories by powered dynamics matrices
+        #
+        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, funs_n], i.e.
+        # --! batches with functions trajectories consisting of inidividual function-points [1, funs_n]
+        funs_pred = torch.matmul(funs_ic, funs_dyn_mat)
+
+        # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
+        funs_pred = torch.squeeze(funs_pred, -2)
+        funs_ic   = torch.squeeze(funs_ic, -2)
+
+        return torch.cat([funs_ic, funs_pred], dim=1)
 
     def fit(self, timeseries):
 
