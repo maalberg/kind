@@ -471,16 +471,17 @@ class detune(torch.nn.Module):
     # --! static kernels in convolutional neural networks,
     # --! the kernels here are dynamic, because they
     # --! are produced from the timeseries every time.
-    fun_params_kern_sz = 10
+    fun_params_kern_sz = 51
 
     def __init__(self):
         super().__init__()
 
         # --! test
         timeseries_dims_n = 1 # displacement
-        timeseries_sz     = 100
+        timeseries_sz     = 102
 
         self.feats_n      = timeseries_dims_n
+        self.timestep     = 0.001
 
         # --! as the input to an encoder we provide flattened timeseries sliced according to filter sizes
         fun_params_enc_inps_n = detune.fun_params_kern_sz * timeseries_dims_n
@@ -526,6 +527,11 @@ class detune(torch.nn.Module):
 
         # --! 
         self.dec = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
+
+        # --! training statictics
+        self.sin_freq = []
+        self.cos_freq = []
+        self.exp_power = []
 
     def forward(self, timeseries):
 
@@ -600,6 +606,13 @@ class detune(torch.nn.Module):
                 detune.sin_params_n, detune.cos_params_n,
                 detune.exp_params_n],
             dim=-1)
+
+        with torch.no_grad():
+            _, sin_freq = torch.split(sin_params, 1, dim=-1)
+            self.sin_freq.append(torch.mean(sin_freq))
+            _, cos_freq = torch.split(cos_params, 1, dim=-1)
+            self.cos_freq.append(torch.mean(cos_freq))
+            self.exp_power.append(torch.mean(exp_params))
 
         # --! measure nonlinear functions, or so-called embeddings, at the current slice of timeseries
         #
@@ -683,15 +696,15 @@ class detune(torch.nn.Module):
 
     def _meas_sin(self, params):
         amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.sin(freq)
+        return amp * torch.sin(self.timestep * freq)
 
     def _meas_cos(self, params):
         amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.cos(freq)
+        return amp * torch.cos(self.timestep * freq)
 
     def _meas_exp(self, params):
         power = params
-        return torch.exp(power)
+        return torch.exp(self.timestep * power)
 
     def _fit_autoencoder(self, timeseries, timeseries_recon):
 
