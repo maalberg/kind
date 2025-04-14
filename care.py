@@ -495,7 +495,8 @@ class detune(torch.nn.Module):
             features=[fun_params_enc_inps_n, 64, 64, fun_params_enc_outs_n],
             act_fn_hidden='relu')
 
-        # --! number of inputs (features) for a function dynamics encoder
+        # --! number of inputs (features) for an adaptive function dynamics encoder,
+        # --! which acts locally on a slice level
         #
         # --! as features this encoder gets timeseries slices, so the idea is to pass
         # --! an n-dimensional trace of function embeddings to the encoder
@@ -504,8 +505,8 @@ class detune(torch.nn.Module):
         # --! which is what the class constructor expects - an int
         funs_dyn_enc_inps_n = timeseries_sz // detune.fun_params_kern_sz
 
-        # --! a transformer is responsible for deriving the dynamics of timeseries that
-        # --! are local to slices
+        # --! a transformer is responsible for adaptively deriving the dynamics of timeseries
+        # --! that are local to slices
         #
         # --! the transformer attends over nonlinear function embeddings
         self.funs_dyn_enc = torch.nn.TransformerEncoder(
@@ -518,8 +519,17 @@ class detune(torch.nn.Module):
             enable_nested_tensor=False)
 
         # --! this is a self-attention module that is supposed to produce a square matrix
-        # --! that describes evolution of function values
+        # --! that describes the evolution of local function values
         self.funs_dyn = torch.nn.MultiheadAttention(embed_dim=funs_dyn_enc_inps_n, num_heads=1, batch_first=True)
+
+        # --! a learnable matrix which is supposed to determine global dynamics that
+        # --! are shared across slices
+        #
+        # --! these dynamics are not adaptable - once they are trained, they are fixed,
+        # --! so ideally they should capture the general behavior of a system
+        timeseries_dyn_inps_n = detune.funs_n * timeseries_dims_n
+        timeseries_dyn_outs_n = detune.funs_n * timeseries_dims_n
+        self.timeseries_dyn = torch.nn.Linear(timeseries_dyn_inps_n, timeseries_dyn_outs_n, bias=False)
 
         # --! 
         dec_inps_n = detune.funs_n * timeseries_dims_n
@@ -665,7 +675,36 @@ class detune(torch.nn.Module):
         # --! we take the number of timeseries slices as a prediction horizon
         horizon = funs.shape[1]
 
-        # --! raise attention matrices to powers covering all prediction horizon
+        # --! extract the initial conditions of function time (per slice) trajectories
+        #
+        # --! the initial conditions (ic) are shaped as [B, 1, 1, funs_n] to allow tensor broadcasting
+        # --! when multiplying by dynamics matrices
+        funs_ic = torch.unsqueeze(funs[:, :1], -2)
+
+        # --! extract a matrix for global dynamics
+        #
+        # --! the matrix is unsqueezed to a shape [1, funs_n, funs_n] to allow
+        # --! broadcasting when multiplying with functions
+        timeseries_dyn_mat = torch.unsqueeze(self.timeseries_dyn.weight, 0)
+
+        # --! raise local attention matrices to powers covering all prediction horizon
+        #
+        # --! powered matrices are shaped as [B, H - 1, funs_n, funs_n], where H is the number of horizon steps
+        # --! and -1 is because we do not predict the first time step
+        #
+        # --! note that dynamics matrices are also transposed to allow multiplication with functions
+        timeseries_dyn_mat = torch.stack([
+            torch.transpose(
+                torch.linalg.matrix_power(timeseries_dyn_mat, i), -2, -1) for i in range(1, horizon)], dim=1)
+
+        # --! predict the global (per timeseries) evolution of functions by multiplying the initial conditions of
+        # --! their trajectories by powered dynamics matrices
+        #
+        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, funs_n], i.e.
+        # --! batches with functions trajectories consisting of inidividual function-points [1, funs_n]
+        funs_pred_global = torch.matmul(funs_ic, timeseries_dyn_mat)
+
+        # --! raise local attention matrices to powers covering all prediction horizon
         #
         # --! powered matrices are shaped as [B, H - 1, funs_n, funs_n], where H is the number of horizon steps
         # --! and -1 is because we do not predict the first time step
@@ -676,22 +715,20 @@ class detune(torch.nn.Module):
             torch.transpose(
                 torch.linalg.matrix_power(funs_dyn_mat, i), -2, -1) for i in range(1, horizon)], dim=1)
 
-        # --! extract the initial conditions of function time (per slice) trajectories
-        #
-        # --! the initial conditions (ic) are shaped as [B, 1, 1, funs_n] to allow tensor broadcasting
-        # --! when multiplying by dynamics matrices
-        funs_ic = torch.unsqueeze(funs[:, :1], -2)
-
-        # --! predict the time (per slice) evolution of functions by multiplying the initial conditions of
+        # --! predict the local (per slice) evolution of functions by multiplying the initial conditions of
         # --! their trajectories by powered dynamics matrices
         #
         # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, funs_n], i.e.
         # --! batches with functions trajectories consisting of inidividual function-points [1, funs_n]
-        funs_pred = torch.matmul(funs_ic, funs_dyn_mat)
+        funs_pred_local = torch.matmul(funs_ic, funs_dyn_mat)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        funs_pred = torch.squeeze(funs_pred, -2)
-        funs_ic   = torch.squeeze(funs_ic, -2)
+        fund_pred_global = torch.squeeze(funs_pred_global, -2)
+        funs_pred_local  = torch.squeeze(funs_pred_local, -2)
+        funs_ic          = torch.squeeze(funs_ic, -2)
+
+        # --! we use addition to combine the global and local predictions
+        funs_pred = fund_pred_global + funs_pred_local
 
         return torch.cat([funs_ic, funs_pred], dim=1)
 
