@@ -543,10 +543,10 @@ class detune(torch.nn.Module):
         self.cos_freq = []
         self.exp_power = []
 
-    def fit(self, timeseries):
+    def fit(self, timeseries, global_only: bool=True):
 
         # --! forward input timeseries to the main algorithm to get fit results
-        funs, funs_pred, timeseries_recon, timeseries_pred, timeseries_dyn_mat, funs_dyn_mat = self.forward(timeseries)
+        funs, funs_pred, timeseries_recon, timeseries_pred, timeseries_dyn_mat, funs_dyn_mat = self.forward(timeseries, global_only)
 
         loss_ae   = self._fit_autoencoder(timeseries, timeseries_recon)
         loss_pred = self._fit_prediction(timeseries, timeseries_pred)
@@ -556,7 +556,7 @@ class detune(torch.nn.Module):
 
         return loss, loss_ae, loss_pred, loss_lin
 
-    def forward(self, timeseries):
+    def forward(self, timeseries, global_only: bool=True):
 
         timesteps_dim = 1
         timesteps_n   = timeseries.shape[timesteps_dim]
@@ -583,7 +583,7 @@ class detune(torch.nn.Module):
         funs = self._embed_functions(inps)
 
         # --! predict these embeddings
-        funs_pred, timeseries_dyn_mat, funs_dyn_mat = self._predict(funs)
+        funs_pred, timeseries_dyn_mat, funs_dyn_mat = self._predict(funs, global_only)
 
         # --! reconstruct function embeddings back to timeseries
         timeseries_recon = self.dec(funs)
@@ -652,7 +652,7 @@ class detune(torch.nn.Module):
         # --! note that 1 denotes the currently iterated slice
         return funs.reshape(funs.shape[0], funs.shape[1], -1)
 
-    def _predict(self, funs):
+    def _predict(self, funs, global_only: bool):
 
         # --! we take the number of timeseries slices as a prediction horizon
         horizon = funs.shape[1]
@@ -663,7 +663,7 @@ class detune(torch.nn.Module):
         # --! we use addition to combine the global and local predictions
         #
         # --! currently, the local operator is prioritized by a static weight alpha
-        alpha = 0.25
+        alpha = 1. if global_only else 0.25
         funs_pred = alpha * funs_pred_global + (1 - alpha) * funs_pred_local
 
         # --! concatenate initial conditions with predictions to get the full trajectory
