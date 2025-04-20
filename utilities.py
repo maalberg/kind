@@ -10,8 +10,11 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     where B, T and C are the number of batches, time steps and data channels,
     repectively.
     """
+
+    # --! note that we force numpy loadtxt to return at least a two-dimensional array
+    # --! by setting ndmin=2
     data = torch.tensor(
-        np.loadtxt('./data/' + name + '.csv', delimiter=',', dtype=np.float32))
+        np.loadtxt('./data/' + name + '.csv', delimiter=',', dtype=np.float32, ndmin=2))
     datachunks_n = int(data.shape[0] / datachunk_len)
 
     # return read data in channels-last format
