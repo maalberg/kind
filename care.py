@@ -458,12 +458,20 @@ class detune(torch.nn.Module):
     funs_n = 5
 
     # --! number of parameters for every nonlinear function embedding
+    #fun_params_n = {
+        #'sin'   : 2, # amplitude and angular frequency
+        #'cos'   : 2,
+        #'sin2x' : 2,
+        #'cos2x' : 2,
+        #'exp'   : 1  # power
+    #}
+
     fun_params_n = {
-        'sin'   : 2, # amplitude and angular frequency
-        'cos'   : 2,
-        'sin2x' : 2,
-        'cos2x' : 2,
-        'exp'   : 1  # power
+        'fun1' : 1,
+        'fun2' : 1,
+        'fun3' : 1,
+        'fun4' : 1,
+        'fun5' : 1,
     }
 
     # --! size of dynamic parameter filters encoded by an encoder from timeseries data
@@ -622,7 +630,12 @@ class detune(torch.nn.Module):
         fun_params = torch.einsum("blkdf, bldf -> blfk", kerns, inps)
 
         # --! split the parameters of different measurement functions
-        sin_params, cos_params, sin2x_params, cos2x_params, exp_params = torch.split(
+        #sin_params, cos_params, sin2x_params, cos2x_params, exp_params = torch.split(
+            #fun_params,
+            #list(detune.fun_params_n.values()),
+            #dim=-1)
+
+        fun1_params, fun2_params, fun3_params, fun4_params, fun5_params = torch.split(
             fun_params,
             list(detune.fun_params_n.values()),
             dim=-1)
@@ -631,12 +644,19 @@ class detune(torch.nn.Module):
         #
         # --! note that there is one single measurement of each function to describe
         # --! a slice, so the granularity of the slicing may play a role
+        #funs = torch.cat([
+            #self._meas_sin(sin_params),
+            #self._meas_cos(cos_params),
+            #self._meas_sin2x(sin2x_params),
+            #self._meas_cos2x(cos2x_params),
+            #self._meas_exp(exp_params)], dim=-1)
+
         funs = torch.cat([
-            self._meas_sin(sin_params),
-            self._meas_cos(cos_params),
-            self._meas_sin2x(sin2x_params),
-            self._meas_cos2x(cos2x_params),
-            self._meas_exp(exp_params)], dim=-1)
+            self._meas_fun1(fun1_params),
+            self._meas_fun2(fun2_params),
+            self._meas_fun3(fun3_params),
+            self._meas_fun4(fun4_params),
+            self._meas_fun5(fun5_params)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, 1, C, funs_n]
         # --! to [B, 1, C * func_n]
@@ -672,7 +692,7 @@ class detune(torch.nn.Module):
         # --! concatenate initial conditions with predictions to get the full trajectory
         funs_pred = torch.cat([funs[:, :1], funs_pred], dim=1)
 
-        return funs_pred, 0., funs_dyn_mat
+        return funs_pred, timeseries_dyn_mat, funs_dyn_mat
 
     def _predict_globally(self, funs, horizon):
 
@@ -777,6 +797,21 @@ class detune(torch.nn.Module):
     def _meas_exp(self, params):
         power = params
         return torch.exp(power)
+
+    def _meas_fun1(self, params):
+        return params**1
+
+    def _meas_fun2(self, params):
+        return params**2
+
+    def _meas_fun3(self, params):
+        return params
+
+    def _meas_fun4(self, params):
+        return params
+
+    def _meas_fun5(self, params):
+        return params
 
     def _fit_autoencoder(self, timeseries, timeseries_recon):
 
