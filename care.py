@@ -680,12 +680,11 @@ class detune(torch.nn.Module):
             #inp_embed_preds.append(forw)
         #funs_pred = torch.cat(inp_embed_preds, dim=1)
 
+        # --! perform global and local predictions
         funs_pred_global, timeseries_dyn_mat = self._predict_globally(funs, horizon)
-        funs_pred_local, funs_dyn_mat        = self._predict_locally(funs, horizon)
+        funs_pred_local, funs_dyn_mat = self._predict_locally(funs, horizon)
 
-        # --! we use addition to combine the global and local predictions
-        #
-        # --! currently, the local operator is prioritized by a static weight alpha
+        # --! we use addition operation to combine the global and local predictions
         alpha = 1. if global_only else alpha
         funs_pred = alpha * funs_pred_global + (1 - alpha) * funs_pred_local
 

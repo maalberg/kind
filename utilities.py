@@ -2,6 +2,18 @@ import numpy as np
 import torch
 
 
+def freeze_module(module):
+    """Freezes all parameters in the given ``module``."""
+    for param in module.parameters():
+        param.requires_grad = False
+
+
+def unfreeze_module(module):
+    """Unfreezes all parameters in the given ``module``."""
+    for param in module.parameters():
+        param.requires_grad = True
+
+
 def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     """
     Reads data from a file called ``name`` and formats the data based on ``datachunk_len``,
@@ -24,23 +36,6 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
 def write_datafile(name: str, data, delim: str = ',') -> None:
     filedata = np.reshape(data, (data.shape[0] * data.shape[1], data.shape[2]))
     np.savetxt('./data/' + name + '.csv', filedata, fmt='%.14f', delimiter=delim)
-
-
-class rff:
-    def __init__(self, features: list[int] = [1, 64], sigma: float = 1.0) -> None:
-        super().__init__()
-
-        x_dims_n = features[0]
-        z_dims_n = features[1]
-
-        self.w = torch.nn.Linear(x_dims_n, z_dims_n, bias=False)
-        torch.nn.init.normal_(self.w.weight, std=sigma)
-
-    def __call__(self, x):
-        z = self.w(x)
-        return torch.cat([
-            torch.cos(2 * torch.pi * z),
-            torch.sin(2 * torch.pi * z)], dim=-1)
 
 
 class fcnn(torch.nn.Module):
