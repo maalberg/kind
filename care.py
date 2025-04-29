@@ -455,7 +455,7 @@ class _estimator_amp(_estimator):
 class detune(torch.nn.Module):
 
     # --! number of nonlinear functions embeddings
-    funs_n = 5
+    funs_n = 4
 
     # --! number of parameters for every nonlinear function embedding
     #fun_params_n = {
@@ -466,12 +466,12 @@ class detune(torch.nn.Module):
         #'exp'   : 1  # power
     #}
 
+    # --! number of parameters for every nonlinear function embedding
     fun_params_n = {
         'fun1' : 1,
         'fun2' : 1,
         'fun3' : 1,
-        'fun4' : 1,
-        'fun5' : 1,
+        'fun4' : 1
     }
 
     # --! size of dynamic parameter filters encoded by an encoder from timeseries data
@@ -483,7 +483,7 @@ class detune(torch.nn.Module):
     # --! static kernels in convolutional neural networks,
     # --! the kernels here are dynamic, because they
     # --! are produced from the timeseries every time.
-    fun_params_kern_sz = 10
+    fun_params_kern_sz = 50
 
     def __init__(self):
         super().__init__()
@@ -572,22 +572,10 @@ class detune(torch.nn.Module):
             print('err >> the size of input timeseries is not a multiple of a filter size')
             return
 
-        # --! reshape input timeseries to work with dynamic kernels
-        #
-        # --! the length of timeseries is reshaped to extract the kernels
-        # --! into the prelast dimension, i.e.
-        # --! [B, T, C] -> [B, T / kern_sz, T_kern, C], where
-        # --! B, T and C are the number of batch elements,
-        # --! timesteps and data channels, respectively.
-        #
-        # --! note that -1 below infers the size of a dimension
-        inps = timeseries.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz, self.feats_n)
-        inps = inps.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz * self.feats_n)
-
-        # --! compute nonlinear function embeddings for all chunks
+        # --! compute nonlinear function embeddings for given timeseries
         #
         # --! the output embeddings are shaped as [B, T / kern_sz, funs_n]
-        funs = self._embed_functions(inps)
+        funs = self._embed_functions(timeseries)
 
         # --! predict these embeddings
         funs_pred, timeseries_dyn_mat, funs_dyn_mat = self._predict(funs, global_only, alpha)
@@ -604,7 +592,19 @@ class detune(torch.nn.Module):
 
         return funs, funs_pred, timeseries_recon, timeseries_pred, timeseries_dyn_mat, funs_dyn_mat
 
-    def _embed_functions(self, inps):
+    def _embed_functions(self, timeseries):
+
+        # --! reshape input timeseries to work with dynamic kernels
+        #
+        # --! the length of timeseries is reshaped to extract the kernels
+        # --! into the prelast dimension, i.e.
+        # --! [B, T, C] -> [B, T / kern_sz, T_kern, C], where
+        # --! B, T and C are the number of batch elements,
+        # --! timesteps and data channels, respectively.
+        #
+        # --! note that -1 below infers the size of a dimension
+        inps = timeseries.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz, self.feats_n)
+        inps = inps.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz * self.feats_n)
 
         # --! based on inputs, encode parameter kernels (filters)
         kerns = self.fun_params_kern_enc(inps)
@@ -635,7 +635,7 @@ class detune(torch.nn.Module):
             #list(detune.fun_params_n.values()),
             #dim=-1)
 
-        fun1_params, fun2_params, fun3_params, fun4_params, fun5_params = torch.split(
+        fun1_params, fun2_params, fun3_params, fun4_params = torch.split(
             fun_params,
             list(detune.fun_params_n.values()),
             dim=-1)
@@ -655,8 +655,7 @@ class detune(torch.nn.Module):
             self._meas_fun1(fun1_params),
             self._meas_fun2(fun2_params),
             self._meas_fun3(fun3_params),
-            self._meas_fun4(fun4_params),
-            self._meas_fun5(fun5_params)], dim=-1)
+            self._meas_fun4(fun4_params)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, 1, C, funs_n]
         # --! to [B, 1, C * func_n]
@@ -798,10 +797,10 @@ class detune(torch.nn.Module):
         return torch.exp(power)
 
     def _meas_fun1(self, params):
-        return params**1
+        return params
 
     def _meas_fun2(self, params):
-        return params**2
+        return params
 
     def _meas_fun3(self, params):
         return params
@@ -810,6 +809,9 @@ class detune(torch.nn.Module):
         return params
 
     def _meas_fun5(self, params):
+        return params
+
+    def _meas_fun6(self, params):
         return params
 
     def _fit_autoencoder(self, timeseries, timeseries_recon):
