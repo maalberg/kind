@@ -494,7 +494,12 @@ class detune(torch.nn.Module):
         fun_params_enc_outs_n = sum(detune.fun_params_n.values()) * detune.fun_params_kern_sz * timeseries_dims_n
 
         # --! instantiate a multi-layer perceptron as an encoder for function parameter kernels
-        self.fun_params_kern_enc = utils.fcnn(
+        self.fun_params_kern_enc_g = utils.fcnn(
+            features=[fun_params_enc_inps_n, 64, 64, fun_params_enc_outs_n],
+            act_fn_hidden='relu')
+
+        # --! instantiate a multi-layer perceptron as an encoder for function parameter kernels
+        self.fun_params_kern_enc_l = utils.fcnn(
             features=[fun_params_enc_inps_n, 64, 64, fun_params_enc_outs_n],
             act_fn_hidden='relu')
 
@@ -539,33 +544,31 @@ class detune(torch.nn.Module):
         dec_outs_n = detune.fun_params_kern_sz * timeseries_dims_n
 
         # --! 
-        self.dec = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
+        self.dec_g = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
+        self.dec_l = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
 
-    def fit(self, timeseries, embedding_only: bool=False, global_only: bool=False, fixed_alpha: float=0.5):
+    def fit(self, timeseries, global_only: bool=False, fixed_alpha: float=0.5):
+
+        alpha = 1. if global_only else fixed_alpha
 
         # --! forward input timeseries to the main algorithm to get fit results
-        funs, funs_pred, timeseries_recon, timeseries_pred = self.forward(
-            timeseries,
-            embedding_only,
-            global_only,
-            fixed_alpha)
+        outs = self.forward(timeseries, alpha)
 
-        loss = 0.
+        funs_g          = outs[0]
+        funs_g_pred     = outs[1]
+        funs_l          = outs[2]
+        funs_l_pred     = outs[3]
+        timeseries_pred = outs[4]
 
-        if embedding_only:
-            loss_ae = self._fit_embedding(timeseries, timeseries_recon)
-            loss    = loss + loss_ae
-            return loss, loss_ae, None, None
+        loss_pred   = self._fit_prediction(timeseries, timeseries_pred)
 
-        loss_pred = self._fit_prediction(timeseries, timeseries_pred)
-        loss_lin  = self._fit_linearity(funs, funs_pred)
-        loss      = loss + loss_pred + loss_lin
+        loss_g_lin  = 0. * self._fit_linearity_g(funs_g, funs_g_pred)
+        loss_l_lin  = 1. * self._fit_linearity_l(funs_l, funs_l_pred)
 
-        return loss, None, loss_pred, loss_lin
+        loss = loss_pred + loss_g_lin + loss_l_lin
+        return loss, loss_pred, loss_g_lin, loss_l_lin
 
-    def forward(self, timeseries,
-                embedding_only: bool=False, global_only: bool=False,
-                fixed_alpha: float=0.5, adapt_alpha: bool=False):
+    def forward(self, timeseries, alpha: float=0.5):
 
         timesteps_dim = 1
         timesteps_n   = timeseries.shape[timesteps_dim]
@@ -576,28 +579,38 @@ class detune(torch.nn.Module):
 
         # --! derive nonlinear function embeddings for given timeseries, such that
         # --! the output embeddings are shaped as [B, T / kern_sz = number of slices, funs_n]
-        funs = self._embed_functions(timeseries)
+        funs_g = self._embed_functions_g(timeseries)
+        funs_l = self._embed_functions_l(timeseries)
 
-        # --! derived embeddings are immediately decoded back to timeseries
-        timeseries_recon = self.dec(funs)
+        # --! we take the number of timeseries slices as a prediction horizon
+        horizon = funs_g.shape[1]
 
+        # --! perform global and local predictions
+        funs_g_pred = self._predict_globally(funs_g, horizon)
+        funs_l_pred = self._predict_locally(funs_l, horizon)
+
+        # --! concatenate predicted parts with initial condictions to get full trajectories
+        funs_g_pred = torch.cat([funs_g[:, :1], funs_g_pred], dim=1)
+        funs_l_pred = torch.cat([funs_l[:, :1], funs_l_pred], dim=1)
+
+        timeseries_pred_g  = self.dec_g(funs_g_pred)
+        timeseries_pred_g  = timeseries_pred_g.reshape(timeseries_pred_g.shape[0], -1, self.feats_n)
+
+        timeseries_pred_l  = self.dec_l(funs_l_pred)
+        timeseries_pred_l  = timeseries_pred_l.reshape(timeseries_pred_l.shape[0], -1, self.feats_n)
+
+        # --! we use addition operation to combine the global and local predictions
+        timeseries_pred = alpha * timeseries_pred_g + (1 - alpha) * timeseries_pred_l
+
+        # --! predicted embeddings are decoded back to timeseries
+        #
         # --! and since timeseries are reconstructed as rows their shape is [B, C, T],
         # --! but the input timeseries are shaped as columns,
         # --! so reshape the reconstructed ones
-        timeseries_recon = timeseries_recon.reshape(timeseries_recon.shape[0], -1, self.feats_n)
 
-        if embedding_only:
-            return funs, None, timeseries_recon, None
+        return funs_g, funs_g_pred, funs_l, funs_l_pred, timeseries_pred
 
-        # --! predict these embeddings
-        funs_pred = self._predict(funs, global_only, fixed_alpha, adapt_alpha)
-
-        timeseries_pred  = self.dec(funs_pred)
-        timeseries_pred  = timeseries_pred.reshape(timeseries_pred.shape[0], -1, self.feats_n)
-
-        return funs, funs_pred, timeseries_recon, timeseries_pred
-
-    def _embed_functions(self, timeseries):
+    def _embed_functions_g(self, timeseries):
 
         # --! reshape input timeseries to work with dynamic kernels
         #
@@ -612,7 +625,7 @@ class detune(torch.nn.Module):
         inps = inps.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz * self.feats_n)
 
         # --! based on inputs, encode parameter kernels (filters)
-        kerns = self.fun_params_kern_enc(inps)
+        kerns = self.fun_params_kern_enc_g(inps)
 
         # --! reshape encoded kernels to format their multiplication with inputs, e.g.
         # --!
@@ -655,27 +668,63 @@ class detune(torch.nn.Module):
         # --! note that 1 denotes the currently iterated slice
         return funs.reshape(funs.shape[0], funs.shape[1], -1)
 
-    def _predict(self, funs, global_only: bool, fixed_alpha: float, adapt_alpha: bool=False):
+    def _embed_functions_l(self, timeseries):
 
-        # --! we take the number of timeseries slices as a prediction horizon
-        horizon = funs.shape[1]
+        # --! reshape input timeseries to work with dynamic kernels
+        #
+        # --! the length of timeseries is reshaped to extract the kernels
+        # --! into the prelast dimension, i.e.
+        # --! [B, T, C] -> [B, T / kern_sz, T_kern, C], where
+        # --! B, T and C are the number of batch elements,
+        # --! timesteps and data channels, respectively.
+        #
+        # --! note that -1 below infers the size of a dimension
+        inps = timeseries.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz, self.feats_n)
+        inps = inps.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz * self.feats_n)
 
-        # --! perform global and local predictions
-        funs_pred_global = self._predict_globally(funs, horizon)
-        funs_pred_local, adaptive_alpha = self._predict_locally(funs, horizon)
+        # --! based on inputs, encode parameter kernels (filters)
+        kerns = self.fun_params_kern_enc_l(inps)
 
-        adaptive_alpha = (1 - adaptive_alpha)
+        # --! reshape encoded kernels to format their multiplication with inputs, e.g.
+        # --!
+        # --! kernels: [B, T / kern_sz, fun_params_n * kern_sz * C] ->
+        # --! [B, T / kern_sz, fun_params_n, kern_sz, C]
+        # --!
+        # --! inputs: [B, T / kern_sz, kern_sz * C] ->
+        # --! [B, T / kern_sz, kern_sz, C]
+        kerns = kerns.reshape(
+            inps.shape[0], inps.shape[1],
+            sum(detune.fun_params_n.values()),
+            detune.fun_params_kern_sz * self.feats_n)
+        kerns = kerns.reshape(
+            inps.shape[0], inps.shape[1],
+            sum(detune.fun_params_n.values()),
+            detune.fun_params_kern_sz, self.feats_n)
+        inps = inps.reshape(inps.shape[0], inps.shape[1], detune.fun_params_kern_sz, self.feats_n)
 
-        alpha = adaptive_alpha if adapt_alpha else fixed_alpha
+        # --! with the help of kernels extract function parameters from input timeseries
+        fun_params = torch.einsum("blkdf, bldf -> blfk", kerns, inps)
 
-        # --! we use addition operation to combine the global and local predictions
-        alpha = 1. if global_only else alpha
-        funs_pred = alpha * funs_pred_global + (1 - alpha) * funs_pred_local
+        sin_params, cos_params, fun1_params, fun2_params = torch.split(
+            fun_params,
+            list(detune.fun_params_n.values()),
+            dim=-1)
 
-        # --! concatenate initial conditions with predictions to get the full trajectory
-        funs_pred = torch.cat([funs[:, :1], funs_pred], dim=1)
+        # --! measure nonlinear functions, or so-called embeddings, for the current slices of timeseries
+        #
+        # --! note that there is one single measurement of each function to describe
+        # --! a slice, so the granularity of the slicing plays an important a role
+        funs = torch.cat([
+            self._meas_sin(sin_params),
+            self._meas_cos(cos_params),
+            self._meas_fun1(fun1_params),
+            self._meas_fun2(fun2_params)], dim=-1)
 
-        return funs_pred
+        # --! reshape dimensions to go from a shape [B, 1, C, funs_n]
+        # --! to [B, 1, C * func_n]
+        #
+        # --! note that 1 denotes the currently iterated slice
+        return funs.reshape(funs.shape[0], funs.shape[1], -1)
 
     def _predict_globally(self, funs, horizon):
 
@@ -731,11 +780,6 @@ class detune(torch.nn.Module):
         # --! used for prediction as a system matrix A
         _, funs_dyn_mat = self.funs_dyn(funs_dyn, funs_dyn, funs_dyn)
 
-        # --! based on entropy in attention matrix, compute an adaptive alpha,
-        # --! where higher entropy denotes less focused attention,
-        # --! meaning that the local operator is unsure what to do with given embeddings
-        adaptive_alpha = self._entropy2alpha(self._attention2entropy(funs_dyn_mat))
-
         # --! raise local attention matrices to powers covering all prediction horizon
         #
         # --! powered matrices are shaped as [B, H - 1, funs_n, funs_n], where H is the number of horizon steps
@@ -761,7 +805,7 @@ class detune(torch.nn.Module):
         funs_pred_local = torch.matmul(funs_ic, funs_dyn_mat_powers)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        return torch.squeeze(funs_pred_local, -2), adaptive_alpha
+        return torch.squeeze(funs_pred_local, -2)
 
     def _attention2entropy(self, attention):
 
@@ -823,7 +867,12 @@ class detune(torch.nn.Module):
         loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(timeseries_pred, timeseries)
 
-    def _fit_linearity(self, funs, funs_pred):
+    def _fit_linearity_g(self, funs, funs_pred):
+
+        loss_fn = torch.nn.MSELoss(reduction='mean')
+        return loss_fn(funs_pred, funs)
+
+    def _fit_linearity_l(self, funs, funs_pred):
 
         loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(funs_pred, funs)
