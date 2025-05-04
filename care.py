@@ -4,6 +4,8 @@ from matplotlib import pyplot as plt
 from abc import abstractmethod
 from abc import ABCMeta as interface
 
+from dataclasses import dataclass
+
 import utilities as utils
 
 class detuning(torch.nn.Module):
@@ -452,18 +454,19 @@ class _estimator_amp(_estimator):
         return torch.square(z1) + torch.square(z2)
 
 
-class detune(torch.nn.Module):
+@dataclass
+class config:
 
-    # --! number of nonlinear functions embeddings
-    funs_n = 4
+    timeseries_dims_n: int
+    timeseries_sz: int
+    timeseries_timestep: float
 
-    # --! number of parameters for every nonlinear function embedding
-    fun_params_n = {
-        'sin'   : 2,
-        'cos'   : 2,
-        'fun1'  : 1,
-        'fun2'  : 1
-    }
+    # --! basis functions used to build lifted embedding
+    #
+    # --! this dictionary is structured as
+    # --! * function name: str
+    # --! * number of function parameters: int
+    funs: dict
 
     # --! size of dynamic parameter filters encoded by an encoder from timeseries data
     #
@@ -474,24 +477,37 @@ class detune(torch.nn.Module):
     # --! static kernels in convolutional neural networks,
     # --! the kernels here are dynamic, because they
     # --! are produced from the timeseries every time.
-    fun_params_kern_sz = 40
+    fun_params_kern_sz: int
 
-    def __init__(self):
+    fit_weight_lin_global: float
+    fit_weight_lin_local: float
+
+
+class detune(torch.nn.Module):
+
+    def __init__(self, config):
         super().__init__()
 
-        # --! test
-        timeseries_dims_n = 1 # displacement
-        timeseries_sz     = 200
+        self.timeseries_dims_n     = config.timeseries_dims_n
+        self.timeseries_sz         = config.timeseries_sz
+        self.timeseries_timestep   = config.timeseries_timestep
 
-        self.feats_n      = timeseries_dims_n
-        self.timestep     = 0.001
+        self.funs                  = config.funs
+        self.fun_params_kern_sz    = config.fun_params_kern_sz
+
+        self.fit_weight_lin_global = config.fit_weight_lin_global
+        self.fit_weight_lin_local  = config.fit_weight_lin_local
+
+        # --! details of basis functions
+        funs_n        = len(self.funs)
+        funs_params_n = sum(self.funs.values())
 
         # --! as the input to a function parameter encoder we provide flattened timeseries
         # --! sliced according to filter/kernel sizes
-        fun_params_enc_inps_n = detune.fun_params_kern_sz * timeseries_dims_n
+        fun_params_enc_inps_n = self.fun_params_kern_sz * self.timeseries_dims_n
 
         # --! 
-        fun_params_enc_outs_n = sum(detune.fun_params_n.values()) * detune.fun_params_kern_sz * timeseries_dims_n
+        fun_params_enc_outs_n = funs_params_n * self.fun_params_kern_sz * self.timeseries_dims_n
 
         # --! instantiate a multi-layer perceptron as an encoder for function parameter kernels
         self.fun_params_kern_enc_g = utils.fcnn(
@@ -511,7 +527,7 @@ class detune(torch.nn.Module):
         #
         # --! note that operation //, i.e. divide and floor, produces an int rather than a float,
         # --! which is what the class constructor expects - an int
-        funs_dyn_enc_inps_n = timeseries_sz // detune.fun_params_kern_sz
+        funs_dyn_enc_inps_n = self.timeseries_sz // self.fun_params_kern_sz
 
         # --! a transformer is responsible for adaptively deriving the dynamics of timeseries
         # --! that are local to slices
@@ -535,13 +551,13 @@ class detune(torch.nn.Module):
         #
         # --! these dynamics are not adaptable - once they are trained, they are fixed,
         # --! so ideally they should capture the general behavior of a system
-        timeseries_dyn_inps_n = detune.funs_n * timeseries_dims_n
-        timeseries_dyn_outs_n = detune.funs_n * timeseries_dims_n
+        timeseries_dyn_inps_n = funs_n * self.timeseries_dims_n
+        timeseries_dyn_outs_n = funs_n * self.timeseries_dims_n
         self.timeseries_dyn = torch.nn.Linear(timeseries_dyn_inps_n, timeseries_dyn_outs_n, bias=False)
 
         # --! 
-        dec_inps_n = detune.funs_n * timeseries_dims_n
-        dec_outs_n = detune.fun_params_kern_sz * timeseries_dims_n
+        dec_inps_n = funs_n * self.timeseries_dims_n
+        dec_outs_n = self.fun_params_kern_sz * self.timeseries_dims_n
 
         # --! 
         self.dec_g = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
@@ -562,18 +578,18 @@ class detune(torch.nn.Module):
 
         loss_pred   = self._fit_prediction(timeseries, timeseries_pred)
 
-        loss_g_lin  = 0. * self._fit_linearity_g(funs_g, funs_g_pred)
-        loss_l_lin  = 1. * self._fit_linearity_l(funs_l, funs_l_pred)
+        loss_lin_g  = self.fit_weight_lin_global * self._fit_linearity_g(funs_g, funs_g_pred)
+        loss_lin_l  = self.fit_weight_lin_local * self._fit_linearity_l(funs_l, funs_l_pred)
 
-        loss = loss_pred + loss_g_lin + loss_l_lin
-        return loss, loss_pred, loss_g_lin, loss_l_lin
+        loss = loss_pred + loss_lin_g + loss_lin_l
+        return loss, loss_pred, loss_lin_g, loss_lin_l
 
     def forward(self, timeseries, alpha: float=0.5):
 
         timesteps_dim = 1
         timesteps_n   = timeseries.shape[timesteps_dim]
 
-        if timesteps_n % detune.fun_params_kern_sz:
+        if timesteps_n % self.fun_params_kern_sz:
             print('err >> the size of input timeseries is not a multiple of a filter size')
             return
 
@@ -594,10 +610,10 @@ class detune(torch.nn.Module):
         funs_l_pred = torch.cat([funs_l[:, :1], funs_l_pred], dim=1)
 
         timeseries_pred_g  = self.dec_g(funs_g_pred)
-        timeseries_pred_g  = timeseries_pred_g.reshape(timeseries_pred_g.shape[0], -1, self.feats_n)
+        timeseries_pred_g  = timeseries_pred_g.reshape(timeseries_pred_g.shape[0], -1, self.timeseries_dims_n)
 
         timeseries_pred_l  = self.dec_l(funs_l_pred)
-        timeseries_pred_l  = timeseries_pred_l.reshape(timeseries_pred_l.shape[0], -1, self.feats_n)
+        timeseries_pred_l  = timeseries_pred_l.reshape(timeseries_pred_l.shape[0], -1, self.timeseries_dims_n)
 
         # --! we use addition operation to combine the global and local predictions
         timeseries_pred = alpha * timeseries_pred_g + (1 - alpha) * timeseries_pred_l
@@ -621,11 +637,13 @@ class detune(torch.nn.Module):
         # --! timesteps and data channels, respectively.
         #
         # --! note that -1 below infers the size of a dimension
-        inps = timeseries.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz, self.feats_n)
-        inps = inps.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz * self.feats_n)
+        inps = timeseries.reshape(timeseries.shape[0], -1, self.fun_params_kern_sz, self.timeseries_dims_n)
+        inps = inps.reshape(timeseries.shape[0], -1, self.fun_params_kern_sz * self.timeseries_dims_n)
 
         # --! based on inputs, encode parameter kernels (filters)
         kerns = self.fun_params_kern_enc_g(inps)
+
+        all_params_n = sum(self.funs.values())
 
         # --! reshape encoded kernels to format their multiplication with inputs, e.g.
         # --!
@@ -636,31 +654,35 @@ class detune(torch.nn.Module):
         # --! [B, T / kern_sz, kern_sz, C]
         kerns = kerns.reshape(
             inps.shape[0], inps.shape[1],
-            sum(detune.fun_params_n.values()),
-            detune.fun_params_kern_sz * self.feats_n)
+            all_params_n,
+            self.fun_params_kern_sz * self.timeseries_dims_n)
         kerns = kerns.reshape(
             inps.shape[0], inps.shape[1],
-            sum(detune.fun_params_n.values()),
-            detune.fun_params_kern_sz, self.feats_n)
-        inps = inps.reshape(inps.shape[0], inps.shape[1], detune.fun_params_kern_sz, self.feats_n)
+            all_params_n,
+            self.fun_params_kern_sz, self.timeseries_dims_n)
+        inps = inps.reshape(inps.shape[0], inps.shape[1], self.fun_params_kern_sz, self.timeseries_dims_n)
 
         # --! with the help of kernels extract function parameters from input timeseries
-        fun_params = torch.einsum("blkdf, bldf -> blfk", kerns, inps)
+        params = torch.einsum("blkdf, bldf -> blfk", kerns, inps)
 
-        sin_params, cos_params, fun1_params, fun2_params = torch.split(
-            fun_params,
-            list(detune.fun_params_n.values()),
-            dim=-1)
+        # --! split extracted parameters based on number of parameters required by each basis function
+        params = torch.split(params, list(self.funs.values()), dim=-1)
 
         # --! measure nonlinear functions, or so-called embeddings, for the current slices of timeseries
         #
         # --! note that there is one single measurement of each function to describe
         # --! a slice, so the granularity of the slicing plays an important a role
-        funs = torch.cat([
-            self._meas_sin(sin_params),
-            self._meas_cos(cos_params),
-            self._meas_fun1(fun1_params),
-            self._meas_fun2(fun2_params)], dim=-1)
+        funs = torch.cat([self._meas_fun(fun, param) for fun, param in zip(self.funs.keys(), params)], dim=-1)
+
+        # --! measure nonlinear functions, or so-called embeddings, for the current slices of timeseries
+        #
+        # --! note that there is one single measurement of each function to describe
+        # --! a slice, so the granularity of the slicing plays an important a role
+        #funs = torch.cat([
+            #self._meas_sin(sin_params),
+            #self._meas_cos(cos_params),
+            #self._meas_fun1(fun1_params),
+            #self._meas_fun2(fun2_params)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, 1, C, funs_n]
         # --! to [B, 1, C * func_n]
@@ -679,11 +701,13 @@ class detune(torch.nn.Module):
         # --! timesteps and data channels, respectively.
         #
         # --! note that -1 below infers the size of a dimension
-        inps = timeseries.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz, self.feats_n)
-        inps = inps.reshape(timeseries.shape[0], -1, detune.fun_params_kern_sz * self.feats_n)
+        inps = timeseries.reshape(timeseries.shape[0], -1, self.fun_params_kern_sz, self.timeseries_dims_n)
+        inps = inps.reshape(timeseries.shape[0], -1, self.fun_params_kern_sz * self.timeseries_dims_n)
 
         # --! based on inputs, encode parameter kernels (filters)
         kerns = self.fun_params_kern_enc_l(inps)
+
+        all_params_n = sum(self.funs.values())
 
         # --! reshape encoded kernels to format their multiplication with inputs, e.g.
         # --!
@@ -694,31 +718,25 @@ class detune(torch.nn.Module):
         # --! [B, T / kern_sz, kern_sz, C]
         kerns = kerns.reshape(
             inps.shape[0], inps.shape[1],
-            sum(detune.fun_params_n.values()),
-            detune.fun_params_kern_sz * self.feats_n)
+            all_params_n,
+            self.fun_params_kern_sz * self.timeseries_dims_n)
         kerns = kerns.reshape(
             inps.shape[0], inps.shape[1],
-            sum(detune.fun_params_n.values()),
-            detune.fun_params_kern_sz, self.feats_n)
-        inps = inps.reshape(inps.shape[0], inps.shape[1], detune.fun_params_kern_sz, self.feats_n)
+            all_params_n,
+            self.fun_params_kern_sz, self.timeseries_dims_n)
+        inps = inps.reshape(inps.shape[0], inps.shape[1], self.fun_params_kern_sz, self.timeseries_dims_n)
 
         # --! with the help of kernels extract function parameters from input timeseries
-        fun_params = torch.einsum("blkdf, bldf -> blfk", kerns, inps)
+        params = torch.einsum("blkdf, bldf -> blfk", kerns, inps)
 
-        sin_params, cos_params, fun1_params, fun2_params = torch.split(
-            fun_params,
-            list(detune.fun_params_n.values()),
-            dim=-1)
+        # --! split extracted parameters based on number of parameters required by each basis function
+        params = torch.split(params, list(self.funs.values()), dim=-1)
 
         # --! measure nonlinear functions, or so-called embeddings, for the current slices of timeseries
         #
         # --! note that there is one single measurement of each function to describe
         # --! a slice, so the granularity of the slicing plays an important a role
-        funs = torch.cat([
-            self._meas_sin(sin_params),
-            self._meas_cos(cos_params),
-            self._meas_fun1(fun1_params),
-            self._meas_fun2(fun2_params)], dim=-1)
+        funs = torch.cat([self._meas_fun(fun, param) for fun, param in zip(self.funs.keys(), params)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, 1, C, funs_n]
         # --! to [B, 1, C * func_n]
@@ -825,37 +843,38 @@ class detune(torch.nn.Module):
         alpha = 1.0 - (entropy / max_entropy)  # inverse mapping
         return alpha * (high - low) + low
 
+    def _meas_fun(self, fun, param):
+        if fun == 'sin':
+            return self._meas_sin(param)
+        elif fun == 'cos':
+            return self._meas_cos(param)
+        elif 'data' in fun:
+            return self._meas_data(param)
+        else:
+            raise Exception("unsupported basis function!")
+
     def _meas_sin(self, params):
         amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.sin(self.timestep * freq)
+        return amp * torch.sin(self.timeseries_timestep * freq)
 
     def _meas_cos(self, params):
         amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.cos(self.timestep * freq)
+        return amp * torch.cos(self.timeseries_timestep * freq)
+
+    def _meas_data(self, params):
+        return params
 
     def _meas_sin2x(self, params):
         amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.sin(2 * self.timestep * freq)
+        return amp * torch.sin(2 * self.timeseries_timestep * freq)
 
     def _meas_cos2x(self, params):
         amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.cos(2 * self.timestep * freq)
+        return amp * torch.cos(2 * self.timeseries_timestep * freq)
 
     def _meas_exp(self, params):
         power = params
         return torch.exp(power)
-
-    def _meas_fun1(self, params):
-        return params
-
-    def _meas_fun2(self, params):
-        return params
-
-    def _meas_fun3(self, params):
-        return params**3
-
-    def _meas_fun4(self, params):
-        return params**4
 
     def _fit_embedding(self, timeseries, timeseries_recon):
 
