@@ -563,6 +563,8 @@ class detune(torch.nn.Module):
         self.dec_g = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
         self.dec_l = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
 
+        self.funs_dyn_mat = None
+
     def fit(self, timeseries, global_only: bool=False, fixed_alpha: float=0.5):
 
         alpha = 1. if global_only else fixed_alpha
@@ -673,16 +675,6 @@ class detune(torch.nn.Module):
         # --! note that there is one single measurement of each function to describe
         # --! a slice, so the granularity of the slicing plays an important a role
         funs = torch.cat([self._meas_fun(fun, param) for fun, param in zip(self.funs.keys(), params)], dim=-1)
-
-        # --! measure nonlinear functions, or so-called embeddings, for the current slices of timeseries
-        #
-        # --! note that there is one single measurement of each function to describe
-        # --! a slice, so the granularity of the slicing plays an important a role
-        #funs = torch.cat([
-            #self._meas_sin(sin_params),
-            #self._meas_cos(cos_params),
-            #self._meas_fun1(fun1_params),
-            #self._meas_fun2(fun2_params)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, 1, C, funs_n]
         # --! to [B, 1, C * func_n]
@@ -797,6 +789,7 @@ class detune(torch.nn.Module):
         # --! this produces a square matrix [funs_n, funs_n] that can be
         # --! used for prediction as a system matrix A
         _, funs_dyn_mat = self.funs_dyn(funs_dyn, funs_dyn, funs_dyn)
+        self.funs_dyn_mat = funs_dyn_mat
 
         # --! raise local attention matrices to powers covering all prediction horizon
         #
@@ -848,6 +841,8 @@ class detune(torch.nn.Module):
             return self._meas_sin(param)
         elif fun == 'cos':
             return self._meas_cos(param)
+        elif fun == 'exp':
+            return self._meas_exp(param)
         elif 'data' in fun:
             return self._meas_data(param)
         else:
