@@ -1,7 +1,7 @@
 import numpy as np
 import torch
-
 from sklearn.preprocessing import MinMaxScaler as minmax_scaler
+from matplotlib import pyplot as plt
 
 
 def freeze_module(module):
@@ -177,6 +177,7 @@ def remove_mean(timeseries, dim: int=0):
     """Removes mean from ``timeseries`` in dimension ``dim``. Dimensions are preserved."""
     return timeseries - np.mean(timeseries, axis=dim, keepdims=True)
 
+
 def save_timeseries_eval(timeseries, dir_name, snippet_sz):
     """
     Saves ``timeseries`` into folder named ``dir_name`` for model evaluation.
@@ -212,3 +213,213 @@ def scale_timeseries(timeseries):
     # --! format scaler input as column vectors
     scaler_inp = np.vstack([timeseries]).T
     return scaler.fit_transform(scaler_inp)
+
+
+def train(model, parameters):
+    """Trains a ``model`` with given ``parameters``."""
+
+    dataset_dir       = parameters['dataset_dir']
+    datafiles_train_n = parameters['train_files_n']
+    timeseries_len    = parameters['timeseries_sz']
+    bat_sz            = parameters['batch_sz']
+    epochs_n          = parameters['epochs_n']
+    x_len             = parameters['x_sz']
+    verbose           = parameters['is_verbose']
+    global_on         = parameters['is_global']
+    lr                = parameters['learn_rate']
+    weight_decay      = parameters['weight_decay']
+    alpha             = parameters['alpha']
+
+    if global_on:
+        # --! we train the global operator here, so freeze the local one
+        unfreeze_module(model.fun_params_kern_enc_g)
+        freeze_module(model.fun_params_kern_enc_l)
+
+        unfreeze_module(model.timeseries_dyn)
+        freeze_module(model.funs_dyn_enc)
+        freeze_module(model.funs_dyn)
+
+        unfreeze_module(model.dec_g)
+        freeze_module(model.dec_l)
+
+        model.fit_weight_lin_global = 1.
+        model.fit_weight_lin_local  = 0.
+    else:
+        # --! we train the local operator now, so freeze the global one
+        freeze_module(model.fun_params_kern_enc_g)
+        unfreeze_module(model.fun_params_kern_enc_l)
+
+        freeze_module(model.timeseries_dyn)
+        unfreeze_module(model.funs_dyn_enc)
+        unfreeze_module(model.funs_dyn)
+
+        freeze_module(model.dec_g)
+        unfreeze_module(model.dec_l)
+
+        model.fit_weight_lin_global = 0.
+        model.fit_weight_lin_local  = 1.
+
+    # --! specify optimizer
+    optimizer = torch.optim.Adam(
+        filter(lambda param: param.requires_grad, model.parameters()),
+        lr=lr,
+        weight_decay=weight_decay)
+
+    # --! empty arrays to gather metrics
+    loss_train_pred  = []
+    loss_train_lin_g = []
+    loss_train_lin_l = []
+    loss_valid_pred  = []
+    loss_valid_lin_g = []
+    loss_valid_lin_l = []
+
+    # --! prepare validation dataset
+    data_valid    = read_datafile(f'{dataset_dir}/valid', timeseries_len)
+    dataset_valid = torch.utils.data.TensorDataset(data_valid)
+
+    # --! training duration
+    if verbose:
+        print(f"inf >> Number of data files for training : {datafiles_train_n}")
+
+    for datafile_train in range(datafiles_train_n):
+        if verbose:
+            print(f"inf >> processing training file number {datafile_train + 1}")
+
+        # --! make training datasets and loaders
+        data_train = read_datafile(f'{dataset_dir}/train{datafile_train + 1}', timeseries_len)
+        dataset_train = torch.utils.data.TensorDataset(data_train)
+        dataloader_train = torch.utils.data.DataLoader(dataset_train, batch_size=bat_sz, shuffle=True)
+
+        # --! train
+        for epoch in range(epochs_n):
+
+            # --! train neural networks
+            for this, data in enumerate(dataloader_train):
+                x = data[0][:, :x_len, :1]
+
+                optimizer.zero_grad()
+
+                # --! fit a model to training data
+                loss, loss_pred, loss_lin_g, loss_lin_l = model.fit(x, global_only=global_on)
+
+                loss.backward()
+                optimizer.step()
+
+                with torch.no_grad():
+                    loss_train_pred.append(loss_pred)
+                    loss_train_lin_g.append(loss_lin_g)
+                    loss_train_lin_l.append(loss_lin_l)
+
+            # --! validate results
+            with torch.no_grad():
+                dataloader_valid = torch.utils.data.DataLoader(dataset_valid, batch_size=bat_sz, shuffle=False)
+                for data in dataloader_valid:
+                    x  = data[0][:, :x_len, :1] # take only displacement
+
+                    # --! validate prediction
+                    outs = model(x, alpha=alpha)
+                    funs_g          = outs[0]
+                    funs_g_pred     = outs[1]
+                    funs_l          = outs[2]
+                    funs_l_pred     = outs[3]
+                    timeseries_pred = outs[4]
+                    loss_valid_pred.append(torch.mean((x - timeseries_pred)**2))
+                    loss_valid_lin_g.append(torch.mean((funs_g - funs_g_pred)**2))
+                    loss_valid_lin_l.append(torch.mean((funs_l - funs_l_pred)**2))
+
+    return loss_train_pred, loss_train_lin_g, loss_train_lin_l, loss_valid_pred, loss_valid_lin_g, loss_valid_lin_l
+
+
+def test(model, parameters):
+    """Tests a ``model`` on ``parameters``."""
+
+    dataset_dir       = parameters['dataset_dir']
+    timeseries_len    = parameters['timeseries_sz']
+    bat_sz            = parameters['batch_sz']
+    x_len             = parameters['x_sz']
+    alpha             = parameters['alpha']
+
+    # --! make test datasets and loaders
+    data_test = read_datafile(f'{dataset_dir}/test', timeseries_len)
+    dataset_test = torch.utils.data.TensorDataset(data_test)
+    dataloader_test = torch.utils.data.DataLoader(dataset_test, batch_size=bat_sz, shuffle=False)
+
+    loss_test_pred = []
+
+    for data in dataloader_test:
+        x = data[0][:, :x_len, :1] # detuning is one-dimensional
+
+        outs = model(x, alpha=alpha)
+        funs_g          = outs[0]
+        funs_g_pred     = outs[1]
+        funs_l          = outs[2]
+        funs_l_pred     = outs[3]
+        timeseries_pred = outs[4]
+        loss_test_pred.append(torch.mean((x - timeseries_pred)**2))
+
+    return loss_test_pred
+
+
+def disp_dataset(dataset_dir, timeseries_sz, timestep):
+    """
+    Displays metrics of a dataset located in a folder named ``dataset_dir``. The size of timeseries
+    stored in this dataset is defined by ``timeseries_sz``. The ``timestep`` that was used
+    when sampling the timeseries helps create time vectors for plotting.
+    """
+
+    # --! read data from files
+    data_train = read_datafile(f'{dataset_dir}/train1', timeseries_sz)
+    data_valid = read_datafile(f'{dataset_dir}/valid', timeseries_sz)
+    data_test = read_datafile(f'{dataset_dir}/test', timeseries_sz)
+
+    # --! compile dataset parameters
+    data_table = [
+        ( 'dataset',           'batches',        'timeseries length',          'channels'),
+        ('--------',           '-------',        '-----------------',          '--------'),
+        (   'train', data_train.shape[0], data_train.shape[1], data_train.shape[2]),
+        (   'valid', data_valid.shape[0], data_valid.shape[1], data_valid.shape[2]),
+        (    'test',  data_test.shape[0],  data_test.shape[1],  data_test.shape[2]) ]
+
+    # --! print dataset parameters
+    print('')
+    print('inf >> dataset parameters:')
+    print('')
+    for row in data_table:
+        print(f'{row[0]:>8} {row[1]:>8} {row[2]:>18} {row[3]:>8}')
+    print('')
+    
+    data0 = data_train[0]
+    data1 = data_train[1]
+    data2 = data_train[2]
+    t = torch.linspace(0., timestep*timeseries_sz, timeseries_sz)
+    zero = torch.zeros_like(t)
+
+    plt.figure(figsize=(4, 4))
+    plt.title(f'Data no. 0 from training dataset')
+    plt.plot(t, data0[:, 0], color='tab:blue', alpha=0.75, label='detuning')
+    plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
+    plt.legend()
+    plt.xlabel('Time [s]')
+    plt.ylabel('Amplitude')
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(4, 4))
+    plt.title(f'Data no. 1 from training dataset')
+    plt.plot(t, data1[:, 0], color='tab:blue', alpha=0.75, label='detuning')
+    plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
+    plt.legend()
+    plt.xlabel('Time [s]')
+    plt.ylabel('Amplitude')
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(4, 4))
+    plt.title(f'Data no. 2 from training dataset')
+    plt.plot(t, data2[:, 0], color='tab:blue', alpha=0.75, label='detuning')
+    plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
+    plt.legend()
+    plt.xlabel('Time [s]')
+    plt.ylabel('Amplitude')
+    plt.tight_layout()
+    plt.show()
