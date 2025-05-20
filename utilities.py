@@ -360,7 +360,7 @@ def test(model, parameters):
     return loss_test_pred
 
 
-def disp_dataset(dataset_dir, timeseries_sz, timestep):
+def disp_dataset(dataset_dir, timeseries_sz, timestep, data_n=3):
     """
     Displays metrics of a dataset located in a folder named ``dataset_dir``. The size of timeseries
     stored in this dataset is defined by ``timeseries_sz``. The ``timestep`` that was used
@@ -387,39 +387,82 @@ def disp_dataset(dataset_dir, timeseries_sz, timestep):
     for row in data_table:
         print(f'{row[0]:>8} {row[1]:>8} {row[2]:>18} {row[3]:>8}')
     print('')
-    
-    data0 = data_train[0]
-    data1 = data_train[1]
-    data2 = data_train[2]
+
     t = torch.linspace(0., timestep*timeseries_sz, timeseries_sz)
     zero = torch.zeros_like(t)
 
-    plt.figure(figsize=(4, 4))
-    plt.title(f'Data no. 0 from training dataset')
-    plt.plot(t, data0[:, 0], color='tab:blue', alpha=0.75, label='detuning')
-    plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
-    plt.legend()
-    plt.xlabel('Time [s]')
-    plt.ylabel('Amplitude')
-    plt.tight_layout()
-    plt.show()
+    for i in range(data_n):
+        data = data_train[i]
+
+        plt.figure(figsize=(4, 4))
+        plt.title(f'Data no. {i} from training dataset')
+        plt.plot(t, data[:, 0], color='tab:blue', alpha=0.75, label='detuning')
+        plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
+        plt.legend()
+        plt.xlabel('Time [s]')
+        plt.ylabel('Amplitude')
+        plt.tight_layout()
+        plt.show()
+
+
+def disp_spectrum(eigvals):
+    """Displays eigenvalues on the unit circle."""
+    reals = eigvals.real.view(-1, 1)
+    imags = eigvals.imag.view(-1, 1)
 
     plt.figure(figsize=(4, 4))
-    plt.title(f'Data no. 1 from training dataset')
-    plt.plot(t, data1[:, 0], color='tab:blue', alpha=0.75, label='detuning')
-    plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
-    plt.legend()
-    plt.xlabel('Time [s]')
-    plt.ylabel('Amplitude')
-    plt.tight_layout()
+    plt.scatter(reals[:, 0], imags[:, 0], c='blue')
+    plt.axhline(0, color='gray', linewidth=0.5)
+    plt.axvline(0, color='gray', linewidth=0.5)
+    circle = plt.Circle((0, 0), 1, color='r', fill=False, linestyle='--')
+    plt.gca().add_artist(circle)
+    plt.title("Global Koopman operator spectrum")
+    plt.xlabel("Real Part")
+    plt.ylabel("Imaginary part")
+    plt.grid(True)
+    plt.axis('equal')
     plt.show()
 
-    plt.figure(figsize=(4, 4))
-    plt.title(f'Data no. 2 from training dataset')
-    plt.plot(t, data2[:, 0], color='tab:blue', alpha=0.75, label='detuning')
-    plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
-    plt.legend()
-    plt.xlabel('Time [s]')
+
+def disp_spectrum_amps(model, dataset_dir, data_timeseries_sz, data_i):
+
+    eigvals, eigvecs = torch.linalg.eig(model.timeseries_dyn.weight)
+    data_test        = read_datafile(f'{dataset_dir}/test', data_timeseries_sz)
+    x_len            = model.timeseries_sz
+
+    data_ic     = torch.unsqueeze(data_test[data_i][:model.fun_params_kern_sz, :1], 0)
+    funs_ic     = model._embed_functions_g(data_ic)
+    eigvecs_inv = torch.linalg.inv(eigvecs)
+    funs_ic     = torch.squeeze(funs_ic, 0)
+    eigvecs_inv = torch.squeeze(eigvecs_inv, 0)
+    funs_ic     = funs_ic.to(torch.cfloat)
+    b           = torch.matmul(eigvecs_inv, torch.transpose(funs_ic, 0, 1))
+    b           = b.abs()
+    b_nums      = np.array([range(len(b[:, 0]))]).reshape(-1, 1) + 1.0
+
+    data        = data_test[data_i]
+    timeseries  = torch.unsqueeze(data[:x_len, :1], dim=0)
+    outs        = model(timeseries, alpha=1.0)
+    timeseries_pred = outs[4]
+    timeseries      = torch.squeeze(timeseries, dim=0)
+    timeseries_pred = torch.squeeze(timeseries_pred, dim=0)
+
+    timestep = model.timeseries_timestep
+    t = np.arange(0., x_len*timestep, timestep).reshape(-1, 1)
+
+    plt.figure(figsize=(7,4))
+    plt.subplot(1, 2, 1)
+
+    plt.bar(b_nums[:, 0], b[:, 0])
+    plt.title('Mode amplitudes')
+    plt.xlabel('Mode index')
     plt.ylabel('Amplitude')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(t[:, 0], timeseries[:, 0], alpha=0.8, color='tab:green', label='$x$')
+    plt.plot(t[:, 0], timeseries_pred[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
+    plt.xlabel('Time [s]')
+    plt.legend()
+
     plt.tight_layout()
     plt.show()
