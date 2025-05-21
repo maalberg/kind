@@ -242,6 +242,7 @@ def train(model, parameters):
         unfreeze_module(model.dec_g)
         freeze_module(model.dec_l)
 
+        # --! toggle the beta parameter defined in the paper
         model.fit_weight_lin_global = 1.
         model.fit_weight_lin_local  = 0.
     else:
@@ -256,6 +257,7 @@ def train(model, parameters):
         freeze_module(model.dec_g)
         unfreeze_module(model.dec_l)
 
+        # --! toggle the beta parameter defined in the paper
         model.fit_weight_lin_global = 0.
         model.fit_weight_lin_local  = 1.
 
@@ -300,7 +302,7 @@ def train(model, parameters):
                 optimizer.zero_grad()
 
                 # --! fit a model to training data
-                loss, loss_pred, loss_lin_g, loss_lin_l = model.fit(x, global_only=global_on)
+                loss, loss_pred, loss_lin_g, loss_lin_l = model.fit(x, global_only=global_on, fixed_alpha=alpha)
 
                 loss.backward()
                 optimizer.step()
@@ -425,6 +427,12 @@ def disp_spectrum(eigvals):
 
 
 def disp_spectrum_amps(model, dataset_dir, data_timeseries_sz, data_i):
+    """
+    Displays the amplitudes of a ``model`` eigenvalues for data from ``dataset_dir`` indexed
+    by ``data_i``. Parameter ``data_timeseries_sz`` is needed to read ``dataset_dir``
+    and extract proper timeseries. The displayed amplitudes are aligned
+    with the corresponding ``model`` predictions.
+    """
 
     eigvals, eigvecs = torch.linalg.eig(model.timeseries_dyn.weight)
     data_test        = read_datafile(f'{dataset_dir}/test', data_timeseries_sz)
