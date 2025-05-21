@@ -412,7 +412,7 @@ def disp_spectrum(eigvals):
     reals = eigvals.real.view(-1, 1)
     imags = eigvals.imag.view(-1, 1)
 
-    plt.figure(figsize=(4, 4))
+    plt.figure(figsize=(3, 3))
     plt.scatter(reals[:, 0], imags[:, 0], c='blue')
     plt.axhline(0, color='gray', linewidth=0.5)
     plt.axvline(0, color='gray', linewidth=0.5)
@@ -458,15 +458,16 @@ def disp_spectrum_amps(model, dataset_dir, data_timeseries_sz, data_i):
     timestep = model.timeseries_timestep
     t = np.arange(0., x_len*timestep, timestep).reshape(-1, 1)
 
-    plt.figure(figsize=(7,4))
-    plt.subplot(1, 2, 1)
+    plt.figure(figsize=(6,3))
 
-    plt.bar(b_nums[:, 0], b[:, 0])
+    plt.subplot(1, 2, 1)
     plt.title('Mode amplitudes')
+    plt.bar(b_nums[:, 0], b[:, 0])
     plt.xlabel('Mode index')
     plt.ylabel('Amplitude')
 
     plt.subplot(1, 2, 2)
+    plt.title('Model response')
     plt.plot(t[:, 0], timeseries[:, 0], alpha=0.8, color='tab:green', label='$x$')
     plt.plot(t[:, 0], timeseries_pred[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
     plt.xlabel('Time [s]')
@@ -474,3 +475,43 @@ def disp_spectrum_amps(model, dataset_dir, data_timeseries_sz, data_i):
 
     plt.tight_layout()
     plt.show()
+
+
+def eval_model(model, dataset_dir, data_timeseries_sz, alphas):
+    """
+    Evaluates a ``model`` on data from a folder named ``dataset_dir``. Data read from
+    that folder is split into timeseries according to ``data_timeseries_sz``.
+    When calling the ``model``, it is parameterized by ``alphas``.
+    """
+    data = read_datafile(f'{dataset_dir}/eval', data_timeseries_sz)
+
+    # --! helping variables
+    x_len          = model.timeseries_sz
+    timestep       = model.timeseries_timestep
+    timeseries_dur = x_len * timestep
+    indeces        = range(data.shape[0])
+
+    # --! data is a batch/array with timeseries, so split it along the batch dimension
+    timeseries_array = torch.split(data, 1, dim=0)
+
+    for i, timeseries, alpha in zip(indeces, timeseries_array, alphas):
+
+        # --! call the model
+        outs = model(timeseries, alpha=alpha)
+        timeseries_pred = outs[4]
+
+        # --! remove the batch dimension
+        timeseries = torch.squeeze(timeseries, dim=0)
+        timeseries_pred = torch.squeeze(timeseries_pred, dim=0)
+
+        t = np.arange(0., data_timeseries_sz*timestep, timestep).reshape(-1, 1)
+        t = t + i*timeseries_dur
+
+        plt.figure(figsize=(3,3))
+        plt.plot(t[:x_len, 0], timeseries[:x_len, 0], alpha=0.8, color='tab:green', label='$x$')
+        plt.plot(t[:x_len, 0], timeseries_pred[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
+        plt.xlabel('Time [s]')
+        plt.ylabel('Amplitude')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
