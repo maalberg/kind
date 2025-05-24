@@ -28,7 +28,7 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     # --! note that we force numpy loadtxt to return at least a two-dimensional array
     # --! by setting ndmin=2
     data = torch.tensor(
-        np.loadtxt('./data/' + name + '.csv', delimiter=',', dtype=np.float32, ndmin=2))
+        np.loadtxt(name + '.csv', delimiter=',', dtype=np.float32, ndmin=2))
     datachunks_n = int(data.shape[0] / datachunk_len)
 
     # return read data in channels-last format
@@ -38,7 +38,7 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
 def write_datafile(name: str, data, delim: str = ',') -> None:
     """Writes ``data`` to a file named ``name``. The file is written using a comma-separated-value format."""
     filedata = np.reshape(data, (data.shape[0] * data.shape[1], data.shape[2]))
-    np.savetxt('./data/' + name + '.csv', filedata, fmt='%.14f', delimiter=delim)
+    np.savetxt(name + '.csv', filedata, fmt='%.14f', delimiter=delim)
 
 
 class fcnn(torch.nn.Module):
@@ -135,7 +135,7 @@ def save_timeseries_train(timeseries, dir_name, snippet_sz):
     specifies a directory name where files are saved, and ``snippet_sz`` is the length
     of saved timeseries snippets.
     """
-    dataset_dir = 'cavity/' + dir_name
+    dataset_dir = dir_name
 
     data_config = [
         # number of timeseries in a file, file name
@@ -195,7 +195,7 @@ def save_timeseries_eval(timeseries, dir_name, snippet_sz):
 
         data = np.expand_dims(np.concatenate([remove_mean(snippet) for snippet in snippets], axis=0), 0)
 
-        dataset_dir = 'cavity/' + dir_name
+        dataset_dir = dir_name
         filename    = 'eval'
         write_datafile(f'{dataset_dir}/{filename}', data)
         print('inf >> evaluation file saved')
@@ -396,7 +396,7 @@ def disp_dataset(dataset_dir, timeseries_sz, timestep, data_n=3):
     for i in range(data_n):
         data = data_train[i]
 
-        plt.figure(figsize=(4, 4))
+        plt.figure(figsize=(3, 3))
         plt.title(f'Data no. {i} from training dataset')
         plt.plot(t, data[:, 0], color='tab:blue', alpha=0.75, label='detuning')
         plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
