@@ -406,6 +406,9 @@ class detune(torch.nn.Module):
             return self._meas_exp(param)
         elif 'data' in fun:
             return self._meas_data(param)
+        elif 'poly' in fun:
+            deg = utils.extract_poly_deg(fun)
+            return self._meas_poly(param, deg)
         else:
             raise Exception("unsupported basis function!")
 
@@ -420,17 +423,12 @@ class detune(torch.nn.Module):
     def _meas_data(self, params):
         return params
 
-    def _meas_sin2x(self, params):
-        amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.sin(2 * self.timeseries_timestep * freq)
-
-    def _meas_cos2x(self, params):
-        amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.cos(2 * self.timeseries_timestep * freq)
-
     def _meas_exp(self, params):
         power = params
         return torch.exp(power)
+
+    def _meas_poly(self, params, deg):
+        return torch.sum(torch.cat([params**(i+1) for i in range(deg)], dim=-1), -1, keepdim=True)
 
     def _fit_embedding(self, timeseries, timeseries_recon):
 

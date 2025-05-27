@@ -545,3 +545,17 @@ def eval_model(model, dataset_dir, data_timeseries_sz, alphas, plot_attention=Fa
             plt.tight_layout()
 
             plt.show()
+
+
+def extract_poly_deg(polynomial: str='poly_1'):
+    """Extracts a degree from the given ``polynomial`` string."""
+    tokens = polynomial.split('_', 1)
+    if len(tokens) != 2:
+        raise ValueError('bad specification of a polynomial')
+    deg = tokens[1]
+    if not deg.isdigit():
+        raise ValueError('bad specification of a polynomial')
+    deg = int(tokens[1])
+    if deg == 0:
+        raise ValueError('zero degree polynomial is not supported')
+    return deg
