@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from sklearn.preprocessing import MinMaxScaler as minmax_scaler
+from sklearn.model_selection import train_test_split
 from matplotlib import pyplot as plt
 import seaborn as sns
 
@@ -559,3 +560,108 @@ def extract_poly_deg(polynomial: str='poly_1'):
     if deg == 0:
         raise ValueError('zero degree polynomial is not supported')
     return deg
+
+
+def label_stationarity(dmd_model, dmd_residual_max, dataset_dir, data_timeseries_sz):
+    """
+    Based on DMD model residuals, creates a set of labels for stationary/non-stationary data.
+    """
+    data = read_datafile(f'{dataset_dir}/test', data_timeseries_sz)
+    labels = torch.zeros(data.shape[0], dtype=torch.bool)
+
+    for this, timeseries in enumerate(data):
+        timeseries = torch.unsqueeze(timeseries, 0)
+
+        # --! predict timeseries
+        outs = dmd_model(timeseries, alpha=1.0)
+        timeseries_pred = outs[4]
+
+        residual = torch.mean((timeseries - timeseries_pred)**2)
+        label = True if residual < dmd_residual_max else False
+        labels[this] = label
+
+    return labels
+
+
+def create_stationarity_dataset(dmd_model, dmd_residual_max, data_dirs, data_timeseries_sz, conv_ready=False):
+    """
+    Returns a dataset which contains a list of tuples. The size of this list corresponds to the sum of
+    stationary and non-stationary data as read from file folders ``data_dirs``. The tuple
+    then consists of timeseries and a label, where label=1.0 denotes stationary
+    timeseries, and label=0.0 non-stantionary.
+    """
+    labels_stationary    = label_stationarity(dmd_model, dmd_residual_max, data_dirs[0], data_timeseries_sz)
+    labels_nonstationary = label_stationarity(dmd_model, dmd_residual_max, data_dirs[1], data_timeseries_sz)
+
+    # --! convert boolean labels to floats
+    labels_stationary    = labels_stationary.float()
+    labels_nonstationary = labels_nonstationary.float()
+
+    data_stationary      = read_datafile(f'{data_dirs[0]}/test', data_timeseries_sz)
+    data_nonstationary   = read_datafile(f'{data_dirs[1]}/test', data_timeseries_sz)
+
+    data   = torch.cat([data_stationary, data_nonstationary], dim=0)
+    labels = torch.cat([labels_stationary, labels_nonstationary], dim=0)
+
+    if conv_ready:
+        # --! to facilitate the use of convolutional neural networks,
+        # --! we shape timeseries as (C, T), where C and T are
+        # --! the number of data channels and time samples,
+        # --! respectively
+        data = torch.transpose(data, -2, -1)
+
+    return torch.utils.data.TensorDataset(data, labels)
+
+
+def train_classifier(model, dataset, parameters):
+
+    epochs_n = parameters['epochs_n']
+    lr       = parameters['learning_rate']
+    wd       = parameters['weight_decay']
+    bat_sz   = parameters['batch_size']
+
+    # --! stratify data splits to ensure the two data classes are equally represented in both splits
+    labels = dataset[:][1]
+    indices_train, indices_valid, _, _ = train_test_split(range(len(dataset)), labels, stratify=labels, test_size=0.2)
+
+    dataset_train = torch.utils.data.Subset(dataset, indices_train)
+    dataset_valid = torch.utils.data.Subset(dataset, indices_valid)
+
+    # --! define split ratio and split the given dataset
+    #train_sz  = int(0.8 * len(dataset))
+    #valid_sz  = len(dataset) - train_sz
+    #dataset_train, dataset_valid = torch.utils.data.random_split(dataset, [train_sz, valid_sz])
+
+    # --! create data loaders for training and validation datasets
+    dataloader_train = torch.utils.data.DataLoader(dataset_train, batch_size=bat_sz, shuffle=True)
+    dataloader_valid = torch.utils.data.DataLoader(dataset_valid, batch_size=bat_sz, shuffle=False)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    loss_fn = torch.nn.BCELoss()
+
+    # --! run training loop
+    for epoch in range(epochs_n):
+        for xb, yb in dataloader_train:
+            optimizer.zero_grad()
+
+            preds = model(xb).squeeze()
+            loss = loss_fn(preds, yb)
+
+            loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            val_preds = []
+            val_targets = []
+            for xb, yb in dataloader_valid:
+                preds = model(xb).squeeze()
+                val_preds.append(preds)
+                val_targets.append(yb)
+            val_preds = torch.cat(val_preds)
+            val_targets = torch.cat(val_targets)
+
+            # --! if prediction is greater than 0.5, it should equal True in targets,
+            # --! and vice versa if it is less, is should correspond to False
+            val_acc = ((val_preds > 0.5) == val_targets).float().mean()
+            print(f"Epoch {epoch+1}, Val Acc: {val_acc:.3f}")
+

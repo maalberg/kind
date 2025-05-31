@@ -450,3 +450,48 @@ class detune(torch.nn.Module):
         loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(funs_pred, funs)
 
+
+@dataclass
+class stationarity_config:
+    kern_sz: int
+
+
+class stationarity_classifier(torch.nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+
+        self.kern_sz = config.kern_sz
+
+        # --! based on kernel size, compute the size of padding
+        pad_sz = (self.kern_sz - 1) // 2
+
+        self.net = torch.nn.Sequential(
+
+            # --! Derives 16 features from input timeseries by looking at small chunks of
+            # --! length 5 using a kernel. When sliding along the timeseries,
+            # --! the kernel shifts by 1 sample (stride=1). And to make
+            # --! the kernel fully processes the last sample, the
+            # --! timeseries are padded by two zero samples (padding=2).
+            #
+            # --! derived features of length 200 are downsampled by a factor of 2, see MaxPool1d
+            torch.nn.Conv1d(1, 16, kernel_size=self.kern_sz, stride=1, padding=pad_sz),
+            torch.nn.ReLU(),
+            torch.nn.MaxPool1d(2),
+
+            # --! extracts 32 high-level features from the already derived 16 features
+            #
+            # --! pools across the entire time axis and converts vector-features into scalar-features,
+            # --! see AdaptiveAvgPool1d
+            torch.nn.Conv1d(16, 32, kernel_size=self.kern_sz, stride=1, padding=pad_sz),
+            torch.nn.ReLU(),
+            torch.nn.AdaptiveAvgPool1d(1),
+
+            # --! classifies features into a probability that given time series are stationary
+            torch.nn.Flatten(),
+            torch.nn.Linear(32, 1),
+            torch.nn.Sigmoid()
+        )
+
+    def forward(self, timeseries):
+        return self.net(timeseries)
