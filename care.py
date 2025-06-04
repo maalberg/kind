@@ -1,30 +1,382 @@
 import torch
-from matplotlib import pyplot as plt
 
 from abc import abstractmethod
-from abc import ABCMeta as interface
+from abc import ABC as interface
 
 from dataclasses import dataclass
 
 import utilities as utils
 
 
+class operator(torch.nn.Module, interface):
+    """Models dynamics of timeseries."""
+
+    def __init__(self, config):
+        super().__init__()
+
+        # --! store mutual configuration inside this base class
+        self.timeseries_ndim       = config.timeseries_ndim
+        self.timeseries_nsample    = config.timeseries_nsample
+        self.timestep              = config.timestep
+        self.fun                   = config.fun
+        self.param_kernsize        = config.param_kernsize
+
+    @abstractmethod
+    def embed_fun(self, timeseries):
+        return
+
+    @abstractmethod
+    def predict(self, fun, horizon):
+        return
+
+    @abstractmethod
+    def freeze(self):
+        return
+
+    @abstractmethod
+    def unfreeze(self):
+        return
+
+    def _eval_fun(self, fun, param):
+        if fun == 'sin':
+            return self._eval_sin(param)
+        elif fun == 'cos':
+            return self._eval_cos(param)
+        elif fun == 'exp':
+            return self._eval_exp(param)
+        elif 'data' in fun:
+            return self._eval_data(param)
+        elif 'poly' in fun:
+            deg = utils.extract_poly_deg(fun)
+            return self._eval_poly(param, deg)
+        else:
+            raise Exception("unsupported basis function!")
+
+    def _eval_sin(self, params):
+        amp, freq = torch.split(params, 1, dim=-1)
+        return amp * torch.sin(self.timestep * freq)
+
+    def _eval_cos(self, params):
+        amp, freq = torch.split(params, 1, dim=-1)
+        return amp * torch.cos(self.timestep * freq)
+
+    def _eval_data(self, params):
+        return params
+
+    def _eval_exp(self, params):
+        power = params
+        return torch.exp(power)
+
+    def _eval_poly(self, params, deg):
+        return torch.sum(torch.cat([params**(i+1) for i in range(deg)], dim=-1), -1, keepdim=True)
+
+
+class operator_sta(operator):
+    """Models dynamics of stationary timeseries in a dynamic mode decomposition-like manner."""
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        # --! derive some details of basis functions for convenience
+        nfun   = len(self.fun)
+        nparam = sum(self.fun.values())
+
+        # --! create an MLP-based encoder to encode timeseries into embeddings
+        #
+        # --! more precisely, input timeseries are partitioned into slices, and the encoder
+        # --! encodes slice-specific kernels for every function parameter
+        # --! in the embedded (latent) space
+        enc_ni   = self.param_kernsize * self.timeseries_ndim
+        enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
+        self.enc = utils.fcnn(features=[enc_ni, 64, 64, enc_no], act_fn_hidden='relu')
+
+        # --! create a learnable DMD-like model (a matrix) that captures stationary dynamics
+        #
+        # --! since this matrix is learned only once and does not adapt during runtime,
+        # --! this operator can also be called static, instead of stationary
+        model_ni = nfun * self.timeseries_ndim
+        model_no = nfun * self.timeseries_ndim
+        self.model = torch.nn.Linear(model_ni, model_no, bias=False)
+
+        # --! create an MLP-based decoder to decode embeddings back to timeseries
+        dec_ni   = nfun * self.timeseries_ndim
+        dec_no   = self.param_kernsize * self.timeseries_ndim
+        self.dec = utils.fcnn(features=[dec_ni, 64, 64, dec_no], act_fn_hidden='relu')
+
+    def embed_fun(self, timeseries):
+
+        # --! reshape timeseries to form an input to embeddings encoder
+        #
+        # --! the length of timeseries is reshaped to put kernels into the prelast dimension, i.e.
+        # --! [B, T, C] -> [B, T / kernsize, kernsize, C], where
+        # --! B, T and C are the number of batch elements,
+        # --! timesteps and data channels, respectively
+        #
+        # --! note that -1 below infers the size of a dimension
+        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.timeseries_ndim)
+        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.timeseries_ndim)
+
+        # --! based on inputs, encode parameter kernels (filters)
+        kern = self.enc(i)
+
+        nparam = sum(self.fun.values())
+
+        # --! reshape encoded kernels to support their next multiplication with inputs, e.g.
+        # --!
+        # --! kernels:
+        # --! [B, T / kernsize, nparam * kernsize * C] -> [B, T / kernsize, nparam, kernsize, C]
+        # --!
+        # --! inputs:
+        # --! [B, T / kernsize, kernsize * C] -> [B, T / kernsize, kernsize, C]
+        kern = kern.reshape(
+            i.shape[0], i.shape[1],
+            nparam,
+            self.param_kernsize * self.timeseries_ndim)
+        kern = kern.reshape(
+            i.shape[0], i.shape[1],
+            nparam,
+            self.param_kernsize, self.timeseries_ndim)
+        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.timeseries_ndim)
+
+        # --! with the help of kernels extract function parameters from input timeseries
+        param = torch.einsum("blkdf, bldf -> blfk", kern, i)
+
+        # --! split extracted parameters based on number of parameters required by each basis function
+        param = torch.split(param, list(self.fun.values()), dim=-1)
+
+        # --! evaluate embedding functions at each slice of timeseries
+        #
+        # --! note that there is one single measurement of each function to describe
+        # --! a slice, so the granularity of slicing plays an important a role
+        fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+
+        # --! reshape dimensions to go from a shape [B, 1, C, nfun]
+        # --! to [B, 1, C * nfun]
+        #
+        # --! note that 1 denotes the currently iterated slice
+        return fun.reshape(fun.shape[0], fun.shape[1], -1)
+
+    def predict(self, fun, horizon):
+
+        # --! extract the matrix of stationary dynamics
+        #
+        # --! the matrix is unsqueezed to a shape [1, nfun, nfun] to allow
+        # --! broadcasting when multiplying with functions
+        mat = torch.unsqueeze(self.model.weight, 0)
+
+        # --! stack together matrices raised to powers to cover all prediction horizon
+        #
+        # --! powered matrices are shaped as [B, H - 1, nfun, nfun], where H is the number of horizon steps
+        # --! and -1 is because we do not predict the first time step
+        #
+        # --! note that dynamics matrices are also transposed to allow multiplication with functions
+        mat_power = torch.stack([
+            torch.transpose(
+                torch.linalg.matrix_power(mat, power), -2, -1) for power in range(1, horizon)], dim=1)
+
+        # --! extract the initial conditions of function values, i.e. the first slice
+        #
+        # --! the initial conditions (ic) are shaped as [B, 1, 1, nfun] to allow tensor broadcasting
+        # --! when multiplying by dynamics matrices
+        fun_ic = torch.unsqueeze(fun[:, :1], -2)
+
+        # --! predict the stationary evolution of function values by multiplying their initial conditions
+        # --! by powered dynamics matrices
+        #
+        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun], i.e.
+        # --! batches with functions trajectories consisting of inidividual function-points [1, nfun]
+        fun_predict = torch.matmul(fun_ic, mat_power)
+
+        # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
+        return torch.squeeze(fun_predict, -2)
+
+    def freeze(self):
+        utils.freeze_module(self.enc)
+        utils.freeze_module(self.model)
+        utils.freeze_module(self.dec)
+
+    def unfreeze(self):
+        utils.unfreeze_module(self.enc)
+        utils.unfreeze_module(self.model)
+        utils.unfreeze_module(self.dec)
+
+
+class operator_dyn(operator):
+    """Models dynamics of transient timeseries using the attention mechanism."""
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        # --! derive some details of basis functions for convenience
+        nfun   = len(self.fun)
+        nparam = sum(self.fun.values())
+
+        # --! create an MLP-based encoder to encode timeseries into embeddings
+        #
+        # --! more precisely, input timeseries are partitioned into slices, and the encoder
+        # --! encodes slice-specific kernels for every function parameter
+        # --! in the embedded (latent) space
+        embed_enc_ni   = self.param_kernsize * self.timeseries_ndim
+        embed_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
+        self.embed_enc = utils.fcnn(features=[embed_enc_ni, 64, 64, embed_enc_no], act_fn_hidden='relu')
+
+        # --! number of input features for an adaptive correction encoder which acts on a slice level
+        #
+        # --! as features, this encoder gets timeseries slices, so the idea is to pass
+        # --! a trace of function embeddings to the encoder
+        corr_enc_ni = self.timeseries_nsample // self.param_kernsize
+
+        # --! adaptive corrections are implemented in terms of a Transformer network
+        self.corr_enc = torch.nn.TransformerEncoder(
+            torch.nn.TransformerEncoderLayer(
+                d_model=corr_enc_ni, nhead=1, dim_feedforward=128, batch_first=True),
+            num_layers=3,
+            enable_nested_tensor=False)
+
+        # --! an extra self-attention module serves as a model that describes the evolution of slices
+        self.model = torch.nn.MultiheadAttention(embed_dim=corr_enc_ni, num_heads=1, batch_first=True)
+
+        # --! create an MLP-based decoder to decode embeddings back to timeseries
+        dec_ni   = nfun * self.timeseries_ndim
+        dec_no   = self.param_kernsize * self.timeseries_ndim
+        self.dec = utils.fcnn(features=[dec_ni, 64, 64, dec_no], act_fn_hidden='relu')
+
+        self.model_mat_last = None
+
+    def embed_fun(self, timeseries):
+
+        # --! reshape timeseries to form an input to embeddings encoder
+        #
+        # --! the length of timeseries is reshaped to put kernels into the prelast dimension, i.e.
+        # --! [B, T, C] -> [B, T / kernsize, kernsize, C], where
+        # --! B, T and C are the number of batch elements,
+        # --! timesteps and data channels, respectively
+        #
+        # --! note that -1 below infers the size of a dimension
+        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.timeseries_ndim)
+        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.timeseries_ndim)
+
+        # --! based on inputs, encode parameter kernels (filters)
+        kern = self.embed_enc(i)
+
+        nparam = sum(self.fun.values())
+
+        # --! reshape encoded kernels to support their next multiplication with inputs, e.g.
+        # --!
+        # --! kernels:
+        # --! [B, T / kernsize, nparam * kernsize * C] -> [B, T / kernsize, nparam, kernsize, C]
+        # --!
+        # --! inputs:
+        # --! [B, T / kernsize, kernsize * C] -> [B, T / kernsize, kernsize, C]
+        kern = kern.reshape(
+            i.shape[0], i.shape[1],
+            nparam,
+            self.param_kernsize * self.timeseries_ndim)
+        kern = kern.reshape(
+            i.shape[0], i.shape[1],
+            nparam,
+            self.param_kernsize, self.timeseries_ndim)
+        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.timeseries_ndim)
+
+        # --! with the help of kernels extract function parameters from input timeseries
+        param = torch.einsum("blkdf, bldf -> blfk", kern, i)
+
+        # --! split extracted parameters based on number of parameters required by each basis function
+        param = torch.split(param, list(self.fun.values()), dim=-1)
+
+        # --! evaluate embedding functions at each slice of timeseries
+        #
+        # --! note that there is one single measurement of each function to describe
+        # --! a slice, so the granularity of slicing plays an important a role
+        fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+
+        # --! reshape dimensions to go from a shape [B, 1, C, nfun]
+        # --! to [B, 1, C * nfun]
+        #
+        # --! note that 1 denotes the currently iterated slice
+        return fun.reshape(fun.shape[0], fun.shape[1], -1)
+
+    def predict(self, fun, horizon):
+
+        # --! encode function embeddings as local corrections by learning which embedding, e.g. a sine,
+        # --! describes the current timeseries best, this embedding
+        # --! receives then the most attention
+        #
+        # --! input functions have a shape [B, T / kernsize, nfun], however
+        # --! the idea is to attend over functions, so we transpose
+        # --! the shape to [B, nfun, T / kernsize], such that
+        # --! function values represent the sequence,
+        # --! and timeseries slices - the features
+        corr = self.corr_enc(fun.transpose(1, 2))
+
+        # --! perform self-attention by passing the above encoded correction as
+        # --! the query, key and value of an extra self-attention module
+        #
+        # --! this produces a square matrix [nfun, nfun] that can be
+        # --! used for prediction as a system matrix A
+        _, model_mat = self.model(corr, corr, corr)
+        self.model_mat_last = model_mat
+
+        # --! stack together matrices raised to powers to cover all prediction horizon
+        #
+        # --! powered matrices are shaped as [B, H - 1, nfun, nfun], where H is the number of horizon steps
+        # --! and -1 is because we do not predict the first time step
+        #
+        # --! note that dynamics matrices are also transposed to allow multiplication with functions
+        # --! shaped as rows, i.e. [1, nfun]
+        mat_power = torch.stack([
+            torch.transpose(
+                torch.linalg.matrix_power(model_mat, power), -2, -1) for power in range(1, horizon)], dim=1)
+
+        # --! extract the initial conditions of function values, i.e. the first slice
+        #
+        # --! the initial conditions (ic) are shaped as [B, 1, 1, nfun] to allow tensor broadcasting
+        # --! when multiplying by dynamics matrices
+        fun_ic = torch.unsqueeze(fun[:, :1], -2)
+
+        # --! predict the stationary evolution of function values by multiplying their initial conditions
+        # --! by powered dynamics matrices
+        #
+        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun], i.e.
+        # --! batches with functions trajectories consisting of inidividual function-points [1, nfun]
+        fun_predict = torch.matmul(fun_ic, mat_power)
+
+        # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
+        return torch.squeeze(fun_predict, -2)
+
+    def freeze(self):
+        utils.freeze_module(self.embed_enc)
+        utils.freeze_module(self.corr_enc)
+        utils.freeze_module(self.model)
+        utils.freeze_module(self.dec)
+
+    def unfreeze(self):
+        utils.unfreeze_module(self.embed_enc)
+        utils.unfreeze_module(self.corr_enc)
+        utils.unfreeze_module(self.model)
+        utils.unfreeze_module(self.dec)
+
+
 @dataclass
-class config:
+class detuning_config:
     """
-    This data class contains configuration for the detuning model.
+    Stores detuning configuration.
     """
 
-    timeseries_dims_n: int
-    timeseries_sz: int
-    timeseries_timestep: float
+    # --! number of dimensions and samples in timeseries
+    timeseries_ndim: int
+    timeseries_nsample: int
+
+    # --! timestep that was used to sample timeseries
+    timestep: float
 
     # --! basis functions used to build lifted embedding
     #
     # --! this dictionary is structured as
-    # --! * function name: str
-    # --! * number of function parameters: int
-    funs: dict
+    #
+    # --!  *  function name: str
+    # --!  *  number of function parameters: int
+    fun: dict
 
     # --! size of dynamic parameter filters encoded by an encoder from timeseries data
     #
@@ -35,102 +387,30 @@ class config:
     # --! static kernels in convolutional neural networks,
     # --! the kernels here are dynamic, because they
     # --! are produced from the timeseries every time.
-    fun_params_kern_sz: int
-
-    fit_weight_lin_global: float
-    fit_weight_lin_local: float
+    param_kernsize: int
 
 
-class detune(torch.nn.Module):
+class detuning(torch.nn.Module):
     """
-    This class models detuning of a cavity resonance (care).
+    Models detuning of a cavity resonance as predictive one-dimensional timeseries.
     """
 
     def __init__(self, config):
         super().__init__()
 
-        self.timeseries_dims_n     = config.timeseries_dims_n
-        self.timeseries_sz         = config.timeseries_sz
-        self.timeseries_timestep   = config.timeseries_timestep
+        self.timeseries_ndim       = config.timeseries_ndim
+        self.timeseries_nsample    = config.timeseries_nsample
+        self.timestep              = config.timestep
+        self.param_kernsize        = config.param_kernsize
 
-        self.funs                  = config.funs
-        self.fun_params_kern_sz    = config.fun_params_kern_sz
+        self.operator_sta = operator_sta(config)
+        self.operator_dyn = operator_dyn(config)
 
-        self.fit_weight_lin_global = config.fit_weight_lin_global
-        self.fit_weight_lin_local  = config.fit_weight_lin_local
+        self.fitweight_linearity_dmd = 0.0
+        self.fitweight_linearity_transformer = 0.0
 
-        # --! details of basis functions
-        funs_n        = len(self.funs)
-        funs_params_n = sum(self.funs.values())
+    def fit(self, timeseries, alpha):
 
-        # --! as the input to a function parameter encoder we provide flattened timeseries
-        # --! sliced according to filter/kernel sizes
-        fun_params_enc_inps_n = self.fun_params_kern_sz * self.timeseries_dims_n
-
-        # --! 
-        fun_params_enc_outs_n = funs_params_n * self.fun_params_kern_sz * self.timeseries_dims_n
-
-        # --! instantiate a multi-layer perceptron as an encoder for function parameter kernels
-        self.fun_params_kern_enc_g = utils.fcnn(
-            features=[fun_params_enc_inps_n, 64, 64, fun_params_enc_outs_n],
-            act_fn_hidden='relu')
-
-        # --! instantiate a multi-layer perceptron as an encoder for function parameter kernels
-        self.fun_params_kern_enc_l = utils.fcnn(
-            features=[fun_params_enc_inps_n, 64, 64, fun_params_enc_outs_n],
-            act_fn_hidden='relu')
-
-        # --! number of inputs (features) for an adaptive function dynamics encoder,
-        # --! which acts locally on a slice level
-        #
-        # --! as features this encoder gets timeseries slices, so the idea is to pass
-        # --! an n-dimensional trace of function embeddings to the encoder
-        #
-        # --! note that operation //, i.e. divide and floor, produces an int rather than a float,
-        # --! which is what the class constructor expects - an int
-        funs_dyn_enc_inps_n = self.timeseries_sz // self.fun_params_kern_sz
-
-        # --! a transformer is responsible for adaptively deriving the dynamics of timeseries
-        # --! that are local to slices
-        #
-        # --! the transformer attends over nonlinear function embeddings
-        self.funs_dyn_enc = torch.nn.TransformerEncoder(
-            torch.nn.TransformerEncoderLayer(
-                d_model=funs_dyn_enc_inps_n,
-                nhead=1,
-                dim_feedforward=128,
-                batch_first=True),
-            num_layers=3,
-            enable_nested_tensor=False)
-
-        # --! this is a self-attention module that is supposed to produce a square matrix
-        # --! that describes the evolution of local function values
-        self.funs_dyn = torch.nn.MultiheadAttention(embed_dim=funs_dyn_enc_inps_n, num_heads=1, batch_first=True)
-
-        # --! a learnable matrix which is supposed to determine global dynamics that
-        # --! are shared across slices
-        #
-        # --! these dynamics are not adaptable - once they are trained, they are fixed,
-        # --! so ideally they should capture the general behavior of a system
-        timeseries_dyn_inps_n = funs_n * self.timeseries_dims_n
-        timeseries_dyn_outs_n = funs_n * self.timeseries_dims_n
-        self.timeseries_dyn = torch.nn.Linear(timeseries_dyn_inps_n, timeseries_dyn_outs_n, bias=False)
-
-        # --! 
-        dec_inps_n = funs_n * self.timeseries_dims_n
-        dec_outs_n = self.fun_params_kern_sz * self.timeseries_dims_n
-
-        # --! 
-        self.dec_g = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
-        self.dec_l = utils.fcnn(features=[dec_inps_n, 64, 64, dec_outs_n], act_fn_hidden='relu')
-
-        self.funs_dyn_mat = None
-
-    def fit(self, timeseries, global_only: bool=False, fixed_alpha: float=0.5):
-
-        alpha = 1. if global_only else fixed_alpha
-
-        # --! forward input timeseries to the main algorithm to get fit results
         outs = self.forward(timeseries, alpha)
 
         funs_g          = outs[0]
@@ -141,42 +421,43 @@ class detune(torch.nn.Module):
 
         loss_pred   = self._fit_prediction(timeseries, timeseries_pred)
 
-        loss_lin_g  = self.fit_weight_lin_global * self._fit_linearity_g(funs_g, funs_g_pred)
-        loss_lin_l  = self.fit_weight_lin_local * self._fit_linearity_l(funs_l, funs_l_pred)
+        loss_lin_g  = self.fitweight_linearity_dmd * self._fit_linearity_g(funs_g, funs_g_pred)
+        loss_lin_l  = self.fitweight_linearity_transformer * self._fit_linearity_l(funs_l, funs_l_pred)
 
         loss = loss_pred + loss_lin_g + loss_lin_l
         return loss, loss_pred, loss_lin_g, loss_lin_l
 
-    def forward(self, timeseries, alpha: float=0.5):
+    def forward(self, timeseries, alpha):
 
         timesteps_dim = 1
         timesteps_n   = timeseries.shape[timesteps_dim]
 
-        if timesteps_n % self.fun_params_kern_sz:
+        if timesteps_n % self.param_kernsize:
             print('err >> the size of input timeseries is not a multiple of a filter size')
             return
 
         # --! derive nonlinear function embeddings for given timeseries, such that
         # --! the output embeddings are shaped as [B, T / kern_sz = number of slices, funs_n]
-        funs_g = self._embed_functions_g(timeseries)
-        funs_l = self._embed_functions_l(timeseries)
+        funs_g = self.operator_sta.embed_fun(timeseries)
+        funs_l = self.operator_dyn.embed_fun(timeseries)
 
         # --! we take the number of timeseries slices as a prediction horizon
         horizon = funs_g.shape[1]
 
         # --! perform global and local predictions
-        funs_g_pred = self._predict_globally(funs_g, horizon)
-        funs_l_pred = self._predict_locally(funs_l, horizon)
+        funs_g_pred = self.operator_sta.predict(funs_g, horizon)
+        funs_l_pred = self.operator_dyn.predict(funs_l, horizon)
 
         # --! concatenate predicted parts with initial condictions to get full trajectories
         funs_g_pred = torch.cat([funs_g[:, :1], funs_g_pred], dim=1)
         funs_l_pred = torch.cat([funs_l[:, :1], funs_l_pred], dim=1)
 
-        timeseries_pred_g  = self.dec_g(funs_g_pred)
-        timeseries_pred_g  = timeseries_pred_g.reshape(timeseries_pred_g.shape[0], -1, self.timeseries_dims_n)
+        #timeseries_pred_g  = self.dec_g(funs_g_pred)
+        timeseries_pred_g  = self.operator_sta.dec(funs_g_pred)
+        timeseries_pred_g  = timeseries_pred_g.reshape(timeseries_pred_g.shape[0], -1, self.timeseries_ndim)
 
-        timeseries_pred_l  = self.dec_l(funs_l_pred)
-        timeseries_pred_l  = timeseries_pred_l.reshape(timeseries_pred_l.shape[0], -1, self.timeseries_dims_n)
+        timeseries_pred_l  = self.operator_dyn.dec(funs_l_pred)
+        timeseries_pred_l  = timeseries_pred_l.reshape(timeseries_pred_l.shape[0], -1, self.timeseries_ndim)
 
         # --! we use addition operation to combine the global and local predictions
         timeseries_pred = alpha * timeseries_pred_g + (1 - alpha) * timeseries_pred_l
@@ -188,196 +469,6 @@ class detune(torch.nn.Module):
         # --! so reshape the reconstructed ones
 
         return funs_g, funs_g_pred, funs_l, funs_l_pred, timeseries_pred
-
-    def _embed_functions_g(self, timeseries):
-
-        # --! reshape input timeseries to work with dynamic kernels
-        #
-        # --! the length of timeseries is reshaped to extract the kernels
-        # --! into the prelast dimension, i.e.
-        # --! [B, T, C] -> [B, T / kern_sz, T_kern, C], where
-        # --! B, T and C are the number of batch elements,
-        # --! timesteps and data channels, respectively.
-        #
-        # --! note that -1 below infers the size of a dimension
-        inps = timeseries.reshape(timeseries.shape[0], -1, self.fun_params_kern_sz, self.timeseries_dims_n)
-        inps = inps.reshape(timeseries.shape[0], -1, self.fun_params_kern_sz * self.timeseries_dims_n)
-
-        # --! based on inputs, encode parameter kernels (filters)
-        kerns = self.fun_params_kern_enc_g(inps)
-
-        all_params_n = sum(self.funs.values())
-
-        # --! reshape encoded kernels to format their multiplication with inputs, e.g.
-        # --!
-        # --! kernels: [B, T / kern_sz, fun_params_n * kern_sz * C] ->
-        # --! [B, T / kern_sz, fun_params_n, kern_sz, C]
-        # --!
-        # --! inputs: [B, T / kern_sz, kern_sz * C] ->
-        # --! [B, T / kern_sz, kern_sz, C]
-        kerns = kerns.reshape(
-            inps.shape[0], inps.shape[1],
-            all_params_n,
-            self.fun_params_kern_sz * self.timeseries_dims_n)
-        kerns = kerns.reshape(
-            inps.shape[0], inps.shape[1],
-            all_params_n,
-            self.fun_params_kern_sz, self.timeseries_dims_n)
-        inps = inps.reshape(inps.shape[0], inps.shape[1], self.fun_params_kern_sz, self.timeseries_dims_n)
-
-        # --! with the help of kernels extract function parameters from input timeseries
-        params = torch.einsum("blkdf, bldf -> blfk", kerns, inps)
-
-        # --! split extracted parameters based on number of parameters required by each basis function
-        params = torch.split(params, list(self.funs.values()), dim=-1)
-
-        # --! measure nonlinear functions, or so-called embeddings, for the current slices of timeseries
-        #
-        # --! note that there is one single measurement of each function to describe
-        # --! a slice, so the granularity of the slicing plays an important a role
-        funs = torch.cat([self._meas_fun(fun, param) for fun, param in zip(self.funs.keys(), params)], dim=-1)
-
-        # --! reshape dimensions to go from a shape [B, 1, C, funs_n]
-        # --! to [B, 1, C * func_n]
-        #
-        # --! note that 1 denotes the currently iterated slice
-        return funs.reshape(funs.shape[0], funs.shape[1], -1)
-
-    def _embed_functions_l(self, timeseries):
-
-        # --! reshape input timeseries to work with dynamic kernels
-        #
-        # --! the length of timeseries is reshaped to extract the kernels
-        # --! into the prelast dimension, i.e.
-        # --! [B, T, C] -> [B, T / kern_sz, T_kern, C], where
-        # --! B, T and C are the number of batch elements,
-        # --! timesteps and data channels, respectively.
-        #
-        # --! note that -1 below infers the size of a dimension
-        inps = timeseries.reshape(timeseries.shape[0], -1, self.fun_params_kern_sz, self.timeseries_dims_n)
-        inps = inps.reshape(timeseries.shape[0], -1, self.fun_params_kern_sz * self.timeseries_dims_n)
-
-        # --! based on inputs, encode parameter kernels (filters)
-        kerns = self.fun_params_kern_enc_l(inps)
-
-        all_params_n = sum(self.funs.values())
-
-        # --! reshape encoded kernels to format their multiplication with inputs, e.g.
-        # --!
-        # --! kernels: [B, T / kern_sz, fun_params_n * kern_sz * C] ->
-        # --! [B, T / kern_sz, fun_params_n, kern_sz, C]
-        # --!
-        # --! inputs: [B, T / kern_sz, kern_sz * C] ->
-        # --! [B, T / kern_sz, kern_sz, C]
-        kerns = kerns.reshape(
-            inps.shape[0], inps.shape[1],
-            all_params_n,
-            self.fun_params_kern_sz * self.timeseries_dims_n)
-        kerns = kerns.reshape(
-            inps.shape[0], inps.shape[1],
-            all_params_n,
-            self.fun_params_kern_sz, self.timeseries_dims_n)
-        inps = inps.reshape(inps.shape[0], inps.shape[1], self.fun_params_kern_sz, self.timeseries_dims_n)
-
-        # --! with the help of kernels extract function parameters from input timeseries
-        params = torch.einsum("blkdf, bldf -> blfk", kerns, inps)
-
-        # --! split extracted parameters based on number of parameters required by each basis function
-        params = torch.split(params, list(self.funs.values()), dim=-1)
-
-        # --! measure nonlinear functions, or so-called embeddings, for the current slices of timeseries
-        #
-        # --! note that there is one single measurement of each function to describe
-        # --! a slice, so the granularity of the slicing plays an important a role
-        funs = torch.cat([self._meas_fun(fun, param) for fun, param in zip(self.funs.keys(), params)], dim=-1)
-
-        # --! reshape dimensions to go from a shape [B, 1, C, funs_n]
-        # --! to [B, 1, C * func_n]
-        #
-        # --! note that 1 denotes the currently iterated slice
-        return funs.reshape(funs.shape[0], funs.shape[1], -1)
-
-    def _predict_globally(self, funs, horizon):
-
-        # --! extract a matrix for global dynamics
-        #
-        # --! the matrix is unsqueezed to a shape [1, funs_n, funs_n] to allow
-        # --! broadcasting when multiplying with functions
-        timeseries_dyn_mat = torch.unsqueeze(self.timeseries_dyn.weight, 0)
-
-        # --! raise local attention matrices to powers covering all prediction horizon
-        #
-        # --! powered matrices are shaped as [B, H - 1, funs_n, funs_n], where H is the number of horizon steps
-        # --! and -1 is because we do not predict the first time step
-        #
-        # --! note that dynamics matrices are also transposed to allow multiplication with functions
-        timeseries_dyn_mat_powers = torch.stack([
-            torch.transpose(
-                torch.linalg.matrix_power(timeseries_dyn_mat, i), -2, -1) for i in range(1, horizon)], dim=1)
-
-        # --! extract the initial conditions of function time (per slice) trajectories
-        #
-        # --! the initial conditions (ic) are shaped as [B, 1, 1, funs_n] to allow tensor broadcasting
-        # --! when multiplying by dynamics matrices
-        funs_ic = torch.unsqueeze(funs[:, :1], -2)
-
-        # --! predict the global (per timeseries) evolution of functions by multiplying the initial conditions of
-        # --! their trajectories by powered dynamics matrices
-        #
-        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, funs_n], i.e.
-        # --! batches with functions trajectories consisting of inidividual function-points [1, funs_n]
-        funs_pred_global = torch.matmul(funs_ic, timeseries_dyn_mat_powers)
-
-        # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        return torch.squeeze(funs_pred_global, -2)
-
-    def _predict_locally(self, funs, horizon):
-
-        # --! encode function embeddings to learn which embedding, e.g. a sine,
-        # --! describes the current timeseries best, this embedding
-        # --! receives then the most attention
-        #
-        # --! input functions have a shape [B, T / kern_sz, funs_n], however
-        # --! the idea is to attend over functions, so we transpose
-        # --! the shape to [B, funs_n, T / kern_sz], such that
-        # --! function values represent the sequence,
-        # --! and timeseries slices - the features
-        funs_dyn = self.funs_dyn_enc(funs.transpose(1, 2))
-
-        # --! perform self-attention by passing the above encoder output as
-        # --! the query, key and value of an extra attention module
-        #
-        # --! this produces a square matrix [funs_n, funs_n] that can be
-        # --! used for prediction as a system matrix A
-        _, funs_dyn_mat = self.funs_dyn(funs_dyn, funs_dyn, funs_dyn)
-        self.funs_dyn_mat = funs_dyn_mat
-
-        # --! raise local attention matrices to powers covering all prediction horizon
-        #
-        # --! powered matrices are shaped as [B, H - 1, funs_n, funs_n], where H is the number of horizon steps
-        # --! and -1 is because we do not predict the first time step
-        #
-        # --! note that dynamics matrices are also transposed to allow multiplication with functions
-        # --! shaped as rows, i.e. [1, funs_n]
-        funs_dyn_mat_powers = torch.stack([
-            torch.transpose(
-                torch.linalg.matrix_power(funs_dyn_mat, i), -2, -1) for i in range(1, horizon)], dim=1)
-
-        # --! extract the initial conditions of function time (per slice) trajectories
-        #
-        # --! the initial conditions (ic) are shaped as [B, 1, 1, funs_n] to allow tensor broadcasting
-        # --! when multiplying by dynamics matrices
-        funs_ic = torch.unsqueeze(funs[:, :1], -2)
-
-        # --! predict the local (per slice) evolution of functions by multiplying the initial conditions of
-        # --! their trajectories by powered dynamics matrices
-        #
-        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, funs_n], i.e.
-        # --! batches with functions trajectories consisting of inidividual function-points [1, funs_n]
-        funs_pred_local = torch.matmul(funs_ic, funs_dyn_mat_powers)
-
-        # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        return torch.squeeze(funs_pred_local, -2)
 
     def _attention2entropy(self, attention):
 
@@ -396,39 +487,6 @@ class detune(torch.nn.Module):
         entropy = torch.clamp(entropy, 0.0, max_entropy)
         alpha = 1.0 - (entropy / max_entropy)  # inverse mapping
         return alpha * (high - low) + low
-
-    def _meas_fun(self, fun, param):
-        if fun == 'sin':
-            return self._meas_sin(param)
-        elif fun == 'cos':
-            return self._meas_cos(param)
-        elif fun == 'exp':
-            return self._meas_exp(param)
-        elif 'data' in fun:
-            return self._meas_data(param)
-        elif 'poly' in fun:
-            deg = utils.extract_poly_deg(fun)
-            return self._meas_poly(param, deg)
-        else:
-            raise Exception("unsupported basis function!")
-
-    def _meas_sin(self, params):
-        amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.sin(self.timeseries_timestep * freq)
-
-    def _meas_cos(self, params):
-        amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.cos(self.timeseries_timestep * freq)
-
-    def _meas_data(self, params):
-        return params
-
-    def _meas_exp(self, params):
-        power = params
-        return torch.exp(power)
-
-    def _meas_poly(self, params, deg):
-        return torch.sum(torch.cat([params**(i+1) for i in range(deg)], dim=-1), -1, keepdim=True)
 
     def _fit_embedding(self, timeseries, timeseries_recon):
 
@@ -452,11 +510,11 @@ class detune(torch.nn.Module):
 
 
 @dataclass
-class stationarity_config:
+class alpha_fun_config:
     kern_sz: int
 
 
-class stationarity_classifier(torch.nn.Module):
+class alpha_fun(torch.nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -494,4 +552,12 @@ class stationarity_classifier(torch.nn.Module):
         )
 
     def forward(self, timeseries):
-        return self.net(timeseries)
+        """
+        Forwards ``timeseries`` to the underlying convolutional neural network (CNN). The ``timeseries``
+        are expected to have a shape of [B, T, C], where B, T and C are the number of
+        batch elements, timesamples and data channels, respectively.
+        """
+        # --! when calling this network we transpose input timeseries to shape them as [C, T],
+        # --! because a convolutional neural network expects the number of
+        # --! time sample T to be the last dimension
+        return self.net(timeseries.transpose(-1, -2))

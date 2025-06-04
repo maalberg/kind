@@ -220,48 +220,34 @@ def scale_timeseries(timeseries):
 def train(model, parameters):
     """Trains a ``model`` with given ``parameters``."""
 
-    dataset_dir       = parameters['dataset_dir']
-    datafiles_train_n = parameters['train_files_n']
-    timeseries_len    = parameters['timeseries_sz']
-    bat_sz            = parameters['batch_sz']
-    epochs_n          = parameters['epochs_n']
-    x_len             = parameters['x_sz']
-    verbose           = parameters['is_verbose']
-    global_on         = parameters['is_global']
-    lr                = parameters['learn_rate']
-    weight_decay      = parameters['weight_decay']
-    alpha             = parameters['alpha']
+    dataset_dir           = parameters['dataset_dir']
+    train_nfile           = parameters['train_nfile']
+    timeseries_nsample    = parameters['timeseries_nsample']
+    x_len                 = parameters['subtimeseries_nsample']
+    alpha_fun             = parameters['alpha_fun']
+    batsize               = parameters['batsize']
+    nepoch                = parameters['nepoch']
+    isverbose             = parameters['isverbose']
+    isdmdonly             = parameters['isdmdonly']
+    lr                    = parameters['learn_rate']
+    weight_decay          = parameters['weight_decay']
 
-    if global_on:
+    if isdmdonly:
         # --! we train the global operator here, so freeze the local one
-        unfreeze_module(model.fun_params_kern_enc_g)
-        freeze_module(model.fun_params_kern_enc_l)
-
-        unfreeze_module(model.timeseries_dyn)
-        freeze_module(model.funs_dyn_enc)
-        freeze_module(model.funs_dyn)
-
-        unfreeze_module(model.dec_g)
-        freeze_module(model.dec_l)
+        model.operator_sta.unfreeze()
+        model.operator_dyn.freeze()
 
         # --! toggle the beta parameter defined in the paper
-        model.fit_weight_lin_global = 1.
-        model.fit_weight_lin_local  = 0.
+        model.fitweight_linearity_dmd = 1.
+        model.fitweight_linearity_transformer  = 0.
     else:
         # --! we train the local operator now, so freeze the global one
-        freeze_module(model.fun_params_kern_enc_g)
-        unfreeze_module(model.fun_params_kern_enc_l)
-
-        freeze_module(model.timeseries_dyn)
-        unfreeze_module(model.funs_dyn_enc)
-        unfreeze_module(model.funs_dyn)
-
-        freeze_module(model.dec_g)
-        unfreeze_module(model.dec_l)
+        model.operator_sta.freeze()
+        model.operator_dyn.unfreeze()
 
         # --! toggle the beta parameter defined in the paper
-        model.fit_weight_lin_global = 0.
-        model.fit_weight_lin_local  = 1.
+        model.fitweight_linearity_dmd = 0.
+        model.fitweight_linearity_transformer  = 1.
 
     # --! specify optimizer
     optimizer = torch.optim.Adam(
@@ -278,33 +264,35 @@ def train(model, parameters):
     loss_valid_lin_l = []
 
     # --! prepare validation dataset
-    data_valid    = read_datafile(f'{dataset_dir}/valid', timeseries_len)
+    data_valid    = read_datafile(f'{dataset_dir}/valid', timeseries_nsample)
     dataset_valid = torch.utils.data.TensorDataset(data_valid)
 
     # --! training duration
-    if verbose:
-        print(f"inf >> Number of data files for training : {datafiles_train_n}")
+    if isverbose:
+        print(f"inf >> Number of data files for training : {train_nfile}")
 
-    for datafile_train in range(datafiles_train_n):
-        if verbose:
-            print(f"inf >> processing training file number {datafile_train + 1}")
+    for train_i in range(train_nfile):
+        if isverbose:
+            print(f"inf >> processing training file number {train_i + 1}")
 
         # --! make training datasets and loaders
-        data_train = read_datafile(f'{dataset_dir}/train{datafile_train + 1}', timeseries_len)
+        data_train = read_datafile(f'{dataset_dir}/train{train_i + 1}', timeseries_nsample)
         dataset_train = torch.utils.data.TensorDataset(data_train)
-        dataloader_train = torch.utils.data.DataLoader(dataset_train, batch_size=bat_sz, shuffle=True)
+        dataloader_train = torch.utils.data.DataLoader(dataset_train, batch_size=batsize, shuffle=True)
 
         # --! train
-        for epoch in range(epochs_n):
+        for epoch in range(nepoch):
 
             # --! train neural networks
             for this, data in enumerate(dataloader_train):
                 x = data[0][:, :x_len, :1]
+                alpha = torch.unsqueeze(alpha_fun(x), -1) if alpha_fun is not None else torch.ones(x.shape[0], 1, 1)
+                alpha = torch.round(alpha)
 
                 optimizer.zero_grad()
 
                 # --! fit a model to training data
-                loss, loss_pred, loss_lin_g, loss_lin_l = model.fit(x, global_only=global_on, fixed_alpha=alpha)
+                loss, loss_pred, loss_lin_g, loss_lin_l = model.fit(x, alpha)
 
                 loss.backward()
                 optimizer.step()
@@ -316,12 +304,14 @@ def train(model, parameters):
 
             # --! validate results
             with torch.no_grad():
-                dataloader_valid = torch.utils.data.DataLoader(dataset_valid, batch_size=bat_sz, shuffle=False)
+                dataloader_valid = torch.utils.data.DataLoader(dataset_valid, batch_size=batsize, shuffle=False)
                 for data in dataloader_valid:
-                    x  = data[0][:, :x_len, :1] # take only displacement
+                    x = data[0][:, :x_len, :1]
+                    alpha = torch.unsqueeze(alpha_fun(x), -1) if alpha_fun is not None else torch.ones(x.shape[0], 1, 1)
 
                     # --! validate prediction
-                    outs = model(x, alpha=alpha)
+                    outs = model(x, alpha[:x.shape[0]])
+
                     funs_g          = outs[0]
                     funs_g_pred     = outs[1]
                     funs_l          = outs[2]
@@ -337,23 +327,24 @@ def train(model, parameters):
 def test(model, parameters):
     """Tests a ``model`` on ``parameters``."""
 
-    dataset_dir       = parameters['dataset_dir']
-    timeseries_len    = parameters['timeseries_sz']
-    bat_sz            = parameters['batch_sz']
-    x_len             = parameters['x_sz']
-    alpha             = parameters['alpha']
+    dataset_dir           = parameters['dataset_dir']
+    timeseries_nsample    = parameters['timeseries_nsample']
+    subtimeseries_nsample = parameters['subtimeseries_nsample']
+    batsize               = parameters['batsize']
+    alpha_fun             = parameters['alpha_fun']
 
     # --! make test datasets and loaders
-    data_test = read_datafile(f'{dataset_dir}/test', timeseries_len)
+    data_test = read_datafile(f'{dataset_dir}/test', timeseries_nsample)
     dataset_test = torch.utils.data.TensorDataset(data_test)
-    dataloader_test = torch.utils.data.DataLoader(dataset_test, batch_size=bat_sz, shuffle=False)
+    dataloader_test = torch.utils.data.DataLoader(dataset_test, batch_size=batsize, shuffle=False)
 
     loss_test_pred = []
 
     for data in dataloader_test:
-        x = data[0][:, :x_len, :1] # detuning is one-dimensional
+        x = data[0][:, :subtimeseries_nsample, :1]
+        alpha = torch.unsqueeze(alpha_fun(x), -1) if alpha_fun is not None else torch.ones(x.shape[0], 1, 1)
 
-        outs = model(x, alpha=alpha)
+        outs = model(x, alpha)
         funs_g          = outs[0]
         funs_g_pred     = outs[1]
         funs_l          = outs[2]
@@ -428,37 +419,37 @@ def disp_spectrum(eigvals):
     plt.show()
 
 
-def disp_spectrum_amps(model, dataset_dir, data_timeseries_sz, data_i):
+def disp_spectrum_amps(model, dataset_dir, timeseries_nsample, timeseries_pos):
     """
-    Displays the amplitudes of a ``model`` eigenvalues for data from ``dataset_dir`` indexed
-    by ``data_i``. Parameter ``data_timeseries_sz`` is needed to read ``dataset_dir``
+    Displays the amplitudes of a ``model`` eigenvalues for data from ``dataset_dir`` indexed by
+    ``timeseries_pos``. Parameter ``timeseries_nsample`` is needed to read ``dataset_dir``
     and extract proper timeseries. The displayed amplitudes are aligned
     with the corresponding ``model`` predictions.
     """
 
-    eigvals, eigvecs = torch.linalg.eig(model.timeseries_dyn.weight)
-    data_test        = read_datafile(f'{dataset_dir}/test', data_timeseries_sz)
-    x_len            = model.timeseries_sz
+    eigval, eigvec        = torch.linalg.eig(model.operator_sta.model.weight)
+    data_test             = read_datafile(f'{dataset_dir}/test', timeseries_nsample)
+    subtimeseries_nsample = model.timeseries_nsample
 
-    data_ic     = torch.unsqueeze(data_test[data_i][:model.fun_params_kern_sz, :1], 0)
-    funs_ic     = model._embed_functions_g(data_ic)
-    eigvecs_inv = torch.linalg.inv(eigvecs)
-    funs_ic     = torch.squeeze(funs_ic, 0)
-    eigvecs_inv = torch.squeeze(eigvecs_inv, 0)
-    funs_ic     = funs_ic.to(torch.cfloat)
-    b           = torch.matmul(eigvecs_inv, torch.transpose(funs_ic, 0, 1))
+    data_ic     = torch.unsqueeze(data_test[timeseries_pos][:model.param_kernsize, :1], 0)
+    fun_ic      = model.operator_sta.embed_fun(data_ic)
+    eigvec_inv  = torch.linalg.inv(eigvec)
+    fun_ic      = torch.squeeze(fun_ic, 0)
+    eigvec_inv  = torch.squeeze(eigvec_inv, 0)
+    fun_ic      = fun_ic.to(torch.cfloat)
+    b           = torch.matmul(eigvec_inv, torch.transpose(fun_ic, 0, 1))
     b           = b.abs()
     b_nums      = np.array([range(len(b[:, 0]))]).reshape(-1, 1) + 1.0
 
-    data        = data_test[data_i]
-    timeseries  = torch.unsqueeze(data[:x_len, :1], dim=0)
+    data        = data_test[timeseries_pos]
+    timeseries  = torch.unsqueeze(data[:subtimeseries_nsample, :1], dim=0)
     outs        = model(timeseries, alpha=1.0)
     timeseries_pred = outs[4]
     timeseries      = torch.squeeze(timeseries, dim=0)
     timeseries_pred = torch.squeeze(timeseries_pred, dim=0)
 
-    timestep = model.timeseries_timestep
-    t = np.arange(0., x_len*timestep, timestep).reshape(-1, 1)
+    timestep = model.timestep
+    t = np.arange(0., subtimeseries_nsample*timestep, timestep).reshape(-1, 1)
 
     plt.figure(figsize=(6,3))
 
@@ -491,8 +482,8 @@ def eval_model(model, dataset_dir, data_timeseries_sz, alphas, plot_attention=Fa
     data = read_datafile(f'{dataset_dir}/eval', data_timeseries_sz)
 
     # --! helping variables
-    x_len          = model.timeseries_sz
-    timestep       = model.timeseries_timestep
+    x_len          = model.timeseries_nsample
+    timestep       = model.timestep
     timeseries_dur = x_len * timestep
     indeces        = range(data.shape[0])
 
@@ -538,7 +529,7 @@ def eval_model(model, dataset_dir, data_timeseries_sz, alphas, plot_attention=Fa
             plt.legend()
             plt.tight_layout()
 
-            attention = torch.squeeze(model.funs_dyn_mat, 0)
+            attention = torch.squeeze(model.operator_dyn.model_mat_last, 0)
             entropy   = model._attention2entropy(attention)
             plt.subplot(1, 2, 2)
             plt.title(f'Entropy is {entropy:.2f}')
@@ -583,42 +574,35 @@ def label_stationarity(dmd_model, dmd_residual_max, dataset_dir, data_timeseries
     return labels
 
 
-def create_stationarity_dataset(dmd_model, dmd_residual_max, data_dirs, data_timeseries_sz, conv_ready=False):
+def create_stationarity_dataset(dmd_model, dmd_residual_max, data_dirs, timeseries_nsample):
     """
     Returns a dataset which contains a list of tuples. The size of this list corresponds to the sum of
     stationary and non-stationary data as read from file folders ``data_dirs``. The tuple
     then consists of timeseries and a label, where label=1.0 denotes stationary
     timeseries, and label=0.0 non-stantionary.
     """
-    labels_stationary    = label_stationarity(dmd_model, dmd_residual_max, data_dirs[0], data_timeseries_sz)
-    labels_nonstationary = label_stationarity(dmd_model, dmd_residual_max, data_dirs[1], data_timeseries_sz)
+    labels_stationary    = label_stationarity(dmd_model, dmd_residual_max, data_dirs[0], timeseries_nsample)
+    labels_nonstationary = label_stationarity(dmd_model, dmd_residual_max, data_dirs[1], timeseries_nsample)
 
     # --! convert boolean labels to floats
     labels_stationary    = labels_stationary.float()
     labels_nonstationary = labels_nonstationary.float()
 
-    data_stationary      = read_datafile(f'{data_dirs[0]}/test', data_timeseries_sz)
-    data_nonstationary   = read_datafile(f'{data_dirs[1]}/test', data_timeseries_sz)
+    data_stationary      = read_datafile(f'{data_dirs[0]}/test', timeseries_nsample)
+    data_nonstationary   = read_datafile(f'{data_dirs[1]}/test', timeseries_nsample)
 
     data   = torch.cat([data_stationary, data_nonstationary], dim=0)
     labels = torch.cat([labels_stationary, labels_nonstationary], dim=0)
 
-    if conv_ready:
-        # --! to facilitate the use of convolutional neural networks,
-        # --! we shape timeseries as (C, T), where C and T are
-        # --! the number of data channels and time samples,
-        # --! respectively
-        data = torch.transpose(data, -2, -1)
-
     return torch.utils.data.TensorDataset(data, labels)
 
 
-def train_classifier(model, dataset, parameters):
+def train_alpha_fun(model, dataset, parameters):
 
     epochs_n = parameters['epochs_n']
     lr       = parameters['learning_rate']
     wd       = parameters['weight_decay']
-    bat_sz   = parameters['batch_size']
+    batsize  = parameters['batsize']
 
     # --! stratify data splits to ensure the two data classes are equally represented in both splits
     labels = dataset[:][1]
@@ -627,14 +611,9 @@ def train_classifier(model, dataset, parameters):
     dataset_train = torch.utils.data.Subset(dataset, indices_train)
     dataset_valid = torch.utils.data.Subset(dataset, indices_valid)
 
-    # --! define split ratio and split the given dataset
-    #train_sz  = int(0.8 * len(dataset))
-    #valid_sz  = len(dataset) - train_sz
-    #dataset_train, dataset_valid = torch.utils.data.random_split(dataset, [train_sz, valid_sz])
-
     # --! create data loaders for training and validation datasets
-    dataloader_train = torch.utils.data.DataLoader(dataset_train, batch_size=bat_sz, shuffle=True)
-    dataloader_valid = torch.utils.data.DataLoader(dataset_valid, batch_size=bat_sz, shuffle=False)
+    dataloader_train = torch.utils.data.DataLoader(dataset_train, batch_size=batsize, shuffle=True)
+    dataloader_valid = torch.utils.data.DataLoader(dataset_valid, batch_size=batsize, shuffle=False)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
     loss_fn = torch.nn.BCELoss()
