@@ -220,28 +220,26 @@ class operator_dyn(operator):
         embed_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
         self.embed_enc = utils.fcnn(features=[embed_enc_ni, 64, 64, embed_enc_no], act_fn_hidden='relu')
 
-        # --! number of input features for an adaptive correction encoder which acts on a slice level
-        #
-        # --! as features, this encoder gets timeseries slices, so the idea is to pass
-        # --! a trace of function embeddings to the encoder
-        corr_enc_ni = self.timeseries_nsample // self.param_kernsize
+        # --! encoder network, which produces adaptation context, acts along the sequence of function
+        # --! values, but its features are the number of these embedding functions
+        adapt_enc_ni = nfun
 
-        # --! adaptive corrections are implemented in terms of a Transformer network
-        self.corr_enc = torch.nn.TransformerEncoder(
+        # --! the encoder of adaptation context is implemented in terms of a Transformer network
+        self.adapt_enc = torch.nn.TransformerEncoder(
             torch.nn.TransformerEncoderLayer(
-                d_model=corr_enc_ni, nhead=1, dim_feedforward=128, batch_first=True),
+                d_model=adapt_enc_ni, nhead=1, dim_feedforward=128, batch_first=True),
             num_layers=3,
             enable_nested_tensor=False)
 
-        # --! an extra self-attention module serves as a model that describes the evolution of slices
-        self.model = torch.nn.MultiheadAttention(embed_dim=corr_enc_ni, num_heads=1, batch_first=True)
+        # --! an additional MLP-based neural network to generate linear time-varying matrices from
+        # --! encoded adaptation context; these matrices enable piecewise-linear
+        # --! predictions of embedding sequences
+        self.model_from = utils.fcnn(features=[nfun, 64, 64, nfun*nfun], act_fn_hidden='relu')
 
         # --! create an MLP-based decoder to decode embeddings back to timeseries
         dec_ni   = nfun * self.timeseries_ndim
         dec_no   = self.param_kernsize * self.timeseries_ndim
         self.dec = utils.fcnn(features=[dec_ni, 64, 64, dec_no], act_fn_hidden='relu')
-
-        self.model_mat_last = None
 
     def embed_fun(self, timeseries):
 
@@ -298,35 +296,28 @@ class operator_dyn(operator):
 
     def predict(self, fun, horizon):
 
-        # --! encode function embeddings as local corrections by learning which embedding, e.g. a sine,
-        # --! describes the current timeseries best, this embedding
-        # --! receives then the most attention
-        #
-        # --! input functions have a shape [B, T / kernsize, nfun], however
-        # --! the idea is to attend over functions, so we transpose
-        # --! the shape to [B, nfun, T / kernsize], such that
-        # --! function values represent the sequence,
-        # --! and timeseries slices - the features
-        corr = self.corr_enc(fun.transpose(1, 2))
+        batsize = fun.shape[0]
+        nfun    = fun.shape[-1]
 
-        # --! perform self-attention by passing the above encoded correction as
-        # --! the query, key and value of an extra self-attention module
+        # --! encode adaptation context in the sequence of function values
         #
-        # --! this produces a square matrix [nfun, nfun] that can be
-        # --! used for prediction as a system matrix A
-        _, model_mat = self.model(corr, corr, corr)
-        self.model_mat_last = model_mat
+        # --! functions, which are shaped as [B, S, F] are encoded to a shape of [B, S, C],
+        # --! where B and S are the number of batch elements batsize and sequence steps,
+        # --! and where F and C are the number of functions nfun and
+        # --! context channels, respectively
+        adapt = torch.split(self.adapt_enc(fun), 1, dim=1)
 
-        # --! stack together matrices raised to powers to cover all prediction horizon
+        # --! using context for each sequence step, produce a sequence of linear time-varying matrices
+        # --! that locally adapt to changes in dynamics
+        mat = torch.cat([
+            self.model_from(context).reshape(batsize, 1, nfun, nfun).transpose(-2, -1) for context in adapt], dim=1)
+
+        # --! accumulate matrix products to enable predictions, such as z2 = A1*z1, z3 = A2*A1*z1, etc,
+        # --! where zi are our embeddings, and where Ai are linear time-varying matrices
         #
-        # --! powered matrices are shaped as [B, H - 1, nfun, nfun], where H is the number of horizon steps
-        # --! and -1 is because we do not predict the first time step
-        #
-        # --! note that dynamics matrices are also transposed to allow multiplication with functions
-        # --! shaped as rows, i.e. [1, nfun]
-        mat_power = torch.stack([
-            torch.transpose(
-                torch.linalg.matrix_power(model_mat, power), -2, -1) for power in range(1, horizon)], dim=1)
+        # --! we omit the last matrix in the sequence An, because there is no way to check the correctness
+        # --! of the corresponding forecasted result z{n+1}
+        mat = torch.cumprod(mat[:, :-1], dim=1)
 
         # --! extract the initial conditions of function values, i.e. the first slice
         #
@@ -339,21 +330,21 @@ class operator_dyn(operator):
         #
         # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun], i.e.
         # --! batches with functions trajectories consisting of inidividual function-points [1, nfun]
-        fun_predict = torch.matmul(fun_ic, mat_power)
+        fun_predict = torch.matmul(fun_ic, mat)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
         return torch.squeeze(fun_predict, -2)
 
     def freeze(self):
         utils.freeze_module(self.embed_enc)
-        utils.freeze_module(self.corr_enc)
-        utils.freeze_module(self.model)
+        utils.freeze_module(self.adapt_enc)
+        utils.freeze_module(self.model_from)
         utils.freeze_module(self.dec)
 
     def unfreeze(self):
         utils.unfreeze_module(self.embed_enc)
-        utils.unfreeze_module(self.corr_enc)
-        utils.unfreeze_module(self.model)
+        utils.unfreeze_module(self.adapt_enc)
+        utils.unfreeze_module(self.model_from)
         utils.unfreeze_module(self.dec)
 
 

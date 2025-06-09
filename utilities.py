@@ -286,7 +286,7 @@ def train(model, parameters):
             # --! train neural networks
             for this, data in enumerate(dataloader_train):
                 x = data[0][:, :x_len, :1]
-                alpha = torch.unsqueeze(alpha_fun(x), -1) if alpha_fun is not None else torch.ones(x.shape[0], 1, 1)
+                alpha = torch.zeros(x.shape[0], 1, 1) if alpha_fun is not None else torch.ones(x.shape[0], 1, 1)
                 alpha = torch.round(alpha)
 
                 optimizer.zero_grad()
@@ -307,7 +307,7 @@ def train(model, parameters):
                 dataloader_valid = torch.utils.data.DataLoader(dataset_valid, batch_size=batsize, shuffle=False)
                 for data in dataloader_valid:
                     x = data[0][:, :x_len, :1]
-                    alpha = torch.unsqueeze(alpha_fun(x), -1) if alpha_fun is not None else torch.ones(x.shape[0], 1, 1)
+                    alpha = torch.zeros(x.shape[0], 1, 1) if alpha_fun is not None else torch.ones(x.shape[0], 1, 1)
 
                     # --! validate prediction
                     outs = model(x, alpha[:x.shape[0]])
