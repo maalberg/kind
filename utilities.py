@@ -471,13 +471,11 @@ def disp_spectrum_amps(model, dataset_dir, timeseries_nsample, timeseries_pos):
     plt.show()
 
 
-def eval_model(model, dataset_dir, data_timeseries_sz, alphas, plot_attention=False):
+def eval_model(model, dataset_dir, data_timeseries_sz, alphas):
     """
     Evaluates a ``model`` on data from a folder named ``dataset_dir``. Data read from
     that folder is split into timeseries according to ``data_timeseries_sz``.
     When calling the ``model``, it is parameterized by ``alphas``.
-    Also, attention is plotted along model predictions if
-    parameter ``plot_attention`` is set to True.
     """
     data = read_datafile(f'{dataset_dir}/eval', data_timeseries_sz)
 
@@ -504,39 +502,15 @@ def eval_model(model, dataset_dir, data_timeseries_sz, alphas, plot_attention=Fa
         t = np.arange(0., data_timeseries_sz*timestep, timestep).reshape(-1, 1)
         t = t + i*timeseries_dur
 
-        if not plot_attention:
-
-            # --! plot prediction result
-            plt.figure(figsize=(3,3))
-            plt.plot(t[:x_len, 0], timeseries[:x_len, 0], alpha=0.8, color='tab:green', label='$x$')
-            plt.plot(t[:x_len, 0], timeseries_pred[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
-            plt.xlabel('Time [s]')
-            plt.ylabel('Amplitude')
-            plt.legend()
-            plt.tight_layout()
-            plt.show()
-
-        else:
-
-            plt.figure(figsize=(6,3))
-
-            plt.subplot(1, 2, 1)
-            plt.title('Model response')
-            plt.plot(t[:x_len, 0], timeseries[:x_len, 0], alpha=0.8, color='tab:green', label='$x$')
-            plt.plot(t[:x_len, 0], timeseries_pred[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
-            plt.xlabel('Time [s]')
-            plt.ylabel('Amplitude')
-            plt.legend()
-            plt.tight_layout()
-
-            attention = torch.squeeze(model.operator_dyn.model_mat_last, 0)
-            entropy   = model._attention2entropy(attention)
-            plt.subplot(1, 2, 2)
-            plt.title(f'Entropy is {entropy:.2f}')
-            sns.heatmap(attention, cmap='coolwarm', annot=True, fmt='.1f')
-            plt.tight_layout()
-
-            plt.show()
+        # --! plot prediction result
+        plt.figure(figsize=(3,3))
+        plt.plot(t[:x_len, 0], timeseries[:x_len, 0], alpha=0.8, color='tab:green', label='$x$')
+        plt.plot(t[:x_len, 0], timeseries_pred[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
+        plt.xlabel('Time [s]')
+        plt.ylabel('Amplitude')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
 
 
 def extract_poly_deg(polynomial: str='poly_1'):
