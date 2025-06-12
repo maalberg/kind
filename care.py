@@ -22,19 +22,28 @@ class operator(torch.nn.Module, interface):
         self.param_kernsize        = config.param_kernsize
 
     @abstractmethod
-    def embed_fun(self, timeseries):
+    def embed(self, timeseries):
+        """Embeds ``timeseries`` as functions of a latent space."""
         return
 
     @abstractmethod
-    def predict(self, fun, horizon):
+    def predict(self, functions):
+        """Predicts ``functions`` embedded in a latent space."""
+        return
+
+    @abstractmethod
+    def forward(self, timeseries):
+        """Predicts given ``timeseries`` based on an embedded function space."""
         return
 
     @abstractmethod
     def freeze(self):
+        """Makes trainable submodules fixed, untrainable."""
         return
 
     @abstractmethod
     def unfreeze(self):
+        """Makes trainable submodules trainable again."""
         return
 
     def _eval_fun(self, fun, param):
@@ -103,7 +112,7 @@ class operator_sta(operator):
         dec_no   = self.param_kernsize * self.timeseries_ndim
         self.dec = utils.fcnn(features=[dec_ni, 64, 64, dec_no], act_fn_hidden='relu')
 
-    def embed_fun(self, timeseries):
+    def embed(self, timeseries):
 
         # --! reshape timeseries to form an input to embeddings encoder
         #
@@ -156,7 +165,9 @@ class operator_sta(operator):
         # --! note that 1 denotes the currently iterated slice
         return fun.reshape(fun.shape[0], fun.shape[1], -1)
 
-    def predict(self, fun, horizon):
+    def predict(self, functions):
+
+        horizon = functions.shape[1]
 
         # --! extract the matrix of stationary dynamics
         #
@@ -178,7 +189,7 @@ class operator_sta(operator):
         #
         # --! the initial conditions (ic) are shaped as [B, 1, 1, nfun] to allow tensor broadcasting
         # --! when multiplying by dynamics matrices
-        fun_ic = torch.unsqueeze(fun[:, :1], -2)
+        fun_ic = torch.unsqueeze(functions[:, :1], -2)
 
         # --! predict the stationary evolution of function values by multiplying their initial conditions
         # --! by powered dynamics matrices
@@ -189,6 +200,23 @@ class operator_sta(operator):
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
         return torch.squeeze(fun_predict, -2)
+
+    def forward(self, timeseries):
+        fun         = self.embed(timeseries)
+        fun_predict = self.predict(fun)
+
+        # --! concatenate an initial condiction of a function with its predicted part to get a full trajectory
+        fun_predict = torch.cat([fun[:, :1], fun_predict], dim=1)
+
+        # --! decode predicted embeddings to timeseries
+        #
+        # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
+        # --! so we reshape the decoded timeseries back to their
+        # --! original shape [B, T, C]
+        timeseries_predict = self.dec(fun_predict)
+        timeseries_predict = timeseries_predict.reshape(timeseries_predict.shape[0], -1, self.timeseries_ndim)
+
+        return timeseries_predict, fun, fun_predict
 
     def freeze(self):
         utils.freeze_module(self.enc)
@@ -241,7 +269,7 @@ class operator_dyn(operator):
         dec_no   = self.param_kernsize * self.timeseries_ndim
         self.dec = utils.fcnn(features=[dec_ni, 64, 64, dec_no], act_fn_hidden='relu')
 
-    def embed_fun(self, timeseries):
+    def embed(self, timeseries):
 
         # --! reshape timeseries to form an input to embeddings encoder
         #
@@ -294,10 +322,11 @@ class operator_dyn(operator):
         # --! note that 1 denotes the currently iterated slice
         return fun.reshape(fun.shape[0], fun.shape[1], -1)
 
-    def predict(self, fun, horizon):
+    def predict(self, functions):
 
-        batsize = fun.shape[0]
-        nfun    = fun.shape[-1]
+        batsize = functions.shape[0]
+        horizon = functions.shape[1]
+        nfun    = functions.shape[-1]
 
         # --! encode adaptation context in the sequence of function values
         #
@@ -305,7 +334,7 @@ class operator_dyn(operator):
         # --! where B and S are the number of batch elements batsize and sequence steps,
         # --! and where F and C are the number of functions nfun and
         # --! context channels, respectively
-        adapt = torch.split(self.adapt_enc(fun), 1, dim=1)
+        adapt = torch.split(self.adapt_enc(functions), 1, dim=1)
 
         # --! using context for each sequence step, produce a sequence of linear time-varying matrices
         # --! that locally adapt to changes in dynamics
@@ -323,7 +352,7 @@ class operator_dyn(operator):
         #
         # --! the initial conditions (ic) are shaped as [B, 1, 1, nfun] to allow tensor broadcasting
         # --! when multiplying by dynamics matrices
-        fun_ic = torch.unsqueeze(fun[:, :1], -2)
+        fun_ic = torch.unsqueeze(functions[:, :1], -2)
 
         # --! predict the stationary evolution of function values by multiplying their initial conditions
         # --! by powered dynamics matrices
@@ -334,6 +363,23 @@ class operator_dyn(operator):
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
         return torch.squeeze(fun_predict, -2)
+
+    def forward(self, timeseries):
+        fun         = self.embed(timeseries)
+        fun_predict = self.predict(fun)
+
+        # --! concatenate an initial condiction of a function with its predicted part to get a full trajectory
+        fun_predict = torch.cat([fun[:, :1], fun_predict], dim=1)
+
+        # --! decode predicted embeddings to timeseries
+        #
+        # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
+        # --! so we reshape the decoded timeseries back to their
+        # --! original shape [B, T, C]
+        timeseries_predict = self.dec(fun_predict)
+        timeseries_predict = timeseries_predict.reshape(timeseries_predict.shape[0], -1, self.timeseries_ndim)
+
+        return timeseries_predict, fun, fun_predict
 
     def freeze(self):
         utils.freeze_module(self.embed_enc)
@@ -401,103 +447,47 @@ class detuning(torch.nn.Module):
         self.fitweight_linearity_transformer = 0.0
 
     def fit(self, timeseries, alpha):
+        """Fits internal neural networks to predict given ``timeseries``."""
 
-        outs = self.forward(timeseries, alpha)
+        o = self.forward(timeseries, alpha)
 
-        funs_g          = outs[0]
-        funs_g_pred     = outs[1]
-        funs_l          = outs[2]
-        funs_l_pred     = outs[3]
-        timeseries_pred = outs[4]
+        timeseries_predict = o[0]
+        sta_fun            = o[1]
+        sta_fun_predict    = o[2]
+        dyn_fun            = o[3]
+        dyn_fun_predict    = o[4]
 
-        loss_pred   = self._fit_prediction(timeseries, timeseries_pred)
+        loss_predict       = self._fit_prediction(timeseries, timeseries_predict)
 
-        loss_lin_g  = self.fitweight_linearity_dmd * self._fit_linearity_g(funs_g, funs_g_pred)
-        loss_lin_l  = self.fitweight_linearity_transformer * self._fit_linearity_l(funs_l, funs_l_pred)
+        loss_lin_sta       = self.fitweight_linearity_dmd * self._fit_linearity(sta_fun, sta_fun_predict)
+        loss_lin_dyn       = self.fitweight_linearity_transformer * self._fit_linearity(dyn_fun, dyn_fun_predict)
 
-        loss = loss_pred + loss_lin_g + loss_lin_l
-        return loss, loss_pred, loss_lin_g, loss_lin_l
+        loss = loss_predict + loss_lin_sta + loss_lin_dyn
+        return loss, loss_predict, loss_lin_sta, loss_lin_dyn
 
     def forward(self, timeseries, alpha):
+        """Predicts given ``timeseries``."""
 
-        timesteps_dim = 1
-        timesteps_n   = timeseries.shape[timesteps_dim]
+        if timeseries.shape[1] % self.param_kernsize:
+            raise Exception('the size of timeseries is not a multiple of a kernel size')
 
-        if timesteps_n % self.param_kernsize:
-            print('err >> the size of input timeseries is not a multiple of a filter size')
-            return
+        sta_timeseries_predict, sta_fun, sta_fun_predict = self.operator_sta(timeseries)
+        dyn_timeseries_predict, dyn_fun, dyn_fun_predict = self.operator_dyn(timeseries)
 
-        # --! derive nonlinear function embeddings for given timeseries, such that
-        # --! the output embeddings are shaped as [B, T / kern_sz = number of slices, funs_n]
-        funs_g = self.operator_sta.embed_fun(timeseries)
-        funs_l = self.operator_dyn.embed_fun(timeseries)
+        # --! blend predicted timeseries using alpha
+        timeseries_predict = alpha * sta_timeseries_predict + (1 - alpha) * dyn_timeseries_predict
 
-        # --! we take the number of timeseries slices as a prediction horizon
-        horizon = funs_g.shape[1]
-
-        # --! perform global and local predictions
-        funs_g_pred = self.operator_sta.predict(funs_g, horizon)
-        funs_l_pred = self.operator_dyn.predict(funs_l, horizon)
-
-        # --! concatenate predicted parts with initial condictions to get full trajectories
-        funs_g_pred = torch.cat([funs_g[:, :1], funs_g_pred], dim=1)
-        funs_l_pred = torch.cat([funs_l[:, :1], funs_l_pred], dim=1)
-
-        #timeseries_pred_g  = self.dec_g(funs_g_pred)
-        timeseries_pred_g  = self.operator_sta.dec(funs_g_pred)
-        timeseries_pred_g  = timeseries_pred_g.reshape(timeseries_pred_g.shape[0], -1, self.timeseries_ndim)
-
-        timeseries_pred_l  = self.operator_dyn.dec(funs_l_pred)
-        timeseries_pred_l  = timeseries_pred_l.reshape(timeseries_pred_l.shape[0], -1, self.timeseries_ndim)
-
-        # --! we use addition operation to combine the global and local predictions
-        timeseries_pred = alpha * timeseries_pred_g + (1 - alpha) * timeseries_pred_l
-
-        # --! predicted embeddings are decoded back to timeseries
-        #
-        # --! and since timeseries are reconstructed as rows their shape is [B, C, T],
-        # --! but the input timeseries are shaped as columns,
-        # --! so reshape the reconstructed ones
-
-        return funs_g, funs_g_pred, funs_l, funs_l_pred, timeseries_pred
-
-    def _attention2entropy(self, attention):
-
-        # --! to prevent log(0) we add a small offset to given attention matrix values
-        epsilon   = 1e-10
-        attention = attention + epsilon
-
-        # --! we compute entropy inside attention rows, i.e. inside queries
-        query_entropy = -torch.sum(attention * torch.log(attention), dim=-1)
-
-        # --! computed query entropies are averaged
-        return torch.mean(query_entropy)
-
-    def _entropy2alpha(self, entropy, low=0.0, high=1.0, max_entropy=1.4):
-
-        entropy = torch.clamp(entropy, 0.0, max_entropy)
-        alpha = 1.0 - (entropy / max_entropy)  # inverse mapping
-        return alpha * (high - low) + low
-
-    def _fit_embedding(self, timeseries, timeseries_recon):
-
-        loss_fn = torch.nn.MSELoss(reduction='mean')
-        return loss_fn(timeseries_recon, timeseries)
+        return timeseries_predict, sta_fun, sta_fun_predict, dyn_fun, dyn_fun_predict
 
     def _fit_prediction(self, timeseries, timeseries_pred):
 
         loss_fn = torch.nn.MSELoss(reduction='mean')
         return loss_fn(timeseries_pred, timeseries)
 
-    def _fit_linearity_g(self, funs, funs_pred):
+    def _fit_linearity(self, fun, fun_predict):
 
-        loss_fn = torch.nn.MSELoss(reduction='mean')
-        return loss_fn(funs_pred, funs)
-
-    def _fit_linearity_l(self, funs, funs_pred):
-
-        loss_fn = torch.nn.MSELoss(reduction='mean')
-        return loss_fn(funs_pred, funs)
+        loss_fun = torch.nn.MSELoss(reduction='mean')
+        return loss_fun(fun_predict, fun)
 
 
 @dataclass

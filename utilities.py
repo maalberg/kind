@@ -310,16 +310,16 @@ def train(model, parameters):
                     alpha = torch.zeros(x.shape[0], 1, 1) if alpha_fun is not None else torch.ones(x.shape[0], 1, 1)
 
                     # --! validate prediction
-                    outs = model(x, alpha[:x.shape[0]])
+                    o = model(x, alpha[:x.shape[0]])
 
-                    funs_g          = outs[0]
-                    funs_g_pred     = outs[1]
-                    funs_l          = outs[2]
-                    funs_l_pred     = outs[3]
-                    timeseries_pred = outs[4]
-                    loss_valid_pred.append(torch.mean((x - timeseries_pred)**2))
-                    loss_valid_lin_g.append(torch.mean((funs_g - funs_g_pred)**2))
-                    loss_valid_lin_l.append(torch.mean((funs_l - funs_l_pred)**2))
+                    timeseries_predict = o[0]
+                    sta_fun            = o[1]
+                    sta_fun_predict    = o[2]
+                    dyn_fun            = o[3]
+                    dyn_fun_predict    = o[4]
+                    loss_valid_pred.append(torch.mean((x - timeseries_predict)**2))
+                    loss_valid_lin_g.append(torch.mean((sta_fun - sta_fun_predict)**2))
+                    loss_valid_lin_l.append(torch.mean((dyn_fun - dyn_fun_predict)**2))
 
     return loss_train_pred, loss_train_lin_g, loss_train_lin_l, loss_valid_pred, loss_valid_lin_g, loss_valid_lin_l
 
@@ -338,21 +338,17 @@ def test(model, parameters):
     dataset_test = torch.utils.data.TensorDataset(data_test)
     dataloader_test = torch.utils.data.DataLoader(dataset_test, batch_size=batsize, shuffle=False)
 
-    loss_test_pred = []
+    loss_test_predict = []
 
     for data in dataloader_test:
         x = data[0][:, :subtimeseries_nsample, :1]
         alpha = torch.unsqueeze(alpha_fun(x), -1) if alpha_fun is not None else torch.ones(x.shape[0], 1, 1)
 
-        outs = model(x, alpha)
-        funs_g          = outs[0]
-        funs_g_pred     = outs[1]
-        funs_l          = outs[2]
-        funs_l_pred     = outs[3]
-        timeseries_pred = outs[4]
-        loss_test_pred.append(torch.mean((x - timeseries_pred)**2))
+        o                   = model(x, alpha)
+        timeseries_predict  = o[0]
+        loss_test_predict.append(torch.mean((x - timeseries_predict)**2))
 
-    return loss_test_pred
+    return loss_test_predict
 
 
 def disp_dataset(dataset_dir, timeseries_sz, timestep, data_n=3):
@@ -432,7 +428,7 @@ def disp_spectrum_amps(model, dataset_dir, timeseries_nsample, timeseries_pos):
     subtimeseries_nsample = model.timeseries_nsample
 
     data_ic     = torch.unsqueeze(data_test[timeseries_pos][:model.param_kernsize, :1], 0)
-    fun_ic      = model.operator_sta.embed_fun(data_ic)
+    fun_ic      = model.operator_sta.embed(data_ic)
     eigvec_inv  = torch.linalg.inv(eigvec)
     fun_ic      = torch.squeeze(fun_ic, 0)
     eigvec_inv  = torch.squeeze(eigvec_inv, 0)
@@ -443,10 +439,10 @@ def disp_spectrum_amps(model, dataset_dir, timeseries_nsample, timeseries_pos):
 
     data        = data_test[timeseries_pos]
     timeseries  = torch.unsqueeze(data[:subtimeseries_nsample, :1], dim=0)
-    outs        = model(timeseries, alpha=1.0)
-    timeseries_pred = outs[4]
-    timeseries      = torch.squeeze(timeseries, dim=0)
-    timeseries_pred = torch.squeeze(timeseries_pred, dim=0)
+    o                  = model(timeseries, alpha=1.0)
+    timeseries_predict = o[0]
+    timeseries         = torch.squeeze(timeseries, dim=0)
+    timeseries_predict = torch.squeeze(timeseries_predict, dim=0)
 
     timestep = model.timestep
     t = np.arange(0., subtimeseries_nsample*timestep, timestep).reshape(-1, 1)
@@ -463,7 +459,7 @@ def disp_spectrum_amps(model, dataset_dir, timeseries_nsample, timeseries_pos):
     plt.subplot(1, 2, 2)
     plt.title('Model response')
     plt.plot(t[:, 0], timeseries[:, 0], alpha=0.8, color='tab:green', label='$x$')
-    plt.plot(t[:, 0], timeseries_pred[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
+    plt.plot(t[:, 0], timeseries_predict[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
     plt.xlabel('Time [s]')
     plt.legend()
     plt.tight_layout()
@@ -491,12 +487,12 @@ def eval_model(model, dataset_dir, data_timeseries_sz, alphas):
     for i, timeseries, alpha in zip(indeces, timeseries_array, alphas):
 
         # --! call the model
-        outs = model(timeseries, alpha=alpha)
-        timeseries_pred = outs[4]
+        o = model(timeseries, alpha=alpha)
+        timeseries_predict = o[0]
 
         # --! remove the batch dimension
         timeseries = torch.squeeze(timeseries, dim=0)
-        timeseries_pred = torch.squeeze(timeseries_pred, dim=0)
+        timeseries_predict = torch.squeeze(timeseries_predict, dim=0)
 
         # --! create a time vector
         t = np.arange(0., data_timeseries_sz*timestep, timestep).reshape(-1, 1)
@@ -505,7 +501,7 @@ def eval_model(model, dataset_dir, data_timeseries_sz, alphas):
         # --! plot prediction result
         plt.figure(figsize=(3,3))
         plt.plot(t[:x_len, 0], timeseries[:x_len, 0], alpha=0.8, color='tab:green', label='$x$')
-        plt.plot(t[:x_len, 0], timeseries_pred[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
+        plt.plot(t[:x_len, 0], timeseries_predict[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
         plt.xlabel('Time [s]')
         plt.ylabel('Amplitude')
         plt.legend()
@@ -538,10 +534,10 @@ def label_stationarity(dmd_model, dmd_residual_max, dataset_dir, data_timeseries
         timeseries = torch.unsqueeze(timeseries, 0)
 
         # --! predict timeseries
-        outs = dmd_model(timeseries, alpha=1.0)
-        timeseries_pred = outs[4]
+        o = dmd_model(timeseries, alpha=1.0)
+        timeseries_predict = o[0]
 
-        residual = torch.mean((timeseries - timeseries_pred)**2)
+        residual = torch.mean((timeseries - timeseries_predict)**2)
         label = True if residual < dmd_residual_max else False
         labels[this] = label
 
