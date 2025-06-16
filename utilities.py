@@ -47,48 +47,52 @@ class fcnn(torch.nn.Module):
     """
     A fully-connected neural network.
     """
-    def __init__(self, features: list[int]=[1, 16 , 1], act_fn_hidden: str='relu', act_fn_out: str='linear') -> None:
+    def __init__(self, feat: list[int]=[1, 16 , 1], actfun_hid: str='relu', actfun_o: str='linear') -> None:
         """
-        Constructs a fully-connected neural network with specified ``features`` and ``activation``.
+        Constructs a fully-connected neural network with specified features ``feat`` and
+        activation functions ``actfun_hid`` and ``actfun_o``.
 
-        The ``features`` define the number of neurons in the network layers, e.g. a list
+        The features define the number of neurons in the network layers, e.g. a list
         of integers [1, 16, 1] describes a network that accepts a one-dimensional
         input, the network has one hidden layer with 16 neurons, and the
         network produces a one-dimensional output.
 
-        The ``act_fn_hidden`` is a string name for activation functions, e.g. a string 'relu'
-        translates into the torch class torch.nn.ReLU. The network will have one
-        single ``act_fn_hidden`` everywhere, except for an output layer -
-        this one can be specified using ``act_fn_out``. Currently
-        supported activation strings/functions are:
+        The ``actfun_hid`` is a string name for activation functions in hidden layers,
+        e.g. a string 'relu' translates into the torch class torch.nn.ReLU.
+        The network will have the same ``actfun_hid`` in all hidden
+        layers. For an output layer the activation function is
+        specified using ``actfun_o``.
+        
+        Currently supported activation strings/functions are:
         'relu'    torch.nn.ReLU
         'tanh'    torch.nn.Tanh
+        'sigmoid' torch.nn.Sigmoid
         'linear'  torch.nn.Identity
         """
         super().__init__()
 
         # use a helper constant to define the number of hidden layers
-        hidden_n = len(features) - 2
+        nhid = len(feat) - 2
 
         # assemble a list of activation functions;
         # note that the number of hidden layers is incremented to accomodate the output layer,
         # so as long as we are counting hidden layers, these are set to user-specified
         # activation, but when we reach the output layer, it is set to user-defined string
-        activations = [act_fn_hidden if i < hidden_n else act_fn_out for i in range(hidden_n + 1)]
+        actfun = [actfun_hid if i < nhid else actfun_o for i in range(nhid + 1)]
 
         # construct a neural network;
         # note that the bias of all layers, the output included, is set to true
         self.net = torch.nn.Sequential(*[
             torch.nn.Sequential(*[
-                torch.nn.Linear(i, o, bias=True), self.get_activation_by_name(a)]) for i, o, a in zip(
-                    features[:-1], features[1:], activations)])
+                torch.nn.Linear(i, o, bias=True), self._get_actfun(a)]) for i, o, a in zip(
+                    feat[:-1], feat[1:], actfun)])
 
     def forward(self, data: torch.Tensor) -> torch.Tensor:
         """Evaluates this neural network on ``data``."""
         return self.net(data)
 
     @staticmethod
-    def get_activation_by_name(name: str):
+    def _get_actfun(name: str):
         """
         Maps a string ``name`` that specifyes an activation function to a corresponding torch class object.
         """
@@ -260,6 +264,8 @@ def train(model, parameters):
     loss_train_lin_g = []
     loss_train_lin_l = []
     loss_valid_pred  = []
+    loss_valid_sta_mu = []
+    valid_sta_sigma = []
     loss_valid_lin_g = []
     loss_valid_lin_l = []
 
@@ -310,18 +316,30 @@ def train(model, parameters):
                     alpha = torch.zeros(x.shape[0], 1, 1) if alpha_fun is not None else torch.ones(x.shape[0], 1, 1)
 
                     # --! validate prediction
-                    o = model(x, alpha[:x.shape[0]])
+                    model_o = model(x, alpha[:x.shape[0]])
 
-                    timeseries_predict = o[0]
-                    sta_fun            = o[1]
-                    sta_fun_predict    = o[2]
-                    dyn_fun            = o[3]
-                    dyn_fun_predict    = o[4]
+                    timeseries_predict          = model_o[0]
+                    sta_timeseries_predict_mu   = model_o[1]
+                    sta_timseries_predict_sigma = model_o[2]
+                    sta_fun                     = model_o[3]
+                    sta_fun_predict             = model_o[4]
+                    dyn_fun                     = model_o[5]
+                    dyn_fun_predict             = model_o[6]
                     loss_valid_pred.append(torch.mean((x - timeseries_predict)**2))
+                    loss_valid_sta_mu.append(torch.mean((x - sta_timeseries_predict_mu)**2))
+                    valid_sta_sigma.append(torch.mean(sta_timseries_predict_sigma))
                     loss_valid_lin_g.append(torch.mean((sta_fun - sta_fun_predict)**2))
                     loss_valid_lin_l.append(torch.mean((dyn_fun - dyn_fun_predict)**2))
 
-    return loss_train_pred, loss_train_lin_g, loss_train_lin_l, loss_valid_pred, loss_valid_lin_g, loss_valid_lin_l
+    o = (
+        loss_train_pred,
+        loss_train_lin_g, loss_train_lin_l,
+        loss_valid_pred,
+        loss_valid_lin_g, loss_valid_lin_l,
+        loss_valid_sta_mu, valid_sta_sigma
+    )
+
+    return o
 
 
 def test(model, parameters):
@@ -351,17 +369,18 @@ def test(model, parameters):
     return loss_test_predict
 
 
-def disp_dataset(dataset_dir, timeseries_sz, timestep, data_n=3):
+def disp_dataset(datadir, timeseries_nsample, timestep, ndata=3):
     """
-    Displays metrics of a dataset located in a folder named ``dataset_dir``. The size of timeseries
-    stored in this dataset is defined by ``timeseries_sz``. The ``timestep`` that was used
-    when sampling the timeseries helps create time vectors for plotting.
+    Displays metrics of a dataset located in a folder named ``datadir``. The size of timeseries
+    stored in this dataset is defined by ``timeseries_nsample``. The ``timestep`` that
+    was used when sampling the timeseries helps create time vectors for plotting.
+    Finally, the number of timeseries to display is specified by ``ndata``.
     """
 
     # --! read data from files
-    data_train = read_datafile(f'{dataset_dir}/train1', timeseries_sz)
-    data_valid = read_datafile(f'{dataset_dir}/valid', timeseries_sz)
-    data_test = read_datafile(f'{dataset_dir}/test', timeseries_sz)
+    data_train = read_datafile(f'{datadir}/train1', timeseries_nsample)
+    data_valid = read_datafile(f'{datadir}/valid', timeseries_nsample)
+    data_test = read_datafile(f'{datadir}/test', timeseries_nsample)
 
     # --! compile dataset parameters
     data_table = [
@@ -379,10 +398,10 @@ def disp_dataset(dataset_dir, timeseries_sz, timestep, data_n=3):
         print(f'{row[0]:>8} {row[1]:>8} {row[2]:>18} {row[3]:>8}')
     print('')
 
-    t = torch.linspace(0., timestep*timeseries_sz, timeseries_sz)
+    t = torch.linspace(0., timestep*timeseries_nsample, timeseries_nsample)
     zero = torch.zeros_like(t)
 
-    for i in range(data_n):
+    for i in range(ndata):
         data = data_train[i]
 
         plt.figure(figsize=(3, 3))
@@ -439,74 +458,112 @@ def disp_spectrum_amps(model, dataset_dir, timeseries_nsample, timeseries_pos):
 
     data        = data_test[timeseries_pos]
     timeseries  = torch.unsqueeze(data[:subtimeseries_nsample, :1], dim=0)
-    o                  = model(timeseries, alpha=1.0)
-    timeseries_predict = o[0]
-    timeseries         = torch.squeeze(timeseries, dim=0)
-    timeseries_predict = torch.squeeze(timeseries_predict, dim=0)
+    o           = model(timeseries, alpha=1.0)
+
+    sta_timeseries_predict_mu    = o[1]
+    sta_timeseries_predict_sigma = o[2]
+    timeseries                   = torch.squeeze(timeseries, dim=0)
+    sta_timeseries_predict_mu    = torch.squeeze(sta_timeseries_predict_mu, dim=0)
+    sta_timeseries_predict_sigma = torch.squeeze(sta_timeseries_predict_sigma, dim=0)
+
+    sta_timeseries_predict_sigma = torch.exp(sta_timeseries_predict_sigma) + 1e-6
+
+    var_max = torch.max(sta_timeseries_predict_sigma)
+    var_max = 0.1 if var_max < 0.1 else var_max
 
     timestep = model.timestep
     t = np.arange(0., subtimeseries_nsample*timestep, timestep).reshape(-1, 1)
 
-    plt.figure(figsize=(6,3))
+    plt.figure(figsize=(9,3))
 
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, 3, 1)
     plt.title('Mode amplitudes')
     plt.bar(b_nums[:, 0], b[:, 0])
     plt.xlabel('Mode index')
     plt.ylabel('Amplitude')
     plt.tight_layout()
 
-    plt.subplot(1, 2, 2)
+    plt.subplot(1, 3, 2)
     plt.title('Model response')
     plt.plot(t[:, 0], timeseries[:, 0], alpha=0.8, color='tab:green', label='$x$')
-    plt.plot(t[:, 0], timeseries_predict[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
+    plt.plot(t[:, 0], sta_timeseries_predict_mu[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
     plt.xlabel('Time [s]')
+    plt.legend()
+    plt.tight_layout()
+
+    plt.subplot(1, 3, 3)
+    plt.title('Uncertainty')
+    plt.plot(t[:, 0], sta_timeseries_predict_sigma[:, 0], alpha=1, color='tab:blue', label='$\\sigma^2$')
+    plt.xlabel('Time [s]')
+    plt.ylim((0., var_max))
     plt.legend()
     plt.tight_layout()
 
     plt.show()
 
 
-def eval_model(model, dataset_dir, data_timeseries_sz, alphas):
+def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
     """
-    Evaluates a ``model`` on data from a folder named ``dataset_dir``. Data read from
-    that folder is split into timeseries according to ``data_timeseries_sz``.
-    When calling the ``model``, it is parameterized by ``alphas``.
+    Evaluates a ``model`` on data from a folder named ``datadir``. Data read from
+    that folder is split into timeseries according to ``timeseries_nsample``.
+    When calling the ``model``, it is parameterized by ``alpha``.
     """
-    data = read_datafile(f'{dataset_dir}/eval', data_timeseries_sz)
+    data = read_datafile(f'{datadir}/eval', timeseries_nsample)
 
     # --! helping variables
-    x_len          = model.timeseries_nsample
-    timestep       = model.timestep
-    timeseries_dur = x_len * timestep
-    indeces        = range(data.shape[0])
+    subtimeseries_nsample = model.timeseries_nsample
+    timestep              = model.timestep
+    timeseries_dur        = subtimeseries_nsample * timestep
+    indeces               = range(data.shape[0])
 
     # --! data is a batch/array with timeseries, so split it along the batch dimension
-    timeseries_array = torch.split(data, 1, dim=0)
+    timeseries = torch.split(data, 1, dim=0)
 
-    for i, timeseries, alpha in zip(indeces, timeseries_array, alphas):
+    for k, x, a in zip(indeces, timeseries, alpha):
 
         # --! call the model
-        o = model(timeseries, alpha=alpha)
-        timeseries_predict = o[0]
+        o = model(x, a)
+
+        mean    = o[1]
+        logvar  = o[2]
 
         # --! remove the batch dimension
-        timeseries = torch.squeeze(timeseries, dim=0)
-        timeseries_predict = torch.squeeze(timeseries_predict, dim=0)
+        x       = torch.squeeze(x, dim=0)
+        mean    = torch.squeeze(mean, dim=0)
+        logvar  = torch.squeeze(logvar, dim=0)
+
+        var = torch.exp(logvar) + 1e-6
 
         # --! create a time vector
-        t = np.arange(0., data_timeseries_sz*timestep, timestep).reshape(-1, 1)
-        t = t + i*timeseries_dur
+        t = np.arange(0., timeseries_dur, timestep).reshape(-1, 1)
+        t = t + k*timeseries_dur
 
         # --! plot prediction result
-        plt.figure(figsize=(3,3))
-        plt.plot(t[:x_len, 0], timeseries[:x_len, 0], alpha=0.8, color='tab:green', label='$x$')
-        plt.plot(t[:x_len, 0], timeseries_predict[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\hat{x}$')
+        plt.figure(figsize=(6, 3))
+
+        plt.subplot(1, 2, 1)
+        plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, 0], alpha=0.8, color='tab:green', label='$x$')
+        plt.plot(t[:subtimeseries_nsample, 0], mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
         plt.xlabel('Time [s]')
         plt.ylabel('Amplitude')
         plt.legend()
         plt.tight_layout()
+
+        var_max = torch.max(var)
+        var_max = 0.1 if var_max < 0.1 else var_max
+
+        plt.subplot(1, 2, 2)
+        plt.plot(t[:subtimeseries_nsample, 0], var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$')
+        plt.xlabel('Time [s]')
+        plt.ylim((0., var_max))
+        plt.legend()
+        plt.tight_layout()
+
         plt.show()
+
+        if datasaved:
+            savedata = np.expand_dims(np.concatenate([t, x, mean, var], axis=1), 0)
+            write_datafile(f'savedata/statest_sim{k}', savedata, delim=' ')
 
 
 def extract_poly_deg(polynomial: str='poly_1'):
