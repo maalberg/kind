@@ -524,7 +524,7 @@ def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
         # --! call the model
         o = model(x, a)
 
-        mean    = o[1]
+        mean    = o[0]
         logvar  = o[2]
 
         # --! remove the batch dimension

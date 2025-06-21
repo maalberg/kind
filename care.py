@@ -448,6 +448,151 @@ class detuning_config:
     param_kernsize: int
 
 
+class detuning_fitphase(interface):
+
+    def __init__(self, model):
+        super().__init__()
+
+        self.model = model
+
+    @abstractmethod
+    def enter(self):
+        return
+
+    @abstractmethod
+    def run(self, timeseries):
+        return
+
+    @abstractmethod
+    def next(self) -> bool:
+        return
+
+
+class detuning_nofit(detuning_fitphase):
+
+    def __init__(self, model):
+        super().__init__(model)
+
+    def enter(self):
+        return
+
+    def run(self, timeseries):
+        return None
+
+    def next(self):
+        self.model._set_fitphase(self.model._get_fitphase_sta_mean())
+        self.model._get_fitphase().enter()
+        return True
+
+
+class detuning_stafit_mean(detuning_fitphase):
+
+    def __init__(self, model):
+        super().__init__(model)
+
+    def enter(self):
+        print("inf >> training: entering stationary mean phase")
+
+        self.model.operator_dyn.freeze_mean()
+
+        self.model.operator_sta.unfreeze()
+        self.model.operator_sta.freeze_var()
+
+    def run(self, timeseries):
+        o = self.model.forward(timeseries, 1.0)
+
+        timeseries_predict           = o[0]
+        sta_timeseries_predict_mean  = o[1]
+        sta_timeseries_predict_var   = o[2]
+        dyn_timeseries_predict       = o[3]
+        sta_fun                      = o[4]
+        sta_fun_predict              = o[5]
+        dyn_fun                      = o[6]
+        dyn_fun_predict              = o[7]
+
+        loss_dmd = self.model._fit_prediction(timeseries, sta_timeseries_predict_mean)
+        loss_lin = self.model._fit_linearity(sta_fun, sta_fun_predict)
+
+        loss = loss_dmd + loss_lin
+
+        return loss, loss_dmd, loss_lin, 0.
+
+    def next(self):
+        self.model._set_fitphase(self.model._get_fitphase_sta_var())
+        self.model._get_fitphase().enter()
+        return True
+
+class detuning_stafit_var(detuning_fitphase):
+
+    def __init__(self, model):
+        super().__init__(model)
+
+    def enter(self):
+        print("inf >> training: entering stationary variance phase")
+
+        self.model.operator_dyn.freeze_mean()
+
+        self.model.operator_sta.unfreeze()
+        self.model.operator_sta.freeze_mean()
+
+    def run(self, timeseries):
+        o = self.model.forward(timeseries, 1.0)
+
+        timeseries_predict           = o[0]
+        sta_timeseries_predict_mean  = o[1]
+        sta_timeseries_predict_var   = o[2]
+        dyn_timeseries_predict       = o[3]
+        sta_fun                      = o[4]
+        sta_fun_predict              = o[5]
+        dyn_fun                      = o[6]
+        dyn_fun_predict              = o[7]
+
+        loss_dmd = self.model._fit_sta(timeseries, sta_timeseries_predict_mean, sta_timeseries_predict_var)
+
+        loss = loss_dmd
+        return loss, loss_dmd, 0., 0.
+
+    def next(self):
+        self.model._set_fitphase(self.model._get_fitphase_dyn())
+        self.model._get_fitphase().enter()
+        return True
+
+
+class detuning_dynfit(detuning_fitphase):
+
+    def __init__(self, model):
+        super().__init__(model)
+
+    def enter(self):
+        print("inf >> training: entering dynamic phase")
+        self.model.operator_dyn.unfreeze()
+
+        self.model.operator_sta.freeze_mean()
+        self.model.operator_sta.freeze_var()
+
+    def run(self, timeseries):
+        o = self.model.forward(timeseries, 0.)
+
+        timeseries_predict           = o[0]
+        sta_timeseries_predict_mean  = o[1]
+        sta_timeseries_predict_var   = o[2]
+        dyn_timeseries_predict       = o[3]
+        sta_fun                      = o[4]
+        sta_fun_predict              = o[5]
+        dyn_fun                      = o[6]
+        dyn_fun_predict              = o[7]
+
+        loss_transformer = self.model._fit_prediction(timeseries, dyn_timeseries_predict)
+        loss_lin = self.model._fit_linearity(dyn_fun, dyn_fun_predict)
+
+        loss = loss_transformer + loss_lin
+
+        return loss, loss_transformer, 0., loss_lin
+
+    def next(self):
+        return False
+
+
 class detuning(torch.nn.Module):
     """
     Models detuning of a cavity resonance as predictive one-dimensional timeseries.
@@ -464,34 +609,18 @@ class detuning(torch.nn.Module):
         self.operator_sta = operator_sta(config)
         self.operator_dyn = operator_dyn(config)
 
-        self.fitweight_linearity_dmd = 0.0
-        self.fitweight_linearity_transformer = 0.0
+        self._fitphase_sta_mean = detuning_stafit_mean(self)
+        self._fitphase_sta_var  = detuning_stafit_var(self)
+        self._fitphase_dyn      = detuning_dynfit(self)
+        self._fitphase          = detuning_nofit(self)
 
-    def fit(self, timeseries, alpha, sta_varloss = False):
+    def fit_next(self):
+        return self._fitphase.next()
+
+    def fit(self, timeseries):
         """Fits internal neural networks to predict given ``timeseries``."""
 
-        o = self.forward(timeseries, alpha)
-
-        timeseries_predict           = o[0]
-        sta_timeseries_predict_mean  = o[1]
-        sta_timeseries_predict_var   = o[2]
-        sta_fun                      = o[3]
-        sta_fun_predict              = o[4]
-        dyn_fun                      = o[5]
-        dyn_fun_predict              = o[6]
-
-        if sta_varloss:
-            loss_dmd = self._fit_sta(timeseries, sta_timeseries_predict_mean, sta_timeseries_predict_var)
-        else:
-            loss_dmd = self._fit_prediction(timeseries, sta_timeseries_predict_mean)
-
-        #loss_predict       = self._fit_prediction(timeseries, timeseries_predict)
-
-        loss_lin_sta       = self.fitweight_linearity_dmd * self._fit_linearity(sta_fun, sta_fun_predict)
-        loss_lin_dyn       = self.fitweight_linearity_transformer * self._fit_linearity(dyn_fun, dyn_fun_predict)
-
-        loss = loss_dmd + loss_lin_sta + loss_lin_dyn
-        return loss, loss_dmd, loss_lin_sta, loss_lin_dyn
+        return self._fitphase.run(timeseries)
 
     def forward(self, timeseries, alpha):
         """Predicts given ``timeseries``."""
@@ -503,11 +632,12 @@ class detuning(torch.nn.Module):
         dyn_timeseries_predict, dyn_fun, dyn_fun_predict = self.operator_dyn(timeseries)
 
         # --! blend predicted timeseries using alpha
-        timeseries_predict = alpha * sta_timeseries_predict_mean# + (1 - alpha) * dyn_timeseries_predict
+        timeseries_predict = alpha * sta_timeseries_predict_mean + (1 - alpha) * dyn_timeseries_predict
 
         o = (
             timeseries_predict,
             sta_timeseries_predict_mean, sta_timeseries_predict_var,
+            dyn_timeseries_predict,
             sta_fun, sta_fun_predict,
             dyn_fun, dyn_fun_predict
         )
@@ -530,6 +660,21 @@ class detuning(torch.nn.Module):
 
         loss_fun = torch.nn.MSELoss(reduction='mean')
         return loss_fun(fun_predict, fun)
+
+    def _get_fitphase_sta_mean(self):
+        return self._fitphase_sta_mean
+
+    def _get_fitphase_sta_var(self):
+        return self._fitphase_sta_var
+
+    def _get_fitphase_dyn(self):
+        return self._fitphase_dyn
+
+    def _get_fitphase(self):
+        return self._fitphase
+
+    def _set_fitphase(self, phase):
+        self._fitphase = phase
 
 
 @dataclass
