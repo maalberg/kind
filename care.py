@@ -448,7 +448,8 @@ class detuning_config:
     param_kernsize: int
 
 
-class detuning_fitphase(interface):
+class fit_phase(interface):
+    """Manages a certain phase of an operator fit procedure."""
 
     def __init__(self, model):
         super().__init__()
@@ -465,10 +466,14 @@ class detuning_fitphase(interface):
 
     @abstractmethod
     def next(self) -> bool:
+        """
+        Transitions to the next phase provided it is available.
+        Returns True if the transition takes place, returns False otherwise.
+        """
         return
 
 
-class detuning_nofit(detuning_fitphase):
+class phase_idle(fit_phase):
 
     def __init__(self, model):
         super().__init__(model)
@@ -480,18 +485,18 @@ class detuning_nofit(detuning_fitphase):
         return None
 
     def next(self):
-        self.model._set_fitphase(self.model._get_fitphase_sta_mean())
-        self.model._get_fitphase().enter()
+        self.model._set_phase(self.model._get_phase_sta_mean())
+        self.model._get_phase().enter()
         return True
 
 
-class detuning_stafit_mean(detuning_fitphase):
+class phase_sta_mean(fit_phase):
 
     def __init__(self, model):
         super().__init__(model)
 
     def enter(self):
-        print("inf >> training: entering stationary mean phase")
+        print("inf >> fit: entering stationary mean phase")
 
         self.model.operator_dyn.freeze_mean()
 
@@ -518,17 +523,18 @@ class detuning_stafit_mean(detuning_fitphase):
         return loss, loss_dmd, loss_lin, 0.
 
     def next(self):
-        self.model._set_fitphase(self.model._get_fitphase_sta_var())
-        self.model._get_fitphase().enter()
+        self.model._set_phase(self.model._get_phase_sta_var())
+        self.model._get_phase().enter()
         return True
 
-class detuning_stafit_var(detuning_fitphase):
+
+class phase_sta_var(fit_phase):
 
     def __init__(self, model):
         super().__init__(model)
 
     def enter(self):
-        print("inf >> training: entering stationary variance phase")
+        print("inf >> fit: entering stationary variance phase")
 
         self.model.operator_dyn.freeze_mean()
 
@@ -553,18 +559,18 @@ class detuning_stafit_var(detuning_fitphase):
         return loss, loss_dmd, 0., 0.
 
     def next(self):
-        self.model._set_fitphase(self.model._get_fitphase_dyn())
-        self.model._get_fitphase().enter()
+        self.model._set_phase(self.model._get_phase_dyn())
+        self.model._get_phase().enter()
         return True
 
 
-class detuning_dynfit(detuning_fitphase):
+class phase_dyn(fit_phase):
 
     def __init__(self, model):
         super().__init__(model)
 
     def enter(self):
-        print("inf >> training: entering dynamic phase")
+        print("inf >> fit: entering dynamic phase")
         self.model.operator_dyn.unfreeze()
 
         self.model.operator_sta.freeze_mean()
@@ -609,18 +615,18 @@ class detuning(torch.nn.Module):
         self.operator_sta = operator_sta(config)
         self.operator_dyn = operator_dyn(config)
 
-        self._fitphase_sta_mean = detuning_stafit_mean(self)
-        self._fitphase_sta_var  = detuning_stafit_var(self)
-        self._fitphase_dyn      = detuning_dynfit(self)
-        self._fitphase          = detuning_nofit(self)
+        self._phase_sta_mean = phase_sta_mean(self)
+        self._phase_sta_var  = phase_sta_var(self)
+        self._phase_dyn      = phase_dyn(self)
+        self._phase          = phase_idle(self)
 
     def fit_next(self):
-        return self._fitphase.next()
+        return self._phase.next()
 
     def fit(self, timeseries):
         """Fits internal neural networks to predict given ``timeseries``."""
 
-        return self._fitphase.run(timeseries)
+        return self._phase.run(timeseries)
 
     def forward(self, timeseries, alpha):
         """Predicts given ``timeseries``."""
@@ -661,20 +667,20 @@ class detuning(torch.nn.Module):
         loss_fun = torch.nn.MSELoss(reduction='mean')
         return loss_fun(fun_predict, fun)
 
-    def _get_fitphase_sta_mean(self):
-        return self._fitphase_sta_mean
+    def _get_phase_sta_mean(self):
+        return self._phase_sta_mean
 
-    def _get_fitphase_sta_var(self):
-        return self._fitphase_sta_var
+    def _get_phase_sta_var(self):
+        return self._phase_sta_var
 
-    def _get_fitphase_dyn(self):
-        return self._fitphase_dyn
+    def _get_phase_dyn(self):
+        return self._phase_dyn
 
-    def _get_fitphase(self):
-        return self._fitphase
+    def _get_phase(self):
+        return self._phase
 
-    def _set_fitphase(self, phase):
-        self._fitphase = phase
+    def _set_phase(self, phase):
+        self._phase = phase
 
 
 @dataclass
