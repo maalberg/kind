@@ -454,40 +454,50 @@ class fit_phase(interface):
     def __init__(self, model):
         super().__init__()
 
+        # --! reference to model that we fit
         self.model = model
 
-    @abstractmethod
-    def enter(self):
-        return
+        # --! create placeholders for phase parameters
+        self.timeseries_nsample    = None
+        self.subtimeseries_nsample = None
+        self.train_nfile           = None
+        self.nepoch                = None
+        self.batsize               = None
+        self.alphafun              = None
+        self.learnrate             = None
+        self.weightdecay           = None
+        self.isverbose             = None
+
+        self.datadir               = None
 
     @abstractmethod
-    def run(self, timeseries):
+    def enter(self, param):
+        """Enters this phase and parameterizes it using ``param``."""
+
+        # --! initialize phase parameters
+        self.timeseries_nsample    = param['timeseries_nsample']
+        self.subtimeseries_nsample = param['subtimeseries_nsample']
+        self.train_nfile           = param['train_nfile']
+        self.nepoch                = param['nepoch']
+        self.batsize               = param['batsize']
+        self.alphafun              = param['alphafun']
+        self.learnrate             = param['learnrate']
+        self.weightdecay           = param['weightdecay']
+        self.isverbose             = param['isverbose']
+
+    @abstractmethod
+    def compute_loss(self, timeseries):
+        """Use given ``timeseries`` to compute the loss of this fit phase."""
         return
 
     @abstractmethod
     def next(self) -> bool:
         """
-        Transitions to the next phase provided it is available.
-        Returns True if the transition takes place, returns False otherwise.
+        Transitions to the next phase, provided it is available.
+        Returns True if the transition takes place,
+        returns False otherwise.
         """
         return
-
-
-class phase_idle(fit_phase):
-
-    def __init__(self, model):
-        super().__init__(model)
-
-    def enter(self):
-        return
-
-    def run(self, timeseries):
-        return None
-
-    def next(self):
-        self.model._set_phase(self.model._get_phase_sta_mean())
-        self.model._get_phase().enter()
-        return True
 
 
 class phase_sta_mean(fit_phase):
@@ -495,15 +505,19 @@ class phase_sta_mean(fit_phase):
     def __init__(self, model):
         super().__init__(model)
 
-    def enter(self):
+    def enter(self, param):
         print("inf >> fit: entering stationary mean phase")
+
+        super().enter(param)
 
         self.model.operator_dyn.freeze_mean()
 
         self.model.operator_sta.unfreeze()
         self.model.operator_sta.freeze_var()
 
-    def run(self, timeseries):
+        self.datadir = param['stadatadir']
+
+    def compute_loss(self, timeseries):
         o = self.model.forward(timeseries, 1.0)
 
         timeseries_predict           = o[0]
@@ -524,7 +538,6 @@ class phase_sta_mean(fit_phase):
 
     def next(self):
         self.model._set_phase(self.model._get_phase_sta_var())
-        self.model._get_phase().enter()
         return True
 
 
@@ -533,15 +546,19 @@ class phase_sta_var(fit_phase):
     def __init__(self, model):
         super().__init__(model)
 
-    def enter(self):
+    def enter(self, param):
         print("inf >> fit: entering stationary variance phase")
+
+        super().enter(param)
 
         self.model.operator_dyn.freeze_mean()
 
         self.model.operator_sta.unfreeze()
         self.model.operator_sta.freeze_mean()
 
-    def run(self, timeseries):
+        self.datadir = param['mixdatadir']
+
+    def compute_loss(self, timeseries):
         o = self.model.forward(timeseries, 1.0)
 
         timeseries_predict           = o[0]
@@ -560,7 +577,6 @@ class phase_sta_var(fit_phase):
 
     def next(self):
         self.model._set_phase(self.model._get_phase_dyn())
-        self.model._get_phase().enter()
         return True
 
 
@@ -569,14 +585,19 @@ class phase_dyn(fit_phase):
     def __init__(self, model):
         super().__init__(model)
 
-    def enter(self):
+    def enter(self, param):
         print("inf >> fit: entering dynamic phase")
+
+        super().enter(param)
+
         self.model.operator_dyn.unfreeze()
 
         self.model.operator_sta.freeze_mean()
         self.model.operator_sta.freeze_var()
 
-    def run(self, timeseries):
+        self.datadir = param['transdatadir']
+
+    def compute_loss(self, timeseries):
         o = self.model.forward(timeseries, 0.)
 
         timeseries_predict           = o[0]
@@ -618,15 +639,63 @@ class detuning(torch.nn.Module):
         self._phase_sta_mean = phase_sta_mean(self)
         self._phase_sta_var  = phase_sta_var(self)
         self._phase_dyn      = phase_dyn(self)
-        self._phase          = phase_idle(self)
+        self._phase          = self._phase_sta_mean
 
     def fit_next(self):
         return self._phase.next()
 
-    def fit(self, timeseries):
-        """Fits internal neural networks to predict given ``timeseries``."""
+    def fit(self, param):
 
-        return self._phase.run(timeseries)
+        # --! first of all, enter the current fit phase to initialize required parameters
+        self._phase.enter(param)
+
+        # --! prepare test data
+        testdata    = utils.read_datafile(f'{self._phase.datadir}/valid', self._phase.timeseries_nsample)
+        testdataset = torch.utils.data.TensorDataset(testdata)
+
+        # --! specify an optimizer for fit
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, self.parameters()),
+            lr=self._phase.learnrate,
+            weight_decay=self._phase.weightdecay)
+
+        trainloss_predict    = []
+        trainloss_sta_lin    = []
+        trainloss_dyn_lin    = []
+
+        # --! training duration
+        if self._phase.isverbose: print(f"inf >> number of data files for training is {self._phase.train_nfile}")
+
+        for ifile in range(self._phase.train_nfile):
+            if self._phase.isverbose: print(f"inf >> processing training file number {ifile + 1}")
+
+            # --! prepare training data
+            traindata     = utils.read_datafile(f'{self._phase.datadir}/train{ifile + 1}', self._phase.timeseries_nsample)
+            traindataset  = torch.utils.data.TensorDataset(traindata)
+            traindatafun  = torch.utils.data.DataLoader(traindataset, batch_size=self._phase.batsize, shuffle=True)
+
+            # --! train
+            for epoch in range(self._phase.nepoch):
+                for data in traindatafun:
+                    timeseries = data[0][:, :self._phase.subtimeseries_nsample, :1]
+                    optimizer.zero_grad()
+
+                    # --! fit a model to training time series
+                    loss, loss_predict, loss_lin_g, loss_lin_l = self._phase.compute_loss(timeseries)
+
+                    loss.backward()
+                    optimizer.step()
+
+                    with torch.no_grad():
+                        trainloss_predict.append(loss_predict)
+                        trainloss_sta_lin.append(loss_lin_g)
+                        trainloss_dyn_lin.append(loss_lin_l)
+
+        o = (
+            trainloss_predict,
+            trainloss_sta_lin, trainloss_dyn_lin
+        )
+        return o
 
     def forward(self, timeseries, alpha):
         """Predicts given ``timeseries``."""
