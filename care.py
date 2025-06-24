@@ -499,6 +499,18 @@ class fit_phase(interface):
         """
         return
 
+    def _compute_varloss(self, timeseries, timeseries_predict_mean, timeseries_predict_var):
+        logvar = torch.clamp(timeseries_predict_var, min=-5, max=5)
+        var    = torch.exp(logvar) + 1e-6
+
+        loss_fun = torch.nn.GaussianNLLLoss()
+        return loss_fun(timeseries_predict_mean, timeseries, var)
+
+    def _compute_meanloss(self, timeseries, timeseries_pred):
+
+        loss_fn = torch.nn.MSELoss(reduction='mean')
+        return loss_fn(timeseries_pred, timeseries)
+
 
 class phase_sta_mean(fit_phase):
 
@@ -518,19 +530,10 @@ class phase_sta_mean(fit_phase):
         self.datadir = param['stadatadir']
 
     def compute_loss(self, timeseries):
-        o = self.model.forward(timeseries, 1.0)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self.model.operator_sta(timeseries)
 
-        timeseries_predict           = o[0]
-        sta_timeseries_predict_mean  = o[1]
-        sta_timeseries_predict_var   = o[2]
-        dyn_timeseries_predict       = o[3]
-        sta_fun                      = o[4]
-        sta_fun_predict              = o[5]
-        dyn_fun                      = o[6]
-        dyn_fun_predict              = o[7]
-
-        loss_dmd = self.model._fit_prediction(timeseries, sta_timeseries_predict_mean)
-        loss_lin = self.model._fit_linearity(sta_fun, sta_fun_predict)
+        loss_dmd = self._compute_meanloss(timeseries, timeseries_predict_mean)
+        loss_lin = self._compute_meanloss(fun, fun_predict)
 
         loss = loss_dmd + loss_lin
 
@@ -559,21 +562,11 @@ class phase_sta_var(fit_phase):
         self.datadir = param['mixdatadir']
 
     def compute_loss(self, timeseries):
-        o = self.model.forward(timeseries, 1.0)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self.model.operator_sta(timeseries)
 
-        timeseries_predict           = o[0]
-        sta_timeseries_predict_mean  = o[1]
-        sta_timeseries_predict_var   = o[2]
-        dyn_timeseries_predict       = o[3]
-        sta_fun                      = o[4]
-        sta_fun_predict              = o[5]
-        dyn_fun                      = o[6]
-        dyn_fun_predict              = o[7]
+        loss = self._compute_varloss(timeseries, timeseries_predict_mean, timeseries_predict_var)
 
-        loss_dmd = self.model._fit_sta(timeseries, sta_timeseries_predict_mean, sta_timeseries_predict_var)
-
-        loss = loss_dmd
-        return loss, loss_dmd, 0., 0.
+        return loss, loss, 0., 0.
 
     def next(self):
         self.model._set_phase(self.model._get_phase_dyn())
@@ -598,19 +591,10 @@ class phase_dyn(fit_phase):
         self.datadir = param['transdatadir']
 
     def compute_loss(self, timeseries):
-        o = self.model.forward(timeseries, 0.)
+        timeseries_predict, fun, fun_predict = self.model.operator_dyn(timeseries)
 
-        timeseries_predict           = o[0]
-        sta_timeseries_predict_mean  = o[1]
-        sta_timeseries_predict_var   = o[2]
-        dyn_timeseries_predict       = o[3]
-        sta_fun                      = o[4]
-        sta_fun_predict              = o[5]
-        dyn_fun                      = o[6]
-        dyn_fun_predict              = o[7]
-
-        loss_transformer = self.model._fit_prediction(timeseries, dyn_timeseries_predict)
-        loss_lin = self.model._fit_linearity(dyn_fun, dyn_fun_predict)
+        loss_transformer = self._compute_meanloss(timeseries, timeseries_predict)
+        loss_lin = self._compute_meanloss(fun, fun_predict)
 
         loss = loss_transformer + loss_lin
 
@@ -718,23 +702,6 @@ class detuning(torch.nn.Module):
         )
 
         return o
-
-    def _fit_sta(self, timeseries, timeseries_predict_mean, timeseries_predict_var):
-        logvar = torch.clamp(timeseries_predict_var, min=-5, max=5)
-        var    = torch.exp(logvar) + 1e-6
-
-        loss_fun = torch.nn.GaussianNLLLoss()
-        return loss_fun(timeseries_predict_mean, timeseries, var)
-
-    def _fit_prediction(self, timeseries, timeseries_pred):
-
-        loss_fn = torch.nn.MSELoss(reduction='mean')
-        return loss_fn(timeseries_pred, timeseries)
-
-    def _fit_linearity(self, fun, fun_predict):
-
-        loss_fun = torch.nn.MSELoss(reduction='mean')
-        return loss_fun(fun_predict, fun)
 
     def _get_phase_sta_mean(self):
         return self._phase_sta_mean
