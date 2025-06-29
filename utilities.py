@@ -110,24 +110,27 @@ class fcnn(torch.nn.Module):
         return a()
 
 
-def sample_timeseries(rng, sample_sz, timeseries_sz, timeseries_i, *timeseries_array):
+def sample_timeseries(rng, nsample, timeseries_nsample, this_timeseries, *timeseries_bank):
     """
-    Randomly samples timeseries of size ``sample_sz`` from given ``timeseries_array``. The array
-    ``timeseries_array`` is indexed using ``timeseries_i``. Timeseries in ``timeseries_array``
-    are expected to be shaped as one-dimensional arrays [T],
+    Randomly samples timeseries of size ``nsample`` from given ``timeseries_bank``. The array
+    ``timeseries_bank`` is indexed using ``this_timeseries``. Timeseries in ``timeseries_bank``
+    are expected to be shaped as column vectors [T, 1],
     where T is the number of timesteps.
     """
 
     # --! select current timeseries
-    timeseries = timeseries_array[timeseries_i]
+    timeseries = timeseries_bank[this_timeseries]
 
     # --! randomly locate a suitable sample region inside selected timeseries
-    sample_start = int((timeseries_sz - sample_sz) * rng.random())
-    sample_end   = sample_start + sample_sz
-    sample       = timeseries[sample_start:sample_end, np.newaxis]
+    sample_start = int((timeseries_nsample - nsample) * rng.random())
+    sample_end   = sample_start + nsample
+    sample       = timeseries[sample_start:sample_end, :1]
 
-    # --! return a sample with mean removed
-    return sample - np.mean(sample, axis=0, keepdims=True)
+    # --! remove the mean of this sample and scale it between -1 and 1
+    sample       = sample - np.mean(sample, axis=0, keepdims=True)
+    sample       = scale_timeseries(sample[:, 0])
+
+    return sample
 
 
 def next_timeseries_i(file_timeseries_i, timeseries_n):
@@ -199,7 +202,9 @@ def save_timeseries_eval(timeseries, dir_name, snippet_sz):
         # --! extract the actual saved timeseries and split them into snippets
         snippets = np.split(timeseries[0][:timeseries_sz, :1], snippets_n, axis=0)
 
-        data = np.expand_dims(np.concatenate([remove_mean(snippet) for snippet in snippets], axis=0), 0)
+        data = np.expand_dims(
+            np.concatenate(
+                [scale_timeseries(remove_mean(snippet)[:, 0]) for snippet in snippets], axis=0), 0)
 
         dataset_dir = dir_name
         filename    = 'eval'
@@ -212,7 +217,8 @@ def save_timeseries_eval(timeseries, dir_name, snippet_sz):
 def scale_timeseries(timeseries):
     """
     Scales ``timeseries`` using min-max algorithm. The min-max range is -1 to 1, as this
-    range should suit neural network training.
+    range should suit neural network training. The ``timeseries`` are expected
+    to be a one-dimensional vector [T], where T is the number of samples.
     """
     scaler = minmax_scaler(feature_range=(-1, 1))
 
@@ -403,24 +409,27 @@ def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
         # --! call the model
         o = model(x, a)
 
-        mean    = o[0]
-        logvar  = o[2]
+        mean        = o[0]
+        sta_logvar  = o[2]
+        dyn_logvar  = o[4]
 
         # --! remove the batch dimension
-        x       = torch.squeeze(x, dim=0)
-        mean    = torch.squeeze(mean, dim=0)
-        logvar  = torch.squeeze(logvar, dim=0)
+        x           = torch.squeeze(x, dim=0)
+        mean        = torch.squeeze(mean, dim=0)
+        sta_logvar  = torch.squeeze(sta_logvar, dim=0)
+        dyn_logvar  = torch.squeeze(dyn_logvar, dim=0)
 
-        var = torch.exp(logvar) + 1e-6
+        sta_var = torch.exp(sta_logvar) + 1e-6
+        dyn_var = torch.exp(dyn_logvar) + 1e-6
 
         # --! create a time vector
         t = np.arange(0., timeseries_dur, timestep).reshape(-1, 1)
         t = t + k*timeseries_dur
 
         # --! plot prediction result
-        plt.figure(figsize=(6, 3))
+        plt.figure(figsize=(9, 3))
 
-        plt.subplot(1, 2, 1)
+        plt.subplot(1, 3, 1)
         plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, 0], alpha=0.8, color='tab:green', label='$x$')
         plt.plot(t[:subtimeseries_nsample, 0], mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
         plt.xlabel('Time [s]')
@@ -428,20 +437,30 @@ def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
         plt.legend()
         plt.tight_layout()
 
-        var_max = torch.max(var)
-        var_max = 0.1 if var_max < 0.1 else var_max
+        sta_var_max = torch.max(sta_var)
+        sta_var_max = 0.1 if sta_var_max < 0.1 else sta_var_max
 
-        plt.subplot(1, 2, 2)
-        plt.plot(t[:subtimeseries_nsample, 0], var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$')
+        dyn_var_max = torch.max(dyn_var)
+        dyn_var_max = 0.1 if dyn_var_max < 0.1 else dyn_var_max
+
+        plt.subplot(1, 3, 2)
+        plt.plot(t[:subtimeseries_nsample, 0], sta_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$')
         plt.xlabel('Time [s]')
-        plt.ylim((0., var_max))
+        plt.ylim((0., sta_var_max))
+        plt.legend()
+        plt.tight_layout()
+
+        plt.subplot(1, 3, 3)
+        plt.plot(t[:subtimeseries_nsample, 0], dyn_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$')
+        plt.xlabel('Time [s]')
+        plt.ylim((0., dyn_var_max))
         plt.legend()
         plt.tight_layout()
 
         plt.show()
 
         if datasaved:
-            savedata = np.expand_dims(np.concatenate([t, x, mean, var], axis=1), 0)
+            savedata = np.expand_dims(np.concatenate([t, x, mean, sta_var, dyn_var], axis=1), 0)
             write_datafile(f'savedata/statest_sim{k}', savedata, delim=' ')
 
 

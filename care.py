@@ -48,7 +48,7 @@ class operator(torch.nn.Module, interface):
 
     @abstractmethod
     def unfreeze(self):
-        """Makes trainable submodules trainable again."""
+        """Makes all trainable submodules trainable again."""
         return
 
     def _eval_fun(self, fun, param):
@@ -282,10 +282,13 @@ class operator_dyn(operator):
         # --! predictions of embedding sequences
         self.model_from = utils.fcnn(feat=[nfun, 64, 64, nfun*nfun], actfun_hid='relu')
 
-        # --! create an MLP-based decoder to decode embeddings back to timeseries
-        dec_ni   = nfun * self.timeseries_ndim
-        dec_no   = self.param_kernsize * self.timeseries_ndim
-        self.dec = utils.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
+        # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty (mean and variance)
+        #
+        # --! features of the variance decoder are doubled to accommodate prediction errors
+        dec_ni        = nfun * self.timeseries_ndim
+        dec_no        = self.param_kernsize * self.timeseries_ndim
+        self.dec_mean = utils.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
+        self.dec_var  = utils.fcnn(feat=[dec_ni * 3, 64, 64, dec_no], actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -394,25 +397,32 @@ class operator_dyn(operator):
         # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
         # --! so we reshape the decoded timeseries back to their
         # --! original shape [B, T, C]
-        timeseries_predict = self.dec(fun_predict)
-        timeseries_predict = timeseries_predict.reshape(timeseries_predict.shape[0], -1, self.timeseries_ndim)
+        timeseries_predict_mean = self.dec_mean(fun_predict)
+        timeseries_predict_mean = timeseries_predict_mean.reshape(timeseries_predict_mean.shape[0], -1, self.timeseries_ndim)
 
-        return timeseries_predict, fun, fun_predict
+        # --! to facilitate variance learning we explicitly provide prediction error along the prediction itself
+        dfun                     = fun_predict - fun
+        dec_var_i                = torch.cat([fun, fun_predict, dfun], dim=-1)
+        timeseries_predict_var   = self.dec_var(dec_var_i)
+        timeseries_predict_var   = timeseries_predict_var.reshape(timeseries_predict_var.shape[0], -1, self.timeseries_ndim)
+
+        return timeseries_predict_mean, timeseries_predict_var, fun, fun_predict
 
     def freeze_mean(self):
         utils.freeze_module(self.embed_enc)
         utils.freeze_module(self.adapt_enc)
         utils.freeze_module(self.model_from)
-        utils.freeze_module(self.dec)
+        utils.freeze_module(self.dec_mean)
 
     def freeze_var(self):
-        raise NotImplementedError
+        utils.freeze_module(self.dec_var)
 
     def unfreeze(self):
         utils.unfreeze_module(self.embed_enc)
         utils.unfreeze_module(self.adapt_enc)
         utils.unfreeze_module(self.model_from)
-        utils.unfreeze_module(self.dec)
+        utils.unfreeze_module(self.dec_mean)
+        utils.unfreeze_module(self.dec_var)
 
 
 @dataclass
@@ -569,21 +579,22 @@ class phase_sta_var(fit_phase):
         return loss, loss, 0., 0.
 
     def next(self):
-        self.model._set_phase(self.model._get_phase_dyn())
+        self.model._set_phase(self.model._get_phase_dyn_mean())
         return True
 
 
-class phase_dyn(fit_phase):
+class phase_dyn_mean(fit_phase):
 
     def __init__(self, model):
         super().__init__(model)
 
     def enter(self, param):
-        print("inf >> fit: entering dynamic phase")
+        print("inf >> fit: entering dynamic mean phase")
 
         super().enter(param)
 
         self.model.operator_dyn.unfreeze()
+        self.model.operator_dyn.freeze_var()
 
         self.model.operator_sta.freeze_mean()
         self.model.operator_sta.freeze_var()
@@ -591,14 +602,45 @@ class phase_dyn(fit_phase):
         self.datadir = param['transdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict, fun, fun_predict = self.model.operator_dyn(timeseries)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self.model.operator_dyn(timeseries)
 
-        loss_transformer = self._compute_meanloss(timeseries, timeseries_predict)
+        loss_transformer = self._compute_meanloss(timeseries, timeseries_predict_mean)
         loss_lin = self._compute_meanloss(fun, fun_predict)
 
-        loss = loss_transformer + loss_lin
+        loss = 1.0 * loss_transformer + 1.0 * loss_lin
 
         return loss, loss_transformer, 0., loss_lin
+
+    def next(self):
+        self.model._set_phase(self.model._get_phase_dyn_var())
+        return True
+
+
+class phase_dyn_var(fit_phase):
+
+    def __init__(self, model):
+        super().__init__(model)
+
+    def enter(self, param):
+        print("inf >> fit: entering dynamic variance phase")
+
+        super().enter(param)
+
+        self.model.operator_dyn.unfreeze()
+        self.model.operator_dyn.freeze_mean()
+
+        self.model.operator_sta.freeze_mean()
+        self.model.operator_sta.freeze_var()
+
+        self.datadir = param['mixdatadir']
+
+    def compute_loss(self, timeseries):
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self.model.operator_dyn(timeseries)
+
+        #weight = torch.sum(torch.abs(timeseries_predict_mean - timeseries))
+        loss = self._compute_varloss(timeseries, timeseries_predict_mean, timeseries_predict_var)
+
+        return loss, loss, 0., 0.
 
     def next(self):
         return False
@@ -622,7 +664,8 @@ class detuning(torch.nn.Module):
 
         self._phase_sta_mean = phase_sta_mean(self)
         self._phase_sta_var  = phase_sta_var(self)
-        self._phase_dyn      = phase_dyn(self)
+        self._phase_dyn_mean = phase_dyn_mean(self)
+        self._phase_dyn_var  = phase_dyn_var(self)
         self._phase          = self._phase_sta_mean
 
     def fit_next(self):
@@ -688,15 +731,15 @@ class detuning(torch.nn.Module):
             raise Exception('the size of timeseries is not a multiple of a kernel size')
 
         sta_timeseries_predict_mean, sta_timeseries_predict_var, sta_fun, sta_fun_predict = self.operator_sta(timeseries)
-        dyn_timeseries_predict, dyn_fun, dyn_fun_predict = self.operator_dyn(timeseries)
+        dyn_timeseries_predict_mean, dyn_timeseries_predict_var, dyn_fun, dyn_fun_predict = self.operator_dyn(timeseries)
 
         # --! blend predicted timeseries using alpha
-        timeseries_predict = alpha * sta_timeseries_predict_mean + (1 - alpha) * dyn_timeseries_predict
+        timeseries_predict = alpha * sta_timeseries_predict_mean + (1 - alpha) * dyn_timeseries_predict_mean
 
         o = (
             timeseries_predict,
             sta_timeseries_predict_mean, sta_timeseries_predict_var,
-            dyn_timeseries_predict,
+            dyn_timeseries_predict_mean, dyn_timeseries_predict_var,
             sta_fun, sta_fun_predict,
             dyn_fun, dyn_fun_predict
         )
@@ -709,8 +752,11 @@ class detuning(torch.nn.Module):
     def _get_phase_sta_var(self):
         return self._phase_sta_var
 
-    def _get_phase_dyn(self):
-        return self._phase_dyn
+    def _get_phase_dyn_mean(self):
+        return self._phase_dyn_mean
+
+    def _get_phase_dyn_var(self):
+        return self._phase_dyn_var
 
     def _get_phase(self):
         return self._phase
