@@ -407,7 +407,7 @@ def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
     for k, x, a in zip(indeces, timeseries, alpha):
 
         # --! call the model
-        o = model(x, a)
+        o = model(x)
 
         mean        = o[0]
         sta_logvar  = o[2]
@@ -444,14 +444,14 @@ def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
         dyn_var_max = 0.1 if dyn_var_max < 0.1 else dyn_var_max
 
         plt.subplot(1, 3, 2)
-        plt.plot(t[:subtimeseries_nsample, 0], sta_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$')
+        plt.plot(t[:subtimeseries_nsample, 0], sta_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - DMD')
         plt.xlabel('Time [s]')
         plt.ylim((0., sta_var_max))
         plt.legend()
         plt.tight_layout()
 
         plt.subplot(1, 3, 3)
-        plt.plot(t[:subtimeseries_nsample, 0], dyn_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$')
+        plt.plot(t[:subtimeseries_nsample, 0], dyn_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - Transformer')
         plt.xlabel('Time [s]')
         plt.ylim((0., dyn_var_max))
         plt.legend()

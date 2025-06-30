@@ -724,22 +724,31 @@ class detuning(torch.nn.Module):
         )
         return o
 
-    def forward(self, timeseries, alpha):
+    def forward(self, timeseries, alpha=None):
         """Predicts given ``timeseries``."""
 
         if timeseries.shape[1] % self.param_kernsize:
             raise Exception('the size of timeseries is not a multiple of a kernel size')
 
-        sta_timeseries_predict_mean, sta_timeseries_predict_var, sta_fun, sta_fun_predict = self.operator_sta(timeseries)
-        dyn_timeseries_predict_mean, dyn_timeseries_predict_var, dyn_fun, dyn_fun_predict = self.operator_dyn(timeseries)
+        sta_timeseries_predict_mean, sta_timeseries_predict_logvar, sta_fun, sta_fun_predict = self.operator_sta(timeseries)
+        dyn_timeseries_predict_mean, dyn_timeseries_predict_logvar, dyn_fun, dyn_fun_predict = self.operator_dyn(timeseries)
 
-        # --! blend predicted timeseries using alpha
+        # --! derive alpha
+        if alpha is None:
+            sta_var = torch.exp(sta_timeseries_predict_logvar) + 1e-6
+            dyn_var = torch.exp(dyn_timeseries_predict_logvar) + 1e-6
+            sta_var = torch.mean(sta_var)
+            dyn_var = torch.mean(dyn_var)
+            alpha = dyn_var / (dyn_var + sta_var)
+            print(alpha)
+
+        # --! blend predicted timeseries using the derived alpha
         timeseries_predict = alpha * sta_timeseries_predict_mean + (1 - alpha) * dyn_timeseries_predict_mean
 
         o = (
             timeseries_predict,
-            sta_timeseries_predict_mean, sta_timeseries_predict_var,
-            dyn_timeseries_predict_mean, dyn_timeseries_predict_var,
+            sta_timeseries_predict_mean, sta_timeseries_predict_logvar,
+            dyn_timeseries_predict_mean, dyn_timeseries_predict_logvar,
             sta_fun, sta_fun_predict,
             dyn_fun, dyn_fun_predict
         )
