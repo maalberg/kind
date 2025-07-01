@@ -724,7 +724,7 @@ class detuning(torch.nn.Module):
         )
         return o
 
-    def forward(self, timeseries, alpha=None):
+    def forward(self, timeseries):
         """Predicts given ``timeseries``."""
 
         if timeseries.shape[1] % self.param_kernsize:
@@ -734,13 +734,11 @@ class detuning(torch.nn.Module):
         dyn_timeseries_predict_mean, dyn_timeseries_predict_logvar, dyn_fun, dyn_fun_predict = self.operator_dyn(timeseries)
 
         # --! derive alpha
-        if alpha is None:
-            sta_var = torch.exp(sta_timeseries_predict_logvar) + 1e-6
-            dyn_var = torch.exp(dyn_timeseries_predict_logvar) + 1e-6
-            sta_var = torch.mean(sta_var)
-            dyn_var = torch.mean(dyn_var)
-            alpha = dyn_var / (dyn_var + sta_var)
-            print(alpha)
+        sta_var = torch.exp(sta_timeseries_predict_logvar) + 1e-6
+        dyn_var = torch.exp(dyn_timeseries_predict_logvar) + 1e-6
+        #sta_var = torch.mean(sta_var)
+        #dyn_var = torch.mean(dyn_var)
+        alpha = dyn_var / (dyn_var + sta_var)
 
         # --! blend predicted timeseries using the derived alpha
         timeseries_predict = alpha * sta_timeseries_predict_mean + (1 - alpha) * dyn_timeseries_predict_mean
@@ -750,7 +748,8 @@ class detuning(torch.nn.Module):
             sta_timeseries_predict_mean, sta_timeseries_predict_logvar,
             dyn_timeseries_predict_mean, dyn_timeseries_predict_logvar,
             sta_fun, sta_fun_predict,
-            dyn_fun, dyn_fun_predict
+            dyn_fun, dyn_fun_predict,
+            alpha
         )
 
         return o

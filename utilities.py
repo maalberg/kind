@@ -387,7 +387,7 @@ def disp_spectrum_amps(model, dataset_dir, timeseries_nsample, timeseries_pos):
     plt.show()
 
 
-def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
+def eval_model(model, datadir, timeseries_nsample, datasaved=False):
     """
     Evaluates a ``model`` on data from a folder named ``datadir``. Data read from
     that folder is split into timeseries according to ``timeseries_nsample``.
@@ -404,7 +404,7 @@ def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
     # --! data is a batch/array with timeseries, so split it along the batch dimension
     timeseries = torch.split(data, 1, dim=0)
 
-    for k, x, a in zip(indeces, timeseries, alpha):
+    for k, x in zip(indeces, timeseries):
 
         # --! call the model
         o = model(x)
@@ -412,12 +412,14 @@ def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
         mean        = o[0]
         sta_logvar  = o[2]
         dyn_logvar  = o[4]
+        alpha       = o[9]
 
         # --! remove the batch dimension
         x           = torch.squeeze(x, dim=0)
         mean        = torch.squeeze(mean, dim=0)
         sta_logvar  = torch.squeeze(sta_logvar, dim=0)
         dyn_logvar  = torch.squeeze(dyn_logvar, dim=0)
+        alpha       = torch.squeeze(alpha, dim=0)
 
         sta_var = torch.exp(sta_logvar) + 1e-6
         dyn_var = torch.exp(dyn_logvar) + 1e-6
@@ -427,13 +429,21 @@ def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
         t = t + k*timeseries_dur
 
         # --! plot prediction result
-        plt.figure(figsize=(9, 3))
+        plt.figure(figsize=(12, 3))
 
-        plt.subplot(1, 3, 1)
+        plt.subplot(1, 4, 1)
         plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, 0], alpha=0.8, color='tab:green', label='$x$')
         plt.plot(t[:subtimeseries_nsample, 0], mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
-        plt.xlabel('Time [s]')
         plt.ylabel('Amplitude')
+        plt.xlabel('Time [s]')
+        plt.legend()
+        plt.tight_layout()
+
+        plt.subplot(1, 4, 2)
+        plt.plot(t[:subtimeseries_nsample, 0], alpha[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\alpha$')
+        plt.xlabel('Time [s]')
+        plt.ylim((0., 1.))
+        plt.xlabel('Time [s]')
         plt.legend()
         plt.tight_layout()
 
@@ -443,14 +453,14 @@ def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
         dyn_var_max = torch.max(dyn_var)
         dyn_var_max = 0.1 if dyn_var_max < 0.1 else dyn_var_max
 
-        plt.subplot(1, 3, 2)
+        plt.subplot(1, 4, 3)
         plt.plot(t[:subtimeseries_nsample, 0], sta_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - DMD')
         plt.xlabel('Time [s]')
         plt.ylim((0., sta_var_max))
         plt.legend()
         plt.tight_layout()
 
-        plt.subplot(1, 3, 3)
+        plt.subplot(1, 4, 4)
         plt.plot(t[:subtimeseries_nsample, 0], dyn_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - Transformer')
         plt.xlabel('Time [s]')
         plt.ylim((0., dyn_var_max))
@@ -460,7 +470,7 @@ def eval_model(model, alpha, datadir, timeseries_nsample, datasaved=False):
         plt.show()
 
         if datasaved:
-            savedata = np.expand_dims(np.concatenate([t, x, mean, sta_var, dyn_var], axis=1), 0)
+            savedata = np.expand_dims(np.concatenate([t, x, mean, sta_var, dyn_var, alpha], axis=1), 0)
             write_datafile(f'savedata/statest_sim{k}', savedata, delim=' ')
 
 
