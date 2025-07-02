@@ -1,0 +1,379 @@
+# --!--------------------------------------------------------------!
+# --! utilities for plotting
+# --!--------------------------------------------------------------!
+
+import torch
+import numpy as np
+from matplotlib import pyplot as plt
+
+import utils_data
+
+
+def plot_dataset(datadir, timeseries_nsample, timestep):
+    """
+    Displays metrics of a dataset located in a folder named ``datadir``. The size of timeseries
+    stored in this dataset is defined by ``timeseries_nsample``. The ``timestep`` that
+    was used when sampling the timeseries helps create time vectors for plotting.
+    """
+
+    # --! read data from files
+    data_train = utils_data.read_datafile(f'{datadir}/train1', timeseries_nsample)
+    data_valid = utils_data.read_datafile(f'{datadir}/valid', timeseries_nsample)
+    data_test  = utils_data.read_datafile(f'{datadir}/test', timeseries_nsample)
+
+    # --! compile dataset parameters
+    data_table = [
+        ( 'dataset',           'batches',        'timeseries length',          'channels'),
+        ('--------',           '-------',        '-----------------',          '--------'),
+        (   'train', data_train.shape[0], data_train.shape[1], data_train.shape[2]),
+        (   'valid', data_valid.shape[0], data_valid.shape[1], data_valid.shape[2]),
+        (    'test',  data_test.shape[0],  data_test.shape[1],  data_test.shape[2]) ]
+
+    # --! print dataset parameters
+    print('')
+    print('inf >> dataset parameters:')
+    print('')
+    for row in data_table:
+        print(f'{row[0]:>8} {row[1]:>8} {row[2]:>18} {row[3]:>8}')
+    print('')
+
+    t = torch.linspace(0., timestep*timeseries_nsample, timeseries_nsample)
+    zero = torch.zeros_like(t)
+
+    plt.figure(figsize=(9, 3))
+
+    ndata = 3
+
+    for j in range(ndata):
+        data = data_train[j]
+
+        plt.subplot(1, ndata, j + 1)
+        plt.title(f'Training data no. {j}')
+        plt.plot(t, data[:, 0], color='tab:blue', alpha=0.75, label='detuning')
+        plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
+        plt.legend()
+        plt.xlabel('Time [s]')
+        if j == 0: plt.ylabel('Amplitude')
+        plt.tight_layout()
+    plt.show()
+
+
+def plot_eigs(model):
+    """Displays eigenvalues of given ``model`` on the unit circle."""
+    print(model.operator_sta.model.weight)
+
+    eigvals, _ = torch.linalg.eig(model.operator_sta.model.weight)
+
+    reals = eigvals.real.view(-1, 1)
+    imags = eigvals.imag.view(-1, 1)
+
+    plt.figure(figsize=(3, 3))
+    plt.scatter(reals[:, 0], imags[:, 0], c='blue')
+    plt.axhline(0, color='gray', linewidth=0.5)
+    plt.axvline(0, color='gray', linewidth=0.5)
+    circle = plt.Circle((0, 0), 1, color='r', fill=False, linestyle='--')
+    plt.gca().add_artist(circle)
+    plt.title("Stationary operator spectrum")
+    plt.xlabel("Real Part")
+    plt.ylabel("Imaginary part")
+    plt.grid(True)
+    plt.axis('equal')
+    plt.show()
+
+
+def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
+    """
+    Displays the amplitudes of a ``model`` eigenvalues for data from ``datadir`` indexed by
+    ``jtimeseries``. Parameter ``timeseries_nsample`` is needed to read ``datadir``
+    and extract proper timeseries. The displayed amplitudes are aligned
+    with the corresponding ``model`` predictions.
+    """
+
+    # --! extract eigenvalues and eigenvectors from a stationary DMD-like operator
+    eigval, eigvec        = torch.linalg.eig(model.operator_sta.model.weight)
+    testdata              = utils_data.read_datafile(f'{datadir}/test', timeseries_nsample)
+    subtimeseries_nsample = model.timeseries_nsample
+
+    # --! take the initial condition of timeseries specified by index j and
+    # --! embed this initial condition into the latent space
+    # --! of the stationary model
+    data_ic     = torch.unsqueeze(testdata[jtimeseries][:model.param_kernsize, :1], 0)
+    fun_ic      = model.operator_sta.embed(data_ic)
+
+    # --! now multiply eigenvectors and initial conditions together in a dot product fashion to
+    # --! find out how aligned these two are, and thus we get our modal amplitude,
+    # --! where a greater modal amplitude means more 'involvement' of a
+    # --! particular eigenvalue in modeling the evolution of
+    # --! particular time series.
+    #
+    # --! under the hood, the eignevectors must be inverted to achieve proper projection
+    # --! of the initial condition into the eigen basis
+    eigvec_inv  = torch.linalg.inv(eigvec)
+    fun_ic      = torch.squeeze(fun_ic, 0)
+    eigvec_inv  = torch.squeeze(eigvec_inv, 0)
+    fun_ic      = fun_ic.to(torch.cfloat)
+    amp         = torch.matmul(eigvec_inv, torch.transpose(fun_ic, 0, 1))
+
+    # --! modal amplitudes are calculated as complex numbers, but we want only the real part
+    amp         = amp.abs()
+    jamp        = np.array([range(len(amp[:, 0]))]).reshape(-1, 1) + 1.0
+
+    data        = testdata[jtimeseries]
+    timeseries  = torch.unsqueeze(data[:subtimeseries_nsample, :1], dim=0)
+    o           = model(timeseries)
+
+    sta_timeseries_predict_mean   = o[1]
+    sta_timeseries_predict_logvar = o[2]
+    timeseries                    = torch.squeeze(timeseries, dim=0)
+    sta_timeseries_predict_mean   = torch.squeeze(sta_timeseries_predict_mean, dim=0)
+    sta_timeseries_predict_logvar = torch.squeeze(sta_timeseries_predict_logvar, dim=0)
+
+    sta_timeseries_predict_var = torch.exp(sta_timeseries_predict_logvar) + 1e-6
+
+    var_max = torch.max(sta_timeseries_predict_var)
+    var_max = 0.1 if var_max < 0.1 else var_max
+
+    timestep = model.timestep
+    t = np.arange(0., subtimeseries_nsample*timestep, timestep).reshape(-1, 1)
+
+    plt.figure(figsize=(9,3))
+
+    plt.subplot(1, 3, 1)
+    plt.title('Mode amplitudes')
+    plt.bar(jamp[:, 0], amp[:, 0])
+    plt.xlabel('Mode index')
+    plt.ylabel('Amplitude')
+    plt.tight_layout()
+
+    plt.subplot(1, 3, 2)
+    plt.title('Model response')
+    plt.plot(t[:, 0], timeseries[:, 0], alpha=0.8, color='tab:green', label='$x$')
+    plt.plot(t[:, 0], sta_timeseries_predict_mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
+    plt.xlabel('Time [s]')
+    plt.legend()
+    plt.tight_layout()
+
+    plt.subplot(1, 3, 3)
+    plt.title('Uncertainty')
+    plt.plot(t[:, 0], sta_timeseries_predict_var[:, 0], alpha=1, color='tab:blue', label='$\\sigma^2$')
+    plt.xlabel('Time [s]')
+    plt.ylim((0., var_max))
+    plt.legend()
+    plt.tight_layout()
+
+    plt.show()
+
+
+def plot_stationary(model, datadir, timeseries_nsample, datasaved=False):
+    """
+    Plots the results of stationary ``model`` evaluation, including the mean and variance
+    of stationary ``model`` predictions. The data for ``model`` evaluation is read
+    from a directory, called ``datadir``. The read data is shaped into
+    timeseries according to the number of samples, specified in
+    ``timeseries_nsample``. Plotted results can also be saved
+    to files if ``datasaved`` flag is set to True.
+    """
+    data = utils_data.read_datafile(f'{datadir}/eval', timeseries_nsample)
+
+    # --! helping variables
+    subtimeseries_nsample = model.timeseries_nsample
+    timestep              = model.timestep
+    timeseries_dur        = subtimeseries_nsample * timestep
+    indeces               = range(data.shape[0])
+
+    # --! data is a batch/array with timeseries, so split it along the batch dimension
+    timeseries = torch.split(data, 1, dim=0)
+
+    for j, x in zip(indeces, timeseries):
+
+        # --! call the model
+        o = model(x)
+
+        mean   = o[1]
+        logvar = o[2]
+
+        # --! remove the batch dimension
+        x      = torch.squeeze(x, dim=0)
+        mean   = torch.squeeze(mean, dim=0)
+        logvar = torch.squeeze(logvar, dim=0)
+
+        # --! convert log-variance to variance
+        var    = torch.exp(logvar) + 1e-6
+
+        # --! create a time vector
+        t = np.arange(0., timeseries_dur, timestep).reshape(-1, 1)
+        t = t + j*timeseries_dur
+
+        # --! plot prediction result
+        plt.figure(figsize=(6, 3))
+
+        plt.subplot(1, 2, 1)
+        plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, 0], alpha=0.8, color='tab:green', label='$x$')
+        plt.plot(t[:subtimeseries_nsample, 0], mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
+        plt.ylabel('Amplitude')
+        plt.xlabel('Time [s]')
+        plt.legend()
+        plt.tight_layout()
+
+        maxvar = torch.max(var)
+        maxvar = 0.1 if maxvar < 0.1 else maxvar
+
+        plt.subplot(1, 2, 2)
+        plt.plot(t[:subtimeseries_nsample, 0], var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - DMD')
+        plt.xlabel('Time [s]')
+        plt.ylim((0., maxvar))
+        plt.legend()
+        plt.tight_layout()
+
+        plt.show()
+
+        if datasaved:
+            savedata = np.expand_dims(np.concatenate([t, x, mean, var], axis=1), 0)
+            utils_data.write_datafile(f'savedata/statest_sim{k}', savedata, delim=' ')
+
+
+def plot_transient(model, datadir, timeseries_nsample, datasaved=False):
+    """
+    Plots the transient response of the given ``model`` to data read from a directory,
+    called ``datadir``.
+    """
+    data = utils_data.read_datafile(f'{datadir}/eval', timeseries_nsample)
+
+    # --! helping variables
+    subtimeseries_nsample = model.timeseries_nsample
+    timestep              = model.timestep
+    timeseries_dur        = subtimeseries_nsample * timestep
+    indeces               = range(data.shape[0])
+
+    # --! data is a batch/array with timeseries, so split it along the batch dimension
+    timeseries = torch.split(data, 1, dim=0)
+
+    for j, x in zip(indeces, timeseries):
+
+        # --! call the model
+        o = model(x)
+
+        mean   = o[3]
+        logvar = o[4]
+
+        # --! remove the batch dimension
+        x      = torch.squeeze(x, dim=0)
+        mean   = torch.squeeze(mean, dim=0)
+        logvar = torch.squeeze(logvar, dim=0)
+
+        # --! convert log-variance to variance
+        var    = torch.exp(logvar) + 1e-6
+
+        # --! create a time vector
+        t = np.arange(0., timeseries_dur, timestep).reshape(-1, 1)
+        t = t + j*timeseries_dur
+
+        # --! plot prediction result
+        plt.figure(figsize=(6, 3))
+
+        plt.subplot(1, 2, 1)
+        plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, 0], alpha=0.8, color='tab:green', label='$x$')
+        plt.plot(t[:subtimeseries_nsample, 0], mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
+        plt.ylabel('Amplitude')
+        plt.xlabel('Time [s]')
+        plt.legend()
+        plt.tight_layout()
+
+        maxvar = torch.max(var)
+        maxvar = 0.1 if maxvar < 0.1 else maxvar
+
+        plt.subplot(1, 2, 2)
+        plt.plot(t[:subtimeseries_nsample, 0], var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - Transformer')
+        plt.xlabel('Time [s]')
+        plt.ylim((0., maxvar))
+        plt.legend()
+        plt.tight_layout()
+
+        plt.show()
+
+        if datasaved:
+            savedata = np.expand_dims(np.concatenate([t, x, mean, var], axis=1), 0)
+            utils_data.write_datafile(f'savedata/dyntest_sim{k}', savedata, delim=' ')
+
+
+def plot_blend(model, datadir, timeseries_nsample, datasaved=False):
+    data = utils_data.read_datafile(f'{datadir}/eval', timeseries_nsample)
+
+    # --! helping variables
+    subtimeseries_nsample = model.timeseries_nsample
+    timestep              = model.timestep
+    timeseries_dur        = subtimeseries_nsample * timestep
+    indeces               = range(data.shape[0])
+
+    # --! data is a batch/array with timeseries, so split it along the batch dimension
+    timeseries = torch.split(data, 1, dim=0)
+
+    for j, x in zip(indeces, timeseries):
+
+        # --! call the model
+        o = model(x)
+
+        mean       = o[0]
+        sta_logvar = o[2]
+        dyn_logvar = o[4]
+        alpha      = o[9]
+
+        # --! remove the batch dimension
+        x          = torch.squeeze(x, dim=0)
+        mean       = torch.squeeze(mean, dim=0)
+        sta_logvar = torch.squeeze(sta_logvar, dim=0)
+        dyn_logvar = torch.squeeze(dyn_logvar, dim=0)
+        alpha      = torch.squeeze(alpha, dim=0)
+
+        # --! convert log-variance to variance
+        sta_var    = torch.exp(sta_logvar) + 1e-6
+        dyn_var    = torch.exp(dyn_logvar) + 1e-6
+
+        # --! create a time vector
+        t = np.arange(0., timeseries_dur, timestep).reshape(-1, 1)
+        t = t + j*timeseries_dur
+
+        # --! plot prediction result
+        plt.figure(figsize=(12, 3))
+
+        plt.subplot(1, 4, 1)
+        plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, 0], alpha=0.8, color='tab:green', label='$x$')
+        plt.plot(t[:subtimeseries_nsample, 0], mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
+        plt.ylabel('Amplitude')
+        plt.xlabel('Time [s]')
+        plt.legend()
+        plt.tight_layout()
+
+        plt.subplot(1, 4, 2)
+        plt.plot(t[:subtimeseries_nsample, 0], alpha[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\alpha$')
+        plt.xlabel('Time [s]')
+        plt.ylim((0., 1.))
+        plt.xlabel('Time [s]')
+        plt.legend()
+        plt.tight_layout()
+
+        maxvar = torch.max(sta_var)
+        maxvar = 0.1 if maxvar < 0.1 else maxvar
+
+        plt.subplot(1, 4, 3)
+        plt.plot(t[:subtimeseries_nsample, 0], sta_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - DMD')
+        plt.xlabel('Time [s]')
+        plt.ylim((0., maxvar))
+        plt.legend()
+        plt.tight_layout()
+
+        maxvar = torch.max(dyn_var)
+        maxvar = 0.1 if maxvar < 0.1 else maxvar
+
+        plt.subplot(1, 4, 4)
+        plt.plot(t[:subtimeseries_nsample, 0], dyn_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - Transformer')
+        plt.xlabel('Time [s]')
+        plt.ylim((0., maxvar))
+        plt.legend()
+        plt.tight_layout()
+
+        plt.show()
+
+        if datasaved:
+            savedata = np.expand_dims(np.concatenate([t, x, mean, sta_var, dyn_var, alpha], axis=1), 0)
+            utils_data.write_datafile(f'savedata/blendtest_sim{k}', savedata, delim=' ')

@@ -1,3 +1,7 @@
+# --!-------------------------------------------------------------------!
+# --! Implementation of Kalman-inspired neural decomposition, or KIND
+# --!-------------------------------------------------------------------!
+
 import torch
 
 from abc import abstractmethod
@@ -5,7 +9,8 @@ from abc import ABC as interface
 
 from dataclasses import dataclass
 
-import utilities as utils
+import utils_data
+import utils_nn
 
 
 class operator(torch.nn.Module, interface):
@@ -61,7 +66,7 @@ class operator(torch.nn.Module, interface):
         elif 'data' in fun:
             return self._eval_data(param)
         elif 'poly' in fun:
-            deg = utils.extract_poly_deg(fun)
+            deg = utils_nn.extract_poly_deg(fun)
             return self._eval_poly(param, deg)
         else:
             raise Exception("unsupported basis function!")
@@ -102,7 +107,7 @@ class operator_sta(operator):
         # --! in the embedded (latent) space
         enc_ni   = self.param_kernsize * self.timeseries_ndim
         enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
-        self.enc = utils.fcnn(feat=[enc_ni, 64, 64, enc_no], actfun_hid='relu')
+        self.enc = utils_nn.fcnn(feat=[enc_ni, 64, 64, enc_no], actfun_hid='relu')
 
         # --! create a learnable DMD-like model (a matrix) that captures stationary dynamics
         #
@@ -117,8 +122,8 @@ class operator_sta(operator):
         # --! features of the variance decoder are doubled to accommodate prediction errors
         dec_ni          = nfun * self.timeseries_ndim
         dec_no          = self.param_kernsize * self.timeseries_ndim
-        self.dec_mean   = utils.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
-        self.dec_var    = utils.fcnn(feat=[dec_ni * 2, 64, 64, dec_no], actfun_hid='relu')
+        self.dec_mean   = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
+        self.dec_var    = utils_nn.fcnn(feat=[dec_ni * 2, 64, 64, dec_no], actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -233,18 +238,18 @@ class operator_sta(operator):
         return timeseries_predict_mean, timeseries_predict_var, fun, fun_predict
 
     def freeze_mean(self):
-        utils.freeze_module(self.enc)
-        utils.freeze_module(self.model)
-        utils.freeze_module(self.dec_mean)
+        utils_nn.freeze_module(self.enc)
+        utils_nn.freeze_module(self.model)
+        utils_nn.freeze_module(self.dec_mean)
 
     def freeze_var(self):
-        utils.freeze_module(self.dec_var)
+        utils_nn.freeze_module(self.dec_var)
 
     def unfreeze(self):
-        utils.unfreeze_module(self.enc)
-        utils.unfreeze_module(self.model)
-        utils.unfreeze_module(self.dec_mean)
-        utils.unfreeze_module(self.dec_var)
+        utils_nn.unfreeze_module(self.enc)
+        utils_nn.unfreeze_module(self.model)
+        utils_nn.unfreeze_module(self.dec_mean)
+        utils_nn.unfreeze_module(self.dec_var)
 
 
 class operator_dyn(operator):
@@ -264,7 +269,7 @@ class operator_dyn(operator):
         # --! in the embedded (latent) space
         embed_enc_ni   = self.param_kernsize * self.timeseries_ndim
         embed_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
-        self.embed_enc = utils.fcnn(feat=[embed_enc_ni, 64, 64, embed_enc_no], actfun_hid='relu')
+        self.embed_enc = utils_nn.fcnn(feat=[embed_enc_ni, 64, 64, embed_enc_no], actfun_hid='relu')
 
         # --! encoder network, which produces adaptation context, acts along the sequence of function
         # --! values, but its features are the number of these embedding functions
@@ -280,15 +285,15 @@ class operator_dyn(operator):
         # --! an additional MLP-based neural network to generate linear time-varying matrices from
         # --! encoded adaptation context; these matrices enable piecewise-linear
         # --! predictions of embedding sequences
-        self.model_from = utils.fcnn(feat=[nfun, 64, 64, nfun*nfun], actfun_hid='relu')
+        self.model_from = utils_nn.fcnn(feat=[nfun, 64, 64, nfun*nfun], actfun_hid='relu')
 
         # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty (mean and variance)
         #
         # --! features of the variance decoder are doubled to accommodate prediction errors
         dec_ni        = nfun * self.timeseries_ndim
         dec_no        = self.param_kernsize * self.timeseries_ndim
-        self.dec_mean = utils.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
-        self.dec_var  = utils.fcnn(feat=[dec_ni * 3, 64, 64, dec_no], actfun_hid='relu')
+        self.dec_mean = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
+        self.dec_var  = utils_nn.fcnn(feat=[dec_ni * 3, 64, 64, dec_no], actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -409,53 +414,20 @@ class operator_dyn(operator):
         return timeseries_predict_mean, timeseries_predict_var, fun, fun_predict
 
     def freeze_mean(self):
-        utils.freeze_module(self.embed_enc)
-        utils.freeze_module(self.adapt_enc)
-        utils.freeze_module(self.model_from)
-        utils.freeze_module(self.dec_mean)
+        utils_nn.freeze_module(self.embed_enc)
+        utils_nn.freeze_module(self.adapt_enc)
+        utils_nn.freeze_module(self.model_from)
+        utils_nn.freeze_module(self.dec_mean)
 
     def freeze_var(self):
-        utils.freeze_module(self.dec_var)
+        utils_nn.freeze_module(self.dec_var)
 
     def unfreeze(self):
-        utils.unfreeze_module(self.embed_enc)
-        utils.unfreeze_module(self.adapt_enc)
-        utils.unfreeze_module(self.model_from)
-        utils.unfreeze_module(self.dec_mean)
-        utils.unfreeze_module(self.dec_var)
-
-
-@dataclass
-class detuning_config:
-    """
-    Stores detuning configuration.
-    """
-
-    # --! number of dimensions and samples in timeseries
-    timeseries_ndim: int
-    timeseries_nsample: int
-
-    # --! timestep that was used to sample timeseries
-    timestep: float
-
-    # --! basis functions used to build lifted embedding
-    #
-    # --! this dictionary is structured as
-    #
-    # --!  *  function name: str
-    # --!  *  number of function parameters: int
-    fun: dict
-
-    # --! size of dynamic parameter filters encoded by an encoder from timeseries data
-    #
-    # --! Timeseries are partioned into slices that are encoded by an encoder to
-    # --! produce, so to say, dynamic kernels, or filters. These kernels
-    # --! help extract specific features, i.e. nonlinear function
-    # --! parameters from the raw timeseries. In constrast to
-    # --! static kernels in convolutional neural networks,
-    # --! the kernels here are dynamic, because they
-    # --! are produced from the timeseries every time.
-    param_kernsize: int
+        utils_nn.unfreeze_module(self.embed_enc)
+        utils_nn.unfreeze_module(self.adapt_enc)
+        utils_nn.unfreeze_module(self.model_from)
+        utils_nn.unfreeze_module(self.dec_mean)
+        utils_nn.unfreeze_module(self.dec_var)
 
 
 class fit_phase(interface):
@@ -490,7 +462,6 @@ class fit_phase(interface):
         self.train_nfile           = param['train_nfile']
         self.nepoch                = param['nepoch']
         self.batsize               = param['batsize']
-        self.alphafun              = param['alphafun']
         self.learnrate             = param['learnrate']
         self.weightdecay           = param['weightdecay']
         self.isverbose             = param['isverbose']
@@ -646,6 +617,39 @@ class phase_dyn_var(fit_phase):
         return False
 
 
+@dataclass
+class detuning_config:
+    """
+    Stores detuning configuration.
+    """
+
+    # --! number of dimensions and samples in timeseries
+    timeseries_ndim: int
+    timeseries_nsample: int
+
+    # --! timestep that was used to sample timeseries
+    timestep: float
+
+    # --! basis functions used to build lifted embedding
+    #
+    # --! this dictionary is structured as
+    #
+    # --!  *  function name: str
+    # --!  *  number of function parameters: int
+    fun: dict
+
+    # --! size of dynamic parameter filters encoded by an encoder from timeseries data
+    #
+    # --! Timeseries are partioned into slices that are encoded by an encoder to
+    # --! produce, so to say, dynamic kernels, or filters. These kernels
+    # --! help extract specific features, i.e. nonlinear function
+    # --! parameters from the raw timeseries. In constrast to
+    # --! static kernels in convolutional neural networks,
+    # --! the kernels here are dynamic, because they
+    # --! are produced from the timeseries every time.
+    param_kernsize: int
+
+
 class detuning(torch.nn.Module):
     """
     Models detuning of a cavity resonance as predictive one-dimensional timeseries.
@@ -677,7 +681,7 @@ class detuning(torch.nn.Module):
         self._phase.enter(param)
 
         # --! prepare test data
-        testdata    = utils.read_datafile(f'{self._phase.datadir}/valid', self._phase.timeseries_nsample)
+        testdata    = utils_data.read_datafile(f'{self._phase.datadir}/valid', self._phase.timeseries_nsample)
         testdataset = torch.utils.data.TensorDataset(testdata)
 
         # --! specify an optimizer for fit
@@ -697,7 +701,7 @@ class detuning(torch.nn.Module):
             if self._phase.isverbose: print(f"inf >> processing training file number {ifile + 1}")
 
             # --! prepare training data
-            traindata     = utils.read_datafile(f'{self._phase.datadir}/train{ifile + 1}', self._phase.timeseries_nsample)
+            traindata     = utils_data.read_datafile(f'{self._phase.datadir}/train{ifile + 1}', self._phase.timeseries_nsample)
             traindataset  = torch.utils.data.TensorDataset(traindata)
             traindatafun  = torch.utils.data.DataLoader(traindataset, batch_size=self._phase.batsize, shuffle=True)
 
@@ -736,8 +740,6 @@ class detuning(torch.nn.Module):
         # --! derive alpha
         sta_var = torch.exp(sta_timeseries_predict_logvar) + 1e-6
         dyn_var = torch.exp(dyn_timeseries_predict_logvar) + 1e-6
-        #sta_var = torch.mean(sta_var)
-        #dyn_var = torch.mean(dyn_var)
         alpha = dyn_var / (dyn_var + sta_var)
 
         # --! blend predicted timeseries using the derived alpha
@@ -772,56 +774,3 @@ class detuning(torch.nn.Module):
     def _set_phase(self, phase):
         self._phase = phase
 
-
-@dataclass
-class alpha_fun_config:
-    kern_sz: int
-
-
-class alpha_fun(torch.nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-
-        self.kern_sz = config.kern_sz
-
-        # --! based on kernel size, compute the size of padding
-        pad_sz = (self.kern_sz - 1) // 2
-
-        self.net = torch.nn.Sequential(
-
-            # --! Derives 16 features from input timeseries by looking at small chunks of
-            # --! length 5 using a kernel. When sliding along the timeseries,
-            # --! the kernel shifts by 1 sample (stride=1). And to make
-            # --! the kernel fully processes the last sample, the
-            # --! timeseries are padded by two zero samples (padding=2).
-            #
-            # --! derived features of length 200 are downsampled by a factor of 2, see MaxPool1d
-            torch.nn.Conv1d(1, 16, kernel_size=self.kern_sz, stride=1, padding=pad_sz),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool1d(2),
-
-            # --! extracts 32 high-level features from the already derived 16 features
-            #
-            # --! pools across the entire time axis and converts vector-features into scalar-features,
-            # --! see AdaptiveAvgPool1d
-            torch.nn.Conv1d(16, 32, kernel_size=self.kern_sz, stride=1, padding=pad_sz),
-            torch.nn.ReLU(),
-            torch.nn.AdaptiveAvgPool1d(1),
-
-            # --! classifies features into a probability that given time series are stationary
-            torch.nn.Flatten(),
-            torch.nn.Linear(32, 1),
-            torch.nn.Sigmoid()
-        )
-
-    def forward(self, timeseries):
-        """
-        Forwards ``timeseries`` to the underlying convolutional neural network (CNN). The ``timeseries``
-        are expected to have a shape of [B, T, C], where B, T and C are the number of
-        batch elements, timesamples and data channels, respectively.
-        """
-        # --! when calling this network we transpose input timeseries to shape them as [C, T],
-        # --! because a convolutional neural network expects the number of
-        # --! time sample T to be the last dimension
-        return self.net(timeseries.transpose(-1, -2))
