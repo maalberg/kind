@@ -107,7 +107,7 @@ class detuning_sim:
         self.b_m        = None
         self.t_m        = None
 
-    def __call__(self, param):
+    def __call__(self, param, noise=None):
         """Simulates detuning according to given parameters ``param``."""
 
         # --! simulate with different parameters
@@ -125,6 +125,9 @@ class detuning_sim:
 
         # --! scale detuning to min max
         dets_sca = [utils_data.scale_timeseries(det[start:]) for det in dets]
+
+        if noise is not None:
+            dets_sca = [d + np.random.normal(0, noise, size=d.shape) for d in dets_sca]
 
         return dets_sca
 
