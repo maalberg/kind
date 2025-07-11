@@ -90,8 +90,8 @@ class operator(torch.nn.Module, interface):
         return torch.sum(torch.cat([params**(i+1) for i in range(deg)], dim=-1), -1, keepdim=True)
 
 
-class operator_sta(operator):
-    """Models dynamics of stationary timeseries in a dynamic mode decomposition-like manner."""
+class operator_stationary(operator):
+    """Models dynamics of stationary timeseries in a DMD-like manner."""
 
     def __init__(self, config):
         super().__init__(config)
@@ -252,8 +252,8 @@ class operator_sta(operator):
         utils_nn.unfreeze_module(self.dec_var)
 
 
-class operator_dyn(operator):
-    """Models dynamics of transient timeseries using the attention mechanism."""
+class operator_transient(operator):
+    """Models dynamics of transient timeseries using a Transformer-based attention mechanism."""
 
     def __init__(self, config):
         super().__init__(config)
@@ -430,14 +430,195 @@ class operator_dyn(operator):
         utils_nn.unfreeze_module(self.dec_var)
 
 
+class run_mode(interface):
+    """Represents the current running mode of a model, i.e. fit or evaluate."""
+
+    def __init__(self, model):
+        super().__init__()
+
+        # --! reference to a model that we run
+        self._model = model
+
+    @abstractmethod
+    def fit_next(self):
+        """
+        Advances a model to the next fit phase, provided the next phase is avalable.
+        Returns True if the model has been successfully advanced.
+        """
+        return
+
+    @abstractmethod
+    def fit(self, param):
+        """Fits a model parameterized by ``param``."""
+        return
+
+    @abstractmethod
+    def forward(self, timeseries):
+        """Forwards given ``timeseries`` to the current mode algorithm."""
+        return
+
+    def _forward(self, timeseries):
+
+        if timeseries.shape[1] % self._model.param_kernsize:
+            raise Exception('the size of timeseries is not a multiple of a kernel size')
+
+        # --! execute both operators on given time series
+        timeseries_sta, timeseries_sta_logvar, fun_sta, fun_sta_pred = self._model.operator_sta(timeseries)
+        timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pred = self._model.operator_dyn(timeseries)
+
+        # --! derive alpha
+        timeseries_sta_var   = torch.exp(timeseries_sta_logvar) + 1e-6
+        timeseries_trans_var = torch.exp(timeseries_trans_logvar) + 1e-6
+        alpha = timeseries_trans_var / (timeseries_trans_var + timeseries_sta_var)
+
+        # --! blend the two types of time series using the derived alpha to get the final prediction
+        timeseries_pred = alpha * timeseries_sta + (1 - alpha) * timeseries_trans
+
+        o = (
+            timeseries_pred,
+            timeseries_sta, timeseries_sta_logvar,
+            timeseries_trans, timeseries_trans_logvar,
+            fun_sta, fun_sta_pred,
+            fun_trans, fun_trans_pred,
+            alpha
+        )
+
+        return o
+
+
+class mode_eval(run_mode):
+    """Represents the evaluation mode of a model."""
+
+    def __init__(self, model):
+        super().__init__(model)
+
+    def fit_next(self):
+        print('wrn >> model is in evaluation mode')
+        return False
+
+    def fit(self, param):
+        print('wrn >> model is in evaluation mode')
+        return None
+
+    def forward(self, timeseries):
+        """Predicts given ``timeseries`` in evaluation mode.
+
+        The ``timeseries`` are expected to be unscaled, so that they can be scaled before the main algorithm and
+        then unscaled once results are obtained.
+        """
+
+        # --! remove mean
+        mean = torch.mean(timeseries, dim=1, keepdim=True)
+        timeseries = timeseries - mean
+
+        # --! scale data using minmax to a range from -1 to 1
+        scaler = utils_data.minmax_scaler(feature_range=(-1, 1))
+        timeseries = scaler.fit_transform(timeseries)
+
+        o = self._forward(timeseries)
+
+        # --! extract to-be-unscaled timeseries from the forwarded result
+        timeseries_pred         = o[0]
+        timeseries_sta          = o[1]
+        timeseries_trans        = o[3]
+
+        # --! unscale resulting timeseries
+        timeseries_pred       = scaler.inverse_transform(timeseries_pred)
+        timeseries_pred       = timeseries_pred + mean
+        timeseries_sta        = scaler.inverse_transform(timeseries_sta)
+        timeseries_sta        = timeseries_sta + mean
+        timeseries_trans      = scaler.inverse_transform(timeseries_trans)
+        timeseries_trans      = timeseries_trans + mean
+
+        # --! put unscaled timeseries back to the result tuple and return the tuple
+        o    = list(o)
+        o[0] = timeseries_pred
+        o[1] = timeseries_sta
+        o[3] = timeseries_trans
+
+        return tuple(o)
+
+
+class mode_fit(run_mode):
+    """Represents the fit mode of a model."""
+
+    def __init__(self, model):
+        super().__init__(model)
+
+    def fit_next(self):
+        return self._model._fit_phase.next()
+
+    def fit(self, param):
+
+        # --! first of all, enter the current fit phase to initialize required parameters
+        self._model._fit_phase.enter(param)
+
+        # --! prepare test data
+        testdata    = utils_data.read_datafile(f'{self._model._fit_phase.datadir}/valid', self._model._fit_phase.timeseries_nsample)
+        testdataset = torch.utils.data.TensorDataset(testdata)
+
+        # --! specify an optimizer for fit
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, self._model.parameters()),
+            lr=self._model._fit_phase.learnrate,
+            weight_decay=self._model._fit_phase.weightdecay)
+
+        trainloss_predict    = []
+        trainloss_sta_lin    = []
+        trainloss_dyn_lin    = []
+
+        # --! training duration
+        if self._model._fit_phase.isverbose: print(f"inf >> number of data files for training is {self._model._fit_phase.train_nfile}")
+
+        for ifile in range(self._model._fit_phase.train_nfile):
+            if self._model._fit_phase.isverbose: print(f"inf >> processing training file number {ifile + 1}")
+
+            # --! prepare training data
+            traindata    = utils_data.read_datafile(
+                f'{self._model._fit_phase.datadir}/train{ifile + 1}',
+                self._model._fit_phase.timeseries_nsample)
+            traindataset = torch.utils.data.TensorDataset(traindata)
+            traindatafun = torch.utils.data.DataLoader(traindataset, batch_size=self._model._fit_phase.batsize, shuffle=True)
+
+            # --! train
+            for epoch in range(self._model._fit_phase.nepoch):
+                for data in traindatafun:
+                    timeseries = data[0][:, :self._model._fit_phase.subtimeseries_nsample, :1]
+                    optimizer.zero_grad()
+
+                    # --! fit a model to training time series
+                    loss, loss_predict, loss_lin_g, loss_lin_l = self._model._fit_phase.compute_loss(timeseries)
+
+                    loss.backward()
+                    optimizer.step()
+
+                    with torch.no_grad():
+                        trainloss_predict.append(loss_predict)
+                        trainloss_sta_lin.append(loss_lin_g)
+                        trainloss_dyn_lin.append(loss_lin_l)
+
+        o = (
+            trainloss_predict,
+            trainloss_sta_lin, trainloss_dyn_lin
+        )
+        return o
+
+    def forward(self, timeseries):
+        """Predicts given ``timeseries`` in fit mode.
+
+        The ``timeseries`` are expected to be scaled to range from -1 to 1 with mean removed.
+        """
+        return self._forward(timeseries)
+
+
 class fit_phase(interface):
-    """Manages a certain phase of an operator fit procedure."""
+    """Manages a certain phase of a model fit, e.g. fit a stationary mean, or fit a transient variance."""
 
     def __init__(self, model):
         super().__init__()
 
         # --! reference to model that we fit
-        self.model = model
+        self._model = model
 
         # --! create placeholders for phase parameters
         self.timeseries_nsample    = None
@@ -493,7 +674,7 @@ class fit_phase(interface):
         return loss_fn(timeseries_pred, timeseries)
 
 
-class phase_sta_mean(fit_phase):
+class phase_stationary_mean(fit_phase):
 
     def __init__(self, model):
         super().__init__(model)
@@ -503,15 +684,15 @@ class phase_sta_mean(fit_phase):
 
         super().enter(param)
 
-        self.model.operator_dyn.freeze_mean()
+        self._model.operator_dyn.freeze_mean()
 
-        self.model.operator_sta.unfreeze()
-        self.model.operator_sta.freeze_var()
+        self._model.operator_sta.unfreeze()
+        self._model.operator_sta.freeze_var()
 
         self.datadir = param['stadatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self.model.operator_sta(timeseries)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_sta(timeseries)
 
         loss_dmd = self._compute_meanloss(timeseries, timeseries_predict_mean)
         loss_lin = self._compute_meanloss(fun, fun_predict)
@@ -521,11 +702,11 @@ class phase_sta_mean(fit_phase):
         return loss, loss_dmd, loss_lin, 0.
 
     def next(self):
-        self.model._set_phase(self.model._get_phase_sta_var())
+        self._model._set_phase(self._model._get_phase_sta_var())
         return True
 
 
-class phase_sta_var(fit_phase):
+class phase_stationary_var(fit_phase):
 
     def __init__(self, model):
         super().__init__(model)
@@ -535,26 +716,26 @@ class phase_sta_var(fit_phase):
 
         super().enter(param)
 
-        self.model.operator_dyn.freeze_mean()
+        self._model.operator_dyn.freeze_mean()
 
-        self.model.operator_sta.unfreeze()
-        self.model.operator_sta.freeze_mean()
+        self._model.operator_sta.unfreeze()
+        self._model.operator_sta.freeze_mean()
 
         self.datadir = param['mixdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self.model.operator_sta(timeseries)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_sta(timeseries)
 
         loss = self._compute_varloss(timeseries, timeseries_predict_mean, timeseries_predict_var)
 
         return loss, loss, 0., 0.
 
     def next(self):
-        self.model._set_phase(self.model._get_phase_dyn_mean())
+        self._model._set_phase(self._model._get_phase_dyn_mean())
         return True
 
 
-class phase_dyn_mean(fit_phase):
+class phase_transient_mean(fit_phase):
 
     def __init__(self, model):
         super().__init__(model)
@@ -564,16 +745,16 @@ class phase_dyn_mean(fit_phase):
 
         super().enter(param)
 
-        self.model.operator_dyn.unfreeze()
-        self.model.operator_dyn.freeze_var()
+        self._model.operator_dyn.unfreeze()
+        self._model.operator_dyn.freeze_var()
 
-        self.model.operator_sta.freeze_mean()
-        self.model.operator_sta.freeze_var()
+        self._model.operator_sta.freeze_mean()
+        self._model.operator_sta.freeze_var()
 
         self.datadir = param['transdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self.model.operator_dyn(timeseries)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_dyn(timeseries)
 
         loss_transformer = self._compute_meanloss(timeseries, timeseries_predict_mean)
         loss_lin = self._compute_meanloss(fun, fun_predict)
@@ -583,11 +764,11 @@ class phase_dyn_mean(fit_phase):
         return loss, loss_transformer, 0., loss_lin
 
     def next(self):
-        self.model._set_phase(self.model._get_phase_dyn_var())
+        self._model._set_phase(self._model._get_phase_dyn_var())
         return True
 
 
-class phase_dyn_var(fit_phase):
+class phase_transient_var(fit_phase):
 
     def __init__(self, model):
         super().__init__(model)
@@ -597,20 +778,18 @@ class phase_dyn_var(fit_phase):
 
         super().enter(param)
 
-        self.model.operator_dyn.unfreeze()
-        self.model.operator_dyn.freeze_mean()
+        self._model.operator_dyn.unfreeze()
+        self._model.operator_dyn.freeze_mean()
 
-        self.model.operator_sta.freeze_mean()
-        self.model.operator_sta.freeze_var()
+        self._model.operator_sta.freeze_mean()
+        self._model.operator_sta.freeze_var()
 
         self.datadir = param['mixdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self.model.operator_dyn(timeseries)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_dyn(timeseries)
 
-        #weight = torch.sum(torch.abs(timeseries_predict_mean - timeseries))
         loss = self._compute_varloss(timeseries, timeseries_predict_mean, timeseries_predict_var)
-
         return loss, loss, 0., 0.
 
     def next(self):
@@ -618,9 +797,9 @@ class phase_dyn_var(fit_phase):
 
 
 @dataclass
-class detuning_config:
+class model_config:
     """
-    Stores detuning configuration.
+    Stores KIND model configuration.
     """
 
     # --! number of dimensions and samples in timeseries
@@ -650,9 +829,12 @@ class detuning_config:
     param_kernsize: int
 
 
-class detuning(torch.nn.Module):
-    """
-    Models detuning of a cavity resonance as predictive one-dimensional timeseries.
+class model(torch.nn.Module):
+    """Models Kalman-inpired neural decomposition, or KIND.
+
+    This model captures the evolution of timeseries by first decomposing them into stationary and
+    transient components, predicting these components into the future and
+    finally blending the predictions in a Kalman-inspired manner.
     """
 
     def __init__(self, config):
@@ -663,114 +845,74 @@ class detuning(torch.nn.Module):
         self.timestep              = config.timestep
         self.param_kernsize        = config.param_kernsize
 
-        self.operator_sta = operator_sta(config)
-        self.operator_dyn = operator_dyn(config)
+        self.operator_sta = operator_stationary(config)
+        self.operator_dyn = operator_transient(config)
 
-        self._phase_sta_mean = phase_sta_mean(self)
-        self._phase_sta_var  = phase_sta_var(self)
-        self._phase_dyn_mean = phase_dyn_mean(self)
-        self._phase_dyn_var  = phase_dyn_var(self)
-        self._phase          = self._phase_sta_mean
+        self._fit_phase_sta_mean = phase_stationary_mean(self)
+        self._fit_phase_sta_var  = phase_stationary_var(self)
+        self._fit_phase_dyn_mean = phase_transient_mean(self)
+        self._fit_phase_dyn_var  = phase_transient_var(self)
+        self._fit_phase          = self._fit_phase_sta_mean
+
+        self._mode_fit  = mode_fit(self)
+        self._mode_eval = mode_eval(self)
+        self._mode      = self._mode_fit
 
     def fit_next(self):
-        return self._phase.next()
+        return self._get_mode().fit_next()
 
     def fit(self, param):
-
-        # --! first of all, enter the current fit phase to initialize required parameters
-        self._phase.enter(param)
-
-        # --! prepare test data
-        testdata    = utils_data.read_datafile(f'{self._phase.datadir}/valid', self._phase.timeseries_nsample)
-        testdataset = torch.utils.data.TensorDataset(testdata)
-
-        # --! specify an optimizer for fit
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, self.parameters()),
-            lr=self._phase.learnrate,
-            weight_decay=self._phase.weightdecay)
-
-        trainloss_predict    = []
-        trainloss_sta_lin    = []
-        trainloss_dyn_lin    = []
-
-        # --! training duration
-        if self._phase.isverbose: print(f"inf >> number of data files for training is {self._phase.train_nfile}")
-
-        for ifile in range(self._phase.train_nfile):
-            if self._phase.isverbose: print(f"inf >> processing training file number {ifile + 1}")
-
-            # --! prepare training data
-            traindata     = utils_data.read_datafile(f'{self._phase.datadir}/train{ifile + 1}', self._phase.timeseries_nsample)
-            traindataset  = torch.utils.data.TensorDataset(traindata)
-            traindatafun  = torch.utils.data.DataLoader(traindataset, batch_size=self._phase.batsize, shuffle=True)
-
-            # --! train
-            for epoch in range(self._phase.nepoch):
-                for data in traindatafun:
-                    timeseries = data[0][:, :self._phase.subtimeseries_nsample, :1]
-                    optimizer.zero_grad()
-
-                    # --! fit a model to training time series
-                    loss, loss_predict, loss_lin_g, loss_lin_l = self._phase.compute_loss(timeseries)
-
-                    loss.backward()
-                    optimizer.step()
-
-                    with torch.no_grad():
-                        trainloss_predict.append(loss_predict)
-                        trainloss_sta_lin.append(loss_lin_g)
-                        trainloss_dyn_lin.append(loss_lin_l)
-
-        o = (
-            trainloss_predict,
-            trainloss_sta_lin, trainloss_dyn_lin
-        )
-        return o
+        return self._get_mode().fit(param)
 
     def forward(self, timeseries):
-        """Predicts given ``timeseries``."""
+        return self._get_mode().forward(timeseries)
 
-        if timeseries.shape[1] % self.param_kernsize:
-            raise Exception('the size of timeseries is not a multiple of a kernel size')
+    def train(self, mode: bool = True):
+        """If ``mode`` is True, switches this model into fit mode.
+        Otherwise, if ``mode`` is False, switches this model into evaluation mode.
+        """
 
-        sta_timeseries_predict_mean, sta_timeseries_predict_logvar, sta_fun, sta_fun_predict = self.operator_sta(timeseries)
-        dyn_timeseries_predict_mean, dyn_timeseries_predict_logvar, dyn_fun, dyn_fun_predict = self.operator_dyn(timeseries)
+        if mode is True:
+            self._set_mode(self._get_mode_fit())
+        else:
+            self._set_mode(self._get_mode_eval())
 
-        # --! derive alpha
-        sta_var = torch.exp(sta_timeseries_predict_logvar) + 1e-6
-        dyn_var = torch.exp(dyn_timeseries_predict_logvar) + 1e-6
-        alpha = dyn_var / (dyn_var + sta_var)
+        # --! call the superclass to finish the mode switch
+        return super().train(mode)
 
-        # --! blend predicted timeseries using the derived alpha
-        timeseries_predict = alpha * sta_timeseries_predict_mean + (1 - alpha) * dyn_timeseries_predict_mean
+    def eval(self):
+        """Sets the model in evaluation mode."""
 
-        o = (
-            timeseries_predict,
-            sta_timeseries_predict_mean, sta_timeseries_predict_logvar,
-            dyn_timeseries_predict_mean, dyn_timeseries_predict_logvar,
-            sta_fun, sta_fun_predict,
-            dyn_fun, dyn_fun_predict,
-            alpha
-        )
+        # --! the superclass is called from the train method, so just delegate execution
+        return self.train(False)
 
-        return o
+    def _get_mode_fit(self):
+        return self._mode_fit
+
+    def _get_mode_eval(self):
+        return self._mode_eval
+
+    def _get_mode(self):
+        return self._mode
+
+    def _set_mode(self, mode):
+        self._mode = mode
 
     def _get_phase_sta_mean(self):
-        return self._phase_sta_mean
+        return self._fit_phase_sta_mean
 
     def _get_phase_sta_var(self):
-        return self._phase_sta_var
+        return self._fit_phase_sta_var
 
     def _get_phase_dyn_mean(self):
-        return self._phase_dyn_mean
+        return self._fit_phase_dyn_mean
 
     def _get_phase_dyn_var(self):
-        return self._phase_dyn_var
+        return self._fit_phase_dyn_var
 
     def _get_phase(self):
-        return self._phase
+        return self._fit_phase
 
     def _set_phase(self, phase):
-        self._phase = phase
+        self._fit_phase = phase
 

@@ -4,7 +4,7 @@
 
 import torch
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler as minmax_scaler
+from sklearn.preprocessing import MinMaxScaler
 
 
 def read_datafile(name: str, datachunk_len) -> torch.Tensor:
@@ -126,7 +126,7 @@ def save_testdata(timeseries, dirname, snippet_nsample):
 
         data = np.expand_dims(
             np.concatenate(
-                [scale_timeseries(remove_mean(snip)[:, 0]) for snip in snippet], axis=0), 0)
+                [snip for snip in snippet], axis=0), 0)
 
         datadir  = dirname
         filename = 'eval'
@@ -142,9 +142,30 @@ def scale_timeseries(timeseries):
     range should suit neural network training. The ``timeseries`` are expected
     to be a one-dimensional vector [T], where T is the number of samples.
     """
-    scaler = minmax_scaler(feature_range=(-1, 1))
+    scaler = MinMaxScaler(feature_range=(-1, 1))
 
     # --! format scaler input as column vectors
     scaler_inp = np.vstack([timeseries]).T
     return scaler.fit_transform(scaler_inp)
+
+
+class minmax_scaler:
+    def __init__(self, feature_range=(-1, 1)):
+        self.min = None
+        self.max = None
+        self.scale_min, self.scale_max = feature_range
+
+    def fit_transform(self, timeseries, dim=1):
+
+        # --! remember min and max values of given timeseries
+        self.min = timeseries.min(dim=dim, keepdim=True)[0]
+        self.max = timeseries.max(dim=dim, keepdim=True)[0]
+
+        # --! transform given timeseries according to scaling range
+        scale = (self.scale_max - self.scale_min) / (self.max - self.min + 1e-8)
+        return self.scale_min + (timeseries - self.min) * scale
+
+    def inverse_transform(self, timeseries):
+        scale = (self.max - self.min + 1e-8) / (self.scale_max - self.scale_min)
+        return self.min + (timeseries - self.scale_min) * scale
 

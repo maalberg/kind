@@ -123,9 +123,10 @@ class detuning_sim:
         # --! so we specify the start
         start = 10
 
-        # --! scale detuning to min max
-        dets_sca = [utils_data.scale_timeseries(det[start:]) for det in dets]
+        # --! reshape detuning signals into column vectors
+        dets_sca = [det[start:, np.newaxis] for det in dets]
 
+        # --! add noise if specified
         if noise is not None:
             dets_sca = [d + np.random.normal(0, noise, size=d.shape) for d in dets_sca]
 
