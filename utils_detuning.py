@@ -47,7 +47,12 @@ def cavfun(t, x, sim_self):
             [v_rf[1]]])
 
     # --! input to mechanical mode: accelerating field gradient squared
-    grad = np.sqrt(np.square(x_rf[0]) + np.square(x_rf[1])) # todo: add division by cavity length
+    #
+    # --! field gradient has units MV/m, but since we simulate only one cell,
+    # --! and one cell is approximately 0.1615 meters, then
+    # --! we need to adjust the total gradient
+    grad = np.sqrt(np.square(x_rf[0]) + np.square(x_rf[1]))
+    grad = grad * 0.1615
     u_m = np.square(grad)
 
     # --! update detuning in cavity system dynamics
