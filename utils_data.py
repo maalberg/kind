@@ -46,11 +46,10 @@ def sample_timeseries(rng, nsample, timeseries_nsample, jtimeseries, *timeseries
     # --! randomly locate a suitable sample region inside selected timeseries
     sample_start = int((timeseries_nsample - nsample) * rng.random())
     sample_end   = sample_start + nsample
-    sample       = timeseries[sample_start:sample_end, :1]
+    sample       = timeseries[sample_start:sample_end, :]
 
     # --! remove the mean of this sample and scale it between -1 and 1
-    sample       = remove_mean(sample)
-    sample       = scale_timeseries(sample[:, 0])
+    sample = scale_timeseries(remove_mean(sample))
 
     return sample
 
@@ -122,7 +121,7 @@ def save_testdata(timeseries, dirname, snippet_nsample):
         timeseries_nsample = snippet_nsample * nsnippet
 
         # --! extract the actual saved timeseries and split them into snippets
-        snippet = np.split(timeseries[0][:timeseries_nsample, :1], nsnippet, axis=0)
+        snippet = np.split(timeseries[0][:timeseries_nsample, :], nsnippet, axis=0)
 
         data = np.expand_dims(
             np.concatenate(
@@ -137,16 +136,14 @@ def save_testdata(timeseries, dirname, snippet_nsample):
 
 
 def scale_timeseries(timeseries):
-    """
-    Scales ``timeseries`` using min-max algorithm. The min-max range is -1 to 1, as this
-    range should suit neural network training. The ``timeseries`` are expected
-    to be a one-dimensional vector [T], where T is the number of samples.
+    """Scales ``timeseries`` using from -1 to 1 using min-max algorithm from scikit-learn package.
+
+    The ``timeseries`` are expected to be shaped as [T, N], where T and N
+    are the number of timesteps and features, respectively.
     """
     scaler = MinMaxScaler(feature_range=(-1, 1))
 
-    # --! format scaler input as column vectors
-    scaler_inp = np.vstack([timeseries]).T
-    return scaler.fit_transform(scaler_inp)
+    return scaler.fit_transform(timeseries)
 
 
 class minmax_scaler:

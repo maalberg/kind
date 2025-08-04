@@ -176,7 +176,9 @@ class operator_stationary(operator):
         # --! to [B, 1, C * nfun]
         #
         # --! note that 1 denotes the currently iterated slice
-        return fun.reshape(fun.shape[0], fun.shape[1], -1)
+        fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
+
+        return fun
 
     def predict(self, functions):
 
@@ -271,21 +273,28 @@ class operator_transient(operator):
         embed_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
         self.embed_enc = utils_nn.fcnn(feat=[embed_enc_ni, 64, 64, embed_enc_no], actfun_hid='relu')
 
-        # --! encoder network, which produces adaptation context, acts along the sequence of function
-        # --! values, but its features are the number of these embedding functions
-        adapt_enc_ni = nfun
+        # --! encoder network which learns to attend over slices of embedded function values
+        attend_enc_ni = nfun * self.timeseries_ndim
 
-        # --! the encoder of adaptation context is implemented in terms of a Transformer network
-        self.adapt_enc = torch.nn.TransformerEncoder(
+        # --! the attention encoder is implemented in terms of a Transformer encoder network
+        self.attend_enc = torch.nn.TransformerEncoder(
             torch.nn.TransformerEncoderLayer(
-                d_model=adapt_enc_ni, nhead=1, dim_feedforward=128, batch_first=True),
+                d_model=attend_enc_ni,
+                nhead=1,
+                dim_feedforward=128,
+                batch_first=True),
             num_layers=3,
             enable_nested_tensor=False)
 
+        # --! model order becomes the number of basis functions times the number of data dimensions
+        model_order  = nfun * self.timeseries_ndim
+        model_gen_ni = model_order
+        model_gen_no = model_order * model_order
+
         # --! an additional MLP-based neural network to generate linear time-varying matrices from
-        # --! encoded adaptation context; these matrices enable piecewise-linear
+        # --! encoded attention; these matrices enable piecewise-linear
         # --! predictions of embedding sequences
-        self.model_from = utils_nn.fcnn(feat=[nfun, 64, 64, nfun*nfun], actfun_hid='relu')
+        self.model_gen = utils_nn.fcnn(feat=[model_gen_ni, 64, 64, model_gen_no], actfun_hid='relu')
 
         # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty (mean and variance)
         #
@@ -352,20 +361,20 @@ class operator_transient(operator):
 
         batsize = functions.shape[0]
         horizon = functions.shape[1]
-        nfun    = functions.shape[-1]
+        nfun    = functions.shape[-1] # note that here nfun = nfun * timeseries_ndim
 
-        # --! encode adaptation context in the sequence of function values
+        # --! encode attention over the sequence of function values
         #
         # --! functions, which are shaped as [B, S, F] are encoded to a shape of [B, S, C],
         # --! where B and S are the number of batch elements batsize and sequence steps,
         # --! and where F and C are the number of functions nfun and
         # --! context channels, respectively
-        adapt = torch.split(self.adapt_enc(functions), 1, dim=1)
+        attend = torch.split(self.attend_enc(functions), 1, dim=1)
 
         # --! using context for each sequence step, produce a sequence of linear time-varying matrices
         # --! that locally adapt to changes in dynamics
         mat = torch.cat([
-            self.model_from(context).reshape(batsize, 1, nfun, nfun).transpose(-2, -1) for context in adapt], dim=1)
+            self.model_gen(context).reshape(batsize, 1, nfun, nfun).transpose(-2, -1) for context in attend], dim=1)
 
         # --! accumulate matrix products to enable predictions, such as z2 = A1*z1, z3 = A2*A1*z1, etc,
         # --! where zi are our embeddings, and where Ai are linear time-varying matrices
@@ -415,8 +424,8 @@ class operator_transient(operator):
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.embed_enc)
-        utils_nn.freeze_module(self.adapt_enc)
-        utils_nn.freeze_module(self.model_from)
+        utils_nn.freeze_module(self.attend_enc)
+        utils_nn.freeze_module(self.model_gen)
         utils_nn.freeze_module(self.dec_mean)
 
     def freeze_var(self):
@@ -424,8 +433,8 @@ class operator_transient(operator):
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.embed_enc)
-        utils_nn.unfreeze_module(self.adapt_enc)
-        utils_nn.unfreeze_module(self.model_from)
+        utils_nn.unfreeze_module(self.attend_enc)
+        utils_nn.unfreeze_module(self.model_gen)
         utils_nn.unfreeze_module(self.dec_mean)
         utils_nn.unfreeze_module(self.dec_var)
 
@@ -463,8 +472,8 @@ class run_mode(interface):
             raise Exception('the size of timeseries is not a multiple of a kernel size')
 
         # --! execute both operators on given time series
-        timeseries_sta, timeseries_sta_logvar, fun_sta, fun_sta_pred = self._model.operator_sta(timeseries)
-        timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pred = self._model.operator_dyn(timeseries)
+        timeseries_sta, timeseries_sta_logvar, fun_sta, fun_sta_pred = self._model.operator_stat(timeseries)
+        timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pred = self._model.operator_trans(timeseries)
 
         # --! derive alpha
         timeseries_sta_var   = torch.exp(timeseries_sta_logvar) + 1e-6
@@ -583,7 +592,8 @@ class mode_fit(run_mode):
             # --! train
             for epoch in range(self._model._fit_phase.nepoch):
                 for data in traindatafun:
-                    timeseries = data[0][:, :self._model._fit_phase.subtimeseries_nsample, :1]
+                    # --! take all channels of these time series for training
+                    timeseries = data[0][:, :self._model._fit_phase.subtimeseries_nsample]
                     optimizer.zero_grad()
 
                     # --! fit a model to training time series
@@ -684,15 +694,15 @@ class phase_stationary_mean(fit_phase):
 
         super().enter(param)
 
-        self._model.operator_dyn.freeze_mean()
+        self._model.operator_trans.freeze_mean()
 
-        self._model.operator_sta.unfreeze()
-        self._model.operator_sta.freeze_var()
+        self._model.operator_stat.unfreeze()
+        self._model.operator_stat.freeze_var()
 
         self.datadir = param['stadatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_sta(timeseries)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_stat(timeseries)
 
         loss_dmd = self._compute_meanloss(timeseries, timeseries_predict_mean)
         loss_lin = self._compute_meanloss(fun, fun_predict)
@@ -716,15 +726,15 @@ class phase_stationary_var(fit_phase):
 
         super().enter(param)
 
-        self._model.operator_dyn.freeze_mean()
+        self._model.operator_trans.freeze_mean()
 
-        self._model.operator_sta.unfreeze()
-        self._model.operator_sta.freeze_mean()
+        self._model.operator_stat.unfreeze()
+        self._model.operator_stat.freeze_mean()
 
         self.datadir = param['mixdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_sta(timeseries)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_stat(timeseries)
 
         loss = self._compute_varloss(timeseries, timeseries_predict_mean, timeseries_predict_var)
 
@@ -741,20 +751,20 @@ class phase_transient_mean(fit_phase):
         super().__init__(model)
 
     def enter(self, param):
-        print("inf >> fit: entering dynamic mean phase")
+        print("inf >> fit: entering transient mean phase")
 
         super().enter(param)
 
-        self._model.operator_dyn.unfreeze()
-        self._model.operator_dyn.freeze_var()
+        self._model.operator_trans.unfreeze()
+        self._model.operator_trans.freeze_var()
 
-        self._model.operator_sta.freeze_mean()
-        self._model.operator_sta.freeze_var()
+        self._model.operator_stat.freeze_mean()
+        self._model.operator_stat.freeze_var()
 
         self.datadir = param['transdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_dyn(timeseries)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_trans(timeseries)
 
         loss_transformer = self._compute_meanloss(timeseries, timeseries_predict_mean)
         loss_lin = self._compute_meanloss(fun, fun_predict)
@@ -774,20 +784,20 @@ class phase_transient_var(fit_phase):
         super().__init__(model)
 
     def enter(self, param):
-        print("inf >> fit: entering dynamic variance phase")
+        print("inf >> fit: entering transient variance phase")
 
         super().enter(param)
 
-        self._model.operator_dyn.unfreeze()
-        self._model.operator_dyn.freeze_mean()
+        self._model.operator_trans.unfreeze()
+        self._model.operator_trans.freeze_mean()
 
-        self._model.operator_sta.freeze_mean()
-        self._model.operator_sta.freeze_var()
+        self._model.operator_stat.freeze_mean()
+        self._model.operator_stat.freeze_var()
 
         self.datadir = param['mixdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_dyn(timeseries)
+        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_trans(timeseries)
 
         loss = self._compute_varloss(timeseries, timeseries_predict_mean, timeseries_predict_var)
         return loss, loss, 0., 0.
@@ -845,8 +855,8 @@ class model(torch.nn.Module):
         self.timestep              = config.timestep
         self.param_kernsize        = config.param_kernsize
 
-        self.operator_sta = operator_stationary(config)
-        self.operator_dyn = operator_transient(config)
+        self.operator_stat = operator_stationary(config)
+        self.operator_trans = operator_transient(config)
 
         self._fit_phase_sta_mean = phase_stationary_mean(self)
         self._fit_phase_sta_var  = phase_stationary_var(self)

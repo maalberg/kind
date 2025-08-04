@@ -37,32 +37,43 @@ def plot_dataset(datadir, timeseries_nsample, timestep):
         print(f'{row[0]:>8} {row[1]:>8} {row[2]:>18} {row[3]:>8}')
     print('')
 
+    # --! make time array and a helping line to demarcate a zero level on a plot
     t = torch.linspace(0., timestep*timeseries_nsample, timeseries_nsample)
     zero = torch.zeros_like(t)
 
-    plt.figure(figsize=(9, 3))
+    # --! show two examples for each channel
+    ndata = 2
 
-    ndata = 3
+    # --! limit the number of displayed channels
+    nchannel = 3 if data_train.shape[2] > 3 else data_train.shape[2]
+
+    sub_w = 3
+    sub_h = 3
+    fig_w = nchannel * sub_w
+    fig_h = ndata * sub_h
+
+    plt.figure(figsize=(fig_w, fig_h))
 
     for j in range(ndata):
         data = data_train[j]
 
-        plt.subplot(1, ndata, j + 1)
-        plt.title(f'Training data no. {j}')
-        plt.plot(t, data[:, 0], color='tab:blue', alpha=0.75, label='detuning')
-        plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
-        plt.legend()
-        plt.xlabel('Time [s]')
-        if j == 0: plt.ylabel('Amplitude')
-        plt.tight_layout()
+        for k in range(nchannel):
+            plt.subplot(ndata, nchannel, j*ndata + k + 1)
+            if j==0: plt.title(f'Detuning index {k}')
+            plt.plot(t, data[:, k], color='tab:blue', alpha=0.75)
+            plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
+            if j == ndata - 1: plt.xlabel('Time [s]')
+            if k == 0: plt.ylabel('Amplitude')
+            plt.tight_layout()
+
     plt.show()
 
 
 def plot_eigs(model):
     """Displays eigenvalues of given ``model`` on the unit circle."""
-    print(model.operator_sta.model.weight)
+    print(model.operator_stat.model.weight)
 
-    eigvals, _ = torch.linalg.eig(model.operator_sta.model.weight)
+    eigvals, _ = torch.linalg.eig(model.operator_stat.model.weight)
 
     reals = eigvals.real.view(-1, 1)
     imags = eigvals.imag.view(-1, 1)
@@ -90,15 +101,16 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     """
 
     # --! extract eigenvalues and eigenvectors from a stationary DMD-like operator
-    eigval, eigvec        = torch.linalg.eig(model.operator_sta.model.weight)
+    eigval, eigvec        = torch.linalg.eig(model.operator_stat.model.weight)
     testdata              = utils_data.read_datafile(f'{datadir}/test', timeseries_nsample)
     subtimeseries_nsample = model.timeseries_nsample
+    timeseries_ndim       = model.timeseries_ndim
 
     # --! take the initial condition of timeseries specified by index j and
     # --! embed this initial condition into the latent space
     # --! of the stationary model
-    data_ic     = torch.unsqueeze(testdata[jtimeseries][:model.param_kernsize, :1], 0)
-    fun_ic      = model.operator_sta.embed(data_ic)
+    data_ic     = torch.unsqueeze(testdata[jtimeseries][:model.param_kernsize, :], 0)
+    fun_ic      = model.operator_stat.embed(data_ic)
 
     # --! now multiply eigenvectors and initial conditions together in a dot product fashion to
     # --! find out how aligned these two are, and thus we get our modal amplitude,
@@ -119,7 +131,7 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     jamp        = np.array([range(len(amp[:, 0]))]).reshape(-1, 1) + 1.0
 
     data        = testdata[jtimeseries]
-    timeseries  = torch.unsqueeze(data[:subtimeseries_nsample, :1], dim=0)
+    timeseries  = torch.unsqueeze(data[:subtimeseries_nsample, :], dim=0)
     o           = model(timeseries)
 
     sta_timeseries_predict_mean   = o[1]
@@ -147,15 +159,17 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
 
     plt.subplot(1, 3, 2)
     plt.title('Model response')
-    plt.plot(t[:, 0], timeseries[:, 0], alpha=0.8, color='tab:green', label='$x$')
-    plt.plot(t[:, 0], sta_timeseries_predict_mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
+    for k in range(timeseries_ndim):
+        plt.plot(t[:, 0], timeseries[:, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
+        plt.plot(t[:, 0], sta_timeseries_predict_mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
     plt.xlabel('Time [s]')
     plt.legend()
     plt.tight_layout()
 
     plt.subplot(1, 3, 3)
     plt.title('Uncertainty')
-    plt.plot(t[:, 0], sta_timeseries_predict_var[:, 0], alpha=1, color='tab:blue', label='$\\sigma^2$')
+    for k in range(timeseries_ndim):
+        plt.plot(t[:, 0], sta_timeseries_predict_var[:, k], alpha=1, label='$\\zeta_{' f'{k+1}' + '}$')
     plt.xlabel('Time [s]')
     plt.ylim((0., var_max))
     plt.legend()
@@ -178,6 +192,7 @@ def plot_stationary(model, datadir, timeseries_nsample, datasaved=False):
     # --! helping variables
     subtimeseries_nsample = model.timeseries_nsample
     timestep              = model.timestep
+    timeseries_ndim       = model.timeseries_ndim
     timeseries_dur        = subtimeseries_nsample * timestep
     indeces               = range(data.shape[0])
 
@@ -208,8 +223,9 @@ def plot_stationary(model, datadir, timeseries_nsample, datasaved=False):
         plt.figure(figsize=(6, 3))
 
         plt.subplot(1, 2, 1)
-        plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, 0], alpha=0.8, color='tab:green', label='$x$')
-        plt.plot(t[:subtimeseries_nsample, 0], mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
+        for k in range(timeseries_ndim):
+            plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(t[:subtimeseries_nsample, 0], mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
         plt.ylabel('Amplitude')
         plt.xlabel('Time [s]')
         plt.legend()
@@ -219,7 +235,8 @@ def plot_stationary(model, datadir, timeseries_nsample, datasaved=False):
         maxvar = 0.1 if maxvar < 0.1 else maxvar
 
         plt.subplot(1, 2, 2)
-        plt.plot(t[:subtimeseries_nsample, 0], var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - DMD')
+        for k in range(timeseries_ndim):
+            plt.plot(t[:subtimeseries_nsample, 0], var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
         plt.xlabel('Time [s]')
         plt.ylim((0., maxvar))
         plt.legend()
@@ -242,6 +259,7 @@ def plot_transient(model, datadir, timeseries_nsample, datasaved=False):
     # --! helping variables
     subtimeseries_nsample = model.timeseries_nsample
     timestep              = model.timestep
+    timeseries_ndim       = model.timeseries_ndim
     timeseries_dur        = subtimeseries_nsample * timestep
     indeces               = range(data.shape[0])
 
@@ -272,8 +290,9 @@ def plot_transient(model, datadir, timeseries_nsample, datasaved=False):
         plt.figure(figsize=(6, 3))
 
         plt.subplot(1, 2, 1)
-        plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, 0], alpha=0.8, color='tab:green', label='$x$')
-        plt.plot(t[:subtimeseries_nsample, 0], mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
+        for k in range(timeseries_ndim):
+            plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(t[:subtimeseries_nsample, 0], mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
         plt.ylabel('Amplitude')
         plt.xlabel('Time [s]')
         plt.legend()
@@ -283,7 +302,8 @@ def plot_transient(model, datadir, timeseries_nsample, datasaved=False):
         maxvar = 0.1 if maxvar < 0.1 else maxvar
 
         plt.subplot(1, 2, 2)
-        plt.plot(t[:subtimeseries_nsample, 0], var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - Transformer')
+        for k in range(timeseries_ndim):
+            plt.plot(t[:subtimeseries_nsample, 0], var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
         plt.xlabel('Time [s]')
         plt.ylim((0., maxvar))
         plt.legend()
@@ -302,6 +322,7 @@ def plot_blend(model, datadir, timeseries_nsample, datasaved=False):
     # --! helping variables
     subtimeseries_nsample = model.timeseries_nsample
     timestep              = model.timestep
+    timeseries_ndim       = model.timeseries_ndim
     timeseries_dur        = subtimeseries_nsample * timestep
     indeces               = range(data.shape[0])
 
@@ -337,15 +358,17 @@ def plot_blend(model, datadir, timeseries_nsample, datasaved=False):
         plt.figure(figsize=(12, 3))
 
         plt.subplot(1, 4, 1)
-        plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, 0], alpha=0.8, color='tab:green', label='$x$')
-        plt.plot(t[:subtimeseries_nsample, 0], mean[:, 0], alpha=1, color='tab:blue', linestyle='dashed', label='$\\mu(\\hat{x})$')
+        for k in range(timeseries_ndim):
+            plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(t[:subtimeseries_nsample, 0], mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
         plt.ylabel('Amplitude')
         plt.xlabel('Time [s]')
         plt.legend()
         plt.tight_layout()
 
         plt.subplot(1, 4, 2)
-        plt.plot(t[:subtimeseries_nsample, 0], alpha[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\alpha$')
+        for k in range(timeseries_ndim):
+            plt.plot(t[:subtimeseries_nsample, 0], alpha[:, k], alpha=1, linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
         plt.xlabel('Time [s]')
         plt.ylim((0., 1.))
         plt.xlabel('Time [s]')
@@ -356,7 +379,8 @@ def plot_blend(model, datadir, timeseries_nsample, datasaved=False):
         maxvar = 0.1 if maxvar < 0.1 else maxvar
 
         plt.subplot(1, 4, 3)
-        plt.plot(t[:subtimeseries_nsample, 0], sta_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - DMD')
+        for k in range(timeseries_ndim):
+            plt.plot(t[:subtimeseries_nsample, 0], sta_var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
         plt.xlabel('Time [s]')
         plt.ylim((0., maxvar))
         plt.legend()
@@ -366,7 +390,8 @@ def plot_blend(model, datadir, timeseries_nsample, datasaved=False):
         maxvar = 0.1 if maxvar < 0.1 else maxvar
 
         plt.subplot(1, 4, 4)
-        plt.plot(t[:subtimeseries_nsample, 0], dyn_var[:, 0], alpha=1, color='tab:blue', linestyle='solid', label='$\\sigma^2$ - Transformer')
+        for k in range(timeseries_ndim):
+            plt.plot(t[:subtimeseries_nsample, 0], dyn_var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
         plt.xlabel('Time [s]')
         plt.ylim((0., maxvar))
         plt.legend()

@@ -7,6 +7,29 @@ from matplotlib import pyplot as plt
 
 import utils_data
 
+def make_a_m(t, f, q, fe: float = 0.):
+    """Make matrix A of a mechanical mode.
+
+    The matrix is parameterized by frequency ``f`` in hertz and quality ``q``.
+    The frequency can be made time-varying by setting frequency
+    factor ``fe`` to something else than 0, e.g., if fe > 0,
+    then the frequency will increase with time, and if
+    fe < 0, the frequency will decrease. Time ``t``
+    represents current simulation time.
+    """
+    f = f + fe * t
+    w = 2 * np.pi * f
+    return np.array([
+        [ 0,             1  ],
+        [-np.square(w), -w/q]])
+
+def make_b_m(t, f, k, fe: float = 0.):
+    f = f + fe * t
+    w = 2 * np.pi * f
+    return np.array([
+        [0              ],
+        [-k*np.square(w)]])
+
 def cavfun(t, x, sim_self):
     """
     Executes the logic of cavity differential equations. Input parameters ``t``
@@ -17,8 +40,6 @@ def cavfun(t, x, sim_self):
     K_rf       = sim_self.K_rf
     v_rf       = sim_self.v_rf
     modes_m_n  = sim_self.modes_m_n
-    a_m        = sim_self.a_m
-    b_m        = sim_self.b_m
     t_m        = sim_self.t_m
     a_rf       = sim_self.a_rf
     b_rf       = sim_self.b_rf
@@ -60,9 +81,19 @@ def cavfun(t, x, sim_self):
     a_rf[0, 1] = -disp_m
     a_rf[1, 0] =  disp_m
 
+    f_m  = sim_self.f_m
+    fe_m = sim_self.fe_m
+    q_m  = sim_self.q_m
+
+    k_m = np.ones_like(f_m) * 2 * np.pi * 1. # coupling with units (2 * pi * Hz) / (MV/m)^2
+
+    # --! assemble mechanical system and input matrices, A and B
+    a_m = block_diag(*[make_a_m(t, f, q, fe) for f, fe, q in zip(f_m, fe_m, q_m)])
+    b_m = np.concatenate([make_b_m(t, f, k, fe) for f, fe, k in zip(f_m, fe_m, k_m)], axis=0)
+
     # --! create an additional instance of mechanical matrix B and split it into
     # --! per-mode submatrices
-    b_m_var  = np.copy(b_m)
+    b_m_var  = b_m
     bs_m_var = np.split(b_m_var, b_m_var.shape[0] // 2, axis=0)
 
     # --! split mechanical time boundary array into per-mode parts
@@ -108,8 +139,6 @@ class detuning_sim:
 
         # --! additional placeholders for the properties of cavity mechanical modes
         self.modes_m_n  = None
-        self.a_m        = None
-        self.b_m        = None
         self.t_m        = None
 
     def __call__(self, param, noise=None):
@@ -122,38 +151,33 @@ class detuning_sim:
         #
         # --! the first two data in y are rf i and q, after that come mechanical modes
         # --! as displacement and velocity
-        dets = [self.__sum(o.y[2:]) for o in sim_o]
+        detuning = [self.__sum(o.y[2:]) for o in sim_o]
 
         # --! we want to skip the transient process of an RF cavity when scaling data,
         # --! so we specify the start
         start = 10
 
-        # --! reshape detuning signals into column vectors
-        dets_sca = [det[start:, np.newaxis] for det in dets]
+        # --! skip the first transient samples and reshape detuning row arrays into column arrays
+        detuning = [d[:, start:].T for d in detuning]
 
         # --! add noise if specified
         if noise is not None:
-            dets_sca = [d + np.random.normal(0, noise, size=d.shape) for d in dets_sca]
+            detuning = [d + np.random.normal(0, noise, size=d.shape) for d in detuning]
 
-        return dets_sca
+        return detuning
 
     def __sim(self, param):
         """
-        Simulatea cavity resonance detuning by solving the cavity differential equation.
+        Simulate a cavity resonance detuning by solving the cavity differential equation.
         The equation is parameterized using ``param``.
         """
-        f_m = param['f_m']
-        q_m = param['q_m']
 
-        k_m = np.ones_like(f_m) * 2 * np.pi * 1. # coupling with units (2 * pi * Hz) / (MV/m)^2
-        w_m = 2 * np.pi * f_m
+        self.f_m  = param['f_m']
+        self.fe_m = param['fe_m']
+        self.q_m  = param['q_m']
 
-        self.modes_m_n = len(f_m)
+        self.modes_m_n = len(self.f_m)
         print(f'inf >> number of mechanical modes specified: {self.modes_m_n}')
-
-        # --! assemble mechanical system and input matrices, A and B
-        self.a_m = block_diag(*[self.__make_a_m(w, q) for w, q in zip(w_m, q_m)])
-        self.b_m = np.concatenate([self.__make_b_m(k, w) for k, w in zip(k_m, w_m)], axis=0)
 
         # --! define timing parameters
         t_span = [0, param['t_rf_n'] * self.t_rf]
@@ -190,32 +214,33 @@ class detuning_sim:
         is shaped as [N, T], where N and T are the number of modes
         and the length of time series, respectively.
         """
-        summed = np.zeros_like(modes[0])
+        summed = np.zeros_like(modes[:2])
 
         modes_n = len(modes) // 2
 
         # --! sum displacements
         for i in range(modes_n):
-            summed = summed + modes[2*i]
+            summed[0] = summed[0] + modes[2*i]
+            summed[1] = summed[1] + modes[2*i + 1]
         return summed
 
     def disp(self, detuning, timestep=0.001):
+
         l = len(detuning[:, 0])
         t = np.arange(0., l*timestep, timestep)
-        plt.figure(figsize=(3, 3))
+
+        plt.figure(figsize=(6, 3))
+        plt.subplot(1, 2, 1)
         plt.plot(t, detuning[:, 0])
         plt.xlabel('Time [s]')
-        plt.ylabel('Amplitude')
+        plt.ylabel('Detuning [rad/s]')
         plt.tight_layout()
+
+        plt.subplot(1, 2, 2)
+        plt.plot(t, detuning[:, 1])
+        plt.xlabel('Time [s]')
+        plt.ylabel('dDetuning/dt [rad/s^2]')
+        plt.tight_layout()
+
         plt.show()
-
-    def __make_a_m(self, w, q):
-        return np.array([
-            [ 0,             1  ],
-            [-np.square(w), -w/q]])
-
-    def __make_b_m(self, k, w):
-        return np.array([
-            [0              ],
-            [-k*np.square(w)]])
 
