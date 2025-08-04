@@ -23,7 +23,6 @@ class operator(torch.nn.Module, interface):
         self.timeseries_ndim       = config.timeseries_ndim
         self.timeseries_nsample    = config.timeseries_nsample
         self.timestep              = config.timestep
-        self.fun                   = config.fun
         self.param_kernsize        = config.param_kernsize
 
     @abstractmethod
@@ -95,6 +94,8 @@ class operator_stationary(operator):
 
     def __init__(self, config):
         super().__init__(config)
+
+        self.fun = config.fun_stat
 
         # --! derive some details of basis functions for convenience
         nfun   = len(self.fun)
@@ -259,6 +260,8 @@ class operator_transient(operator):
 
     def __init__(self, config):
         super().__init__(config)
+
+        self.fun = config.fun_trans
 
         # --! derive some details of basis functions for convenience
         nfun   = len(self.fun)
@@ -819,13 +822,14 @@ class model_config:
     # --! timestep that was used to sample timeseries
     timestep: float
 
-    # --! basis functions used to build lifted embedding
+    # --! basis functions used to build lifted embeddings for stationary and transient operators
     #
-    # --! this dictionary is structured as
+    # --! these dictionaries are structured as
     #
-    # --!  *  function name: str
-    # --!  *  number of function parameters: int
-    fun: dict
+    # --!  *  key: function name [str]
+    # --!  *  value: number of function parameters [int]
+    fun_stat: dict
+    fun_trans: dict
 
     # --! size of dynamic parameter filters encoded by an encoder from timeseries data
     #
