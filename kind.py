@@ -110,18 +110,26 @@ class operator_stationary(operator):
         enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
         self.enc = utils_nn.fcnn(feat=[enc_ni, 64, 64, enc_no], actfun_hid='relu')
 
+        # --! this linear transformation is supposed to prune the dimensionality of the
+        # --! basis functions, such that only the number of these basis functions
+        # --! influences the order of the DMD matrix and the number of data
+        # --! dimensions has no effect on the order
+        fun_prune_ni = nfun * self.timeseries_ndim
+        fun_prune_no = nfun
+        self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
+
         # --! create a learnable DMD-like model (a matrix) that captures stationary dynamics
         #
         # --! since this matrix is learned only once and does not adapt during runtime,
         # --! this operator can also be called static, instead of stationary
-        model_ni = nfun * self.timeseries_ndim
-        model_no = nfun * self.timeseries_ndim
+        model_ni = nfun
+        model_no = nfun
         self.model = torch.nn.Linear(model_ni, model_no, bias=False)
 
         # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty (mean and variance)
         #
         # --! features of the variance decoder are doubled to accommodate prediction errors
-        dec_ni          = nfun * self.timeseries_ndim
+        dec_ni          = nfun
         dec_no          = self.param_kernsize * self.timeseries_ndim
         self.dec_mean   = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
         self.dec_var    = utils_nn.fcnn(feat=[dec_ni * 2, 64, 64, dec_no], actfun_hid='relu')
@@ -173,13 +181,12 @@ class operator_stationary(operator):
         # --! a slice, so the granularity of slicing plays an important a role
         fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
 
-        # --! reshape dimensions to go from a shape [B, 1, C, nfun]
-        # --! to [B, 1, C * nfun]
-        #
-        # --! note that 1 denotes the currently iterated slice
+        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nfun]
+        # --! to [B, T / kernsize, ndim * nfun]
         fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
 
-        return fun
+        # --! prune extra dimensionality caused by multidimensional data
+        return self.fun_prune(fun)
 
     def predict(self, functions):
 
@@ -276,8 +283,16 @@ class operator_transient(operator):
         embed_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
         self.embed_enc = utils_nn.fcnn(feat=[embed_enc_ni, 64, 64, embed_enc_no], actfun_hid='relu')
 
+        # --! this linear transformation is supposed to prune the dimensionality of the
+        # --! basis functions, such that only the number of these basis functions
+        # --! influences the order of linear matrices and the number of data
+        # --! dimensions has no effect on that order
+        fun_prune_ni = nfun * self.timeseries_ndim
+        fun_prune_no = nfun
+        self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
+
         # --! encoder network which learns to attend over slices of embedded function values
-        attend_enc_ni = nfun * self.timeseries_ndim
+        attend_enc_ni = nfun
 
         # --! the attention encoder is implemented in terms of a Transformer encoder network
         self.attend_enc = torch.nn.TransformerEncoder(
@@ -289,20 +304,13 @@ class operator_transient(operator):
             num_layers=3,
             enable_nested_tensor=False)
 
-        # --! model order becomes the number of basis functions times the number of data dimensions
-        model_order  = nfun * self.timeseries_ndim
-        model_gen_ni = model_order
-        model_gen_no = model_order * model_order
-
         # --! an additional MLP-based neural network to generate linear time-varying matrices from
         # --! encoded attention; these matrices enable piecewise-linear
         # --! predictions of embedding sequences
-        self.model_gen = utils_nn.fcnn(feat=[model_gen_ni, 64, 64, model_gen_no], actfun_hid='relu')
+        self.model_gen = utils_nn.fcnn(feat=[nfun, 64, 64, nfun*nfun], actfun_hid='relu')
 
-        # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty (mean and variance)
-        #
-        # --! features of the variance decoder are doubled to accommodate prediction errors
-        dec_ni        = nfun * self.timeseries_ndim
+        # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
+        dec_ni        = nfun
         dec_no        = self.param_kernsize * self.timeseries_ndim
         self.dec_mean = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
         self.dec_var  = utils_nn.fcnn(feat=[dec_ni * 3, 64, 64, dec_no], actfun_hid='relu')
@@ -354,17 +362,18 @@ class operator_transient(operator):
         # --! a slice, so the granularity of slicing plays an important a role
         fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
 
-        # --! reshape dimensions to go from a shape [B, 1, C, nfun]
-        # --! to [B, 1, C * nfun]
-        #
-        # --! note that 1 denotes the currently iterated slice
-        return fun.reshape(fun.shape[0], fun.shape[1], -1)
+        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nfun]
+        # --! to [B, T / kernsize, ndim * nfun]
+        fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
+
+        # --! prune extra dimensionality caused by multidimensional data
+        return self.fun_prune(fun)
 
     def predict(self, functions):
 
         batsize = functions.shape[0]
         horizon = functions.shape[1]
-        nfun    = functions.shape[-1] # note that here nfun = nfun * timeseries_ndim
+        nfun    = functions.shape[-1]
 
         # --! encode attention over the sequence of function values
         #
