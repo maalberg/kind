@@ -71,9 +71,9 @@ def plot_dataset(datadir, timeseries_nsample, timestep):
 
 def plot_eigs(model):
     """Displays eigenvalues of given ``model`` on the unit circle."""
-    print(model.operator_stat.model.weight)
+    print(model.operator_stat.model_mean.weight)
 
-    eigvals, _ = torch.linalg.eig(model.operator_stat.model.weight)
+    eigvals, _ = torch.linalg.eig(model.operator_stat.model_mean.weight)
 
     reals = eigvals.real.view(-1, 1)
     imags = eigvals.imag.view(-1, 1)
@@ -101,7 +101,7 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     """
 
     # --! extract eigenvalues and eigenvectors from a stationary DMD-like operator
-    eigval, eigvec        = torch.linalg.eig(model.operator_stat.model.weight)
+    eigval, eigvec        = torch.linalg.eig(model.operator_stat.model_mean.weight)
     testdata              = utils_data.read_datafile(f'{datadir}/test', timeseries_nsample)
     subtimeseries_nsample = model.timeseries_nsample
     timeseries_ndim       = model.timeseries_ndim
@@ -134,15 +134,16 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     timeseries  = torch.unsqueeze(data[:subtimeseries_nsample, :], dim=0)
     o           = model(timeseries)
 
-    sta_timeseries_predict_mean   = o[1]
-    sta_timeseries_predict_logvar = o[2]
-    timeseries                    = torch.squeeze(timeseries, dim=0)
-    sta_timeseries_predict_mean   = torch.squeeze(sta_timeseries_predict_mean, dim=0)
-    sta_timeseries_predict_logvar = torch.squeeze(sta_timeseries_predict_logvar, dim=0)
+    timeseries_predict_mean   = o[1]
+    timeseries_predict_logvar = o[2]
 
-    sta_timeseries_predict_var = torch.exp(sta_timeseries_predict_logvar) + 1e-6
+    timeseries                = torch.squeeze(timeseries, dim=0)
+    timeseries_predict_mean   = torch.squeeze(timeseries_predict_mean, dim=0)
+    timeseries_predict_logvar = torch.squeeze(timeseries_predict_logvar, dim=0)
 
-    var_max = torch.max(sta_timeseries_predict_var)
+    timeseries_predict_var = torch.exp(timeseries_predict_logvar) + 1e-6
+
+    var_max = torch.max(timeseries_predict_var)
     var_max = 0.1 if var_max < 0.1 else var_max
 
     timestep = model.timestep
@@ -161,7 +162,7 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     plt.title('Model response')
     for k in range(timeseries_ndim):
         plt.plot(t[:, 0], timeseries[:, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
-        plt.plot(t[:, 0], sta_timeseries_predict_mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
+        plt.plot(t[:, 0], timeseries_predict_mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
     plt.xlabel('Time [s]')
     plt.legend()
     plt.tight_layout()
@@ -169,7 +170,7 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     plt.subplot(1, 3, 3)
     plt.title('Uncertainty')
     for k in range(timeseries_ndim):
-        plt.plot(t[:, 0], sta_timeseries_predict_var[:, k], alpha=1, label='$\\zeta_{' f'{k+1}' + '}$')
+        plt.plot(t[:, 0], timeseries_predict_var[:, k], alpha=1, label='$\\zeta_{' f'{k+1}' + '}$')
     plt.xlabel('Time [s]')
     plt.ylim((0., var_max))
     plt.legend()

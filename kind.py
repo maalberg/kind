@@ -12,6 +12,8 @@ from dataclasses import dataclass
 import utils_data
 import utils_nn
 
+from matplotlib import pyplot as plt
+
 
 class operator(torch.nn.Module, interface):
     """Models dynamics of timeseries."""
@@ -124,15 +126,19 @@ class operator_stationary(operator):
         # --! this operator can also be called static, instead of stationary
         model_ni = nfun
         model_no = nfun
-        self.model = torch.nn.Linear(model_ni, model_no, bias=False)
+        self.model_mean = torch.nn.Linear(model_ni, model_no, bias=False)
 
-        # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty (mean and variance)
-        #
-        # --! features of the variance decoder are doubled to accommodate prediction errors
+        # --! create a learnable model (a matrix) to capture the evolution of model uncertainty
+        unc_ni = nfun
+        unc_no = nfun
+        self.model_unc = torch.nn.Linear(unc_ni, unc_no, bias=False)
+        print(self.model_unc.weight)
+
+        # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
         dec_ni          = nfun
         dec_no          = self.param_kernsize * self.timeseries_ndim
         self.dec_mean   = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
-        self.dec_var    = utils_nn.fcnn(feat=[dec_ni * 2, 64, 64, dec_no], actfun_hid='relu')
+        self.dec_unc    = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -188,7 +194,7 @@ class operator_stationary(operator):
         # --! prune extra dimensionality caused by multidimensional data
         return self.fun_prune(fun)
 
-    def predict(self, functions):
+    def predict(self, functions, model):
 
         horizon = functions.shape[1]
 
@@ -196,7 +202,7 @@ class operator_stationary(operator):
         #
         # --! the matrix is unsqueezed to a shape [1, nfun, nfun] to allow
         # --! broadcasting when multiplying with functions
-        mat = torch.unsqueeze(self.model.weight, 0)
+        mat = torch.unsqueeze(model.weight, 0)
 
         # --! stack together matrices raised to powers to cover all prediction horizon
         #
@@ -225,41 +231,62 @@ class operator_stationary(operator):
         return torch.squeeze(fun_predict, -2)
 
     def forward(self, timeseries):
-        fun         = self.embed(timeseries)
-        fun_predict = self.predict(fun)
 
-        # --! concatenate an initial condiction of a function with its predicted part to get a full trajectory
-        fun_predict = torch.cat([fun[:, :1], fun_predict], dim=1)
+        # --! from given timeseries, embed latent function values and then predict these embeddings
+        # --! starting from the first value (initial condition) upto a specified horizon
+        fun          = self.embed(timeseries)
+        fun_predict  = self.predict(fun, self.model_mean)
+        fun_predict  = torch.cat([fun[:, :1], fun_predict], dim=1)
+
+        # --! compute function prediction error (difference) and normalize the error to
+        # --! improve, stabilize subsequent learning of the error dynamics
+        dfun         = fun_predict - fun
+        dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
+        dfun         = dfun - dfun_mean
+        scaler       = utils_data.minmax_scaler(feature_range=(-1, 1))
+        dfun         = scaler.fit_transform(dfun)
+
+        # --! predict the evolution of function error starting from the first error value upto
+        # --! a specified horizon
+        dfun_predict = self.predict(dfun, self.model_unc)
+        dfun_predict = torch.cat([dfun[:, :1], dfun_predict], dim=1)
+
+        # --! denormalize predicted errors to restore original magnitudes, which are essential for
+        # --! decoding the right uncertainty magnitudes
+        dfun_predict_unsca = scaler.inverse_transform(dfun_predict)
+        dfun_predict_unsca = dfun_predict_unsca + dfun_mean
 
         # --! decode predicted embeddings to timeseries
         #
         # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
         # --! so we reshape the decoded results back to their
-        # --! original shape [B, T, C]
+        # --! original shape [B, T, ndim]
         timeseries_predict_mean  = self.dec_mean(fun_predict)
         timeseries_predict_mean  = timeseries_predict_mean.reshape(timeseries_predict_mean.shape[0], -1, self.timeseries_ndim)
 
-        # --! to facilitate variance learning we explicitly provide prediction error along the prediction itself
-        dfun                     = fun_predict - fun
-        dec_var_i                = torch.cat([fun_predict, dfun], dim=-1)
-        timeseries_predict_var   = self.dec_var(dec_var_i)
-        timeseries_predict_var   = timeseries_predict_var.reshape(timeseries_predict_var.shape[0], -1, self.timeseries_ndim)
+        # --! decode predicted and denormalized function errors to model uncertainty
+        timeseries_predict_unc   = self.dec_unc(dfun_predict_unsca)
+        timeseries_predict_unc   = timeseries_predict_unc.reshape(timeseries_predict_unc.shape[0], -1, self.timeseries_ndim)
 
-        return timeseries_predict_mean, timeseries_predict_var, fun, fun_predict
+        return timeseries_predict_mean, timeseries_predict_unc, fun, fun_predict, dfun, dfun_predict
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.enc)
-        utils_nn.freeze_module(self.model)
+        utils_nn.freeze_module(self.fun_prune)
+        utils_nn.freeze_module(self.model_mean)
         utils_nn.freeze_module(self.dec_mean)
 
     def freeze_var(self):
-        utils_nn.freeze_module(self.dec_var)
+        utils_nn.freeze_module(self.model_unc)
+        utils_nn.freeze_module(self.dec_unc)
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.enc)
-        utils_nn.unfreeze_module(self.model)
+        utils_nn.unfreeze_module(self.fun_prune)
+        utils_nn.unfreeze_module(self.model_mean)
+        utils_nn.unfreeze_module(self.model_unc)
         utils_nn.unfreeze_module(self.dec_mean)
-        utils_nn.unfreeze_module(self.dec_var)
+        utils_nn.unfreeze_module(self.dec_unc)
 
 
 class operator_transient(operator):
@@ -484,22 +511,22 @@ class run_mode(interface):
             raise Exception('the size of timeseries is not a multiple of a kernel size')
 
         # --! execute both operators on given time series
-        timeseries_sta, timeseries_sta_logvar, fun_sta, fun_sta_pred = self._model.operator_stat(timeseries)
+        timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pred, dfun_stat, dfun_stat_pred = self._model.operator_stat(timeseries)
         timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pred = self._model.operator_trans(timeseries)
 
         # --! derive alpha
-        timeseries_sta_var   = torch.exp(timeseries_sta_logvar) + 1e-6
+        timeseries_stat_var  = torch.exp(timeseries_stat_logvar) + 1e-6
         timeseries_trans_var = torch.exp(timeseries_trans_logvar) + 1e-6
-        alpha = timeseries_trans_var / (timeseries_trans_var + timeseries_sta_var)
+        alpha = timeseries_trans_var / (timeseries_trans_var + timeseries_stat_var)
 
         # --! blend the two types of time series using the derived alpha to get the final prediction
-        timeseries_pred = alpha * timeseries_sta + (1 - alpha) * timeseries_trans
+        timeseries_pred = alpha * timeseries_stat + (1 - alpha) * timeseries_trans
 
         o = (
             timeseries_pred,
-            timeseries_sta, timeseries_sta_logvar,
+            timeseries_stat, timeseries_stat_logvar,
             timeseries_trans, timeseries_trans_logvar,
-            fun_sta, fun_sta_pred,
+            fun_stat, fun_stat_pred,
             fun_trans, fun_trans_pred,
             alpha
         )
@@ -540,21 +567,21 @@ class mode_eval(run_mode):
 
         # --! extract to-be-unscaled timeseries from the forwarded result
         timeseries_pred         = o[0]
-        timeseries_sta          = o[1]
+        timeseries_stat         = o[1]
         timeseries_trans        = o[3]
 
         # --! unscale resulting timeseries
         timeseries_pred       = scaler.inverse_transform(timeseries_pred)
         timeseries_pred       = timeseries_pred + mean
-        timeseries_sta        = scaler.inverse_transform(timeseries_sta)
-        timeseries_sta        = timeseries_sta + mean
+        timeseries_stat       = scaler.inverse_transform(timeseries_stat)
+        timeseries_stat       = timeseries_stat + mean
         timeseries_trans      = scaler.inverse_transform(timeseries_trans)
         timeseries_trans      = timeseries_trans + mean
 
         # --! put unscaled timeseries back to the result tuple and return the tuple
         o    = list(o)
         o[0] = timeseries_pred
-        o[1] = timeseries_sta
+        o[1] = timeseries_stat
         o[3] = timeseries_trans
 
         return tuple(o)
@@ -714,14 +741,14 @@ class phase_stationary_mean(fit_phase):
         self.datadir = param['stadatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_stat(timeseries)
+        timeseries_predict_mean, timeseries_predict_unc, fun, fun_predict, dfun, dfun_predict = self._model.operator_stat(timeseries)
 
-        loss_dmd = self._compute_meanloss(timeseries, timeseries_predict_mean)
-        loss_lin = self._compute_meanloss(fun, fun_predict)
+        loss_recon  = self._compute_meanloss(timeseries, timeseries_predict_mean)
+        loss_linear = self._compute_meanloss(fun, fun_predict)
 
-        loss = loss_dmd + loss_lin
+        loss = loss_recon + loss_linear
 
-        return loss, loss_dmd, loss_lin, 0.
+        return loss, loss_recon, loss_linear, 0.
 
     def next(self):
         self._model._set_phase(self._model._get_phase_sta_var())
@@ -746,11 +773,14 @@ class phase_stationary_var(fit_phase):
         self.datadir = param['mixdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_predict_mean, timeseries_predict_var, fun, fun_predict = self._model.operator_stat(timeseries)
+        timeseries_predict_mean, timeseries_predict_unc, fun, fun_predict, dfun, dfun_predict = self._model.operator_stat(timeseries)
 
-        loss = self._compute_varloss(timeseries, timeseries_predict_mean, timeseries_predict_var)
+        loss_linear = self._compute_meanloss(dfun, dfun_predict)
+        loss_recon  = self._compute_varloss(timeseries, timeseries_predict_mean, timeseries_predict_unc)
 
-        return loss, loss, 0., 0.
+        loss = loss_recon + loss_linear
+
+        return loss, loss_recon, loss_linear, 0.
 
     def next(self):
         self._model._set_phase(self._model._get_phase_dyn_mean())
