@@ -96,3 +96,16 @@ def extract_poly_deg(polynomial: str='poly_1'):
     if deg == 0:
         raise ValueError('zero degree polynomial is not supported')
     return deg
+
+
+def cumprod_mat(mat_array):
+    batsize, nsample, ndim, _ = mat_array.shape
+    cumprod = []
+    prevprod = torch.eye(ndim).unsqueeze(0).repeat(batsize, 1, 1)
+
+    for j in range(nsample):
+        prod = mat_array[:, j] @ prevprod
+        cumprod.append(prod)
+        prevprod = prod
+
+    return torch.stack(cumprod, dim=1)

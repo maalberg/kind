@@ -12,8 +12,6 @@ from dataclasses import dataclass
 import utils_data
 import utils_nn
 
-from matplotlib import pyplot as plt
-
 
 class operator(torch.nn.Module, interface):
     """Models dynamics of timeseries."""
@@ -33,8 +31,13 @@ class operator(torch.nn.Module, interface):
         return
 
     @abstractmethod
-    def predict(self, functions):
+    def predict_mean(self, functions):
         """Predicts ``functions`` embedded in a latent space."""
+        return
+
+    @abstractmethod
+    def predict_var(self, errors):
+        """Predicts ``errors`` of functions embedded in a latent space."""
         return
 
     @abstractmethod
@@ -100,8 +103,9 @@ class operator_stationary(operator):
         self.fun = config.fun_stat
 
         # --! derive some details of basis functions for convenience
-        nfun   = len(self.fun)
-        nparam = sum(self.fun.values())
+        nfun        = len(self.fun)
+        nparam      = sum(self.fun.values())
+        fun_nsample = self.timeseries_nsample // self.param_kernsize
 
         # --! create an MLP-based encoder to encode timeseries into embeddings
         #
@@ -120,25 +124,30 @@ class operator_stationary(operator):
         fun_prune_no = nfun
         self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
-        # --! create a learnable DMD-like model (a matrix) that captures stationary dynamics
+        # --! create a learnable DMD-like model (a matrix) that captures stationary (mean) dynamics
         #
         # --! since this matrix is learned only once and does not adapt during runtime,
         # --! this operator can also be called static, instead of stationary
-        model_ni = nfun
-        model_no = nfun
-        self.model_mean = torch.nn.Linear(model_ni, model_no, bias=False)
+        mean_ni = nfun
+        mean_no = nfun
+        self.model_mean = torch.nn.Linear(mean_ni, mean_no, bias=False)
 
-        # --! create a learnable model (a matrix) to capture the evolution of model uncertainty
-        unc_ni = nfun
-        unc_no = nfun
-        self.model_unc = torch.nn.Linear(unc_ni, unc_no, bias=False)
-        print(self.model_unc.weight)
+        # --! create a learnable model to capture the evolution of function variance
+        #
+        # --! the model takes a flattened sequence of function values and returns
+        # --! a flattened sequence of square matrices
+        #
+        # --! note that the sequence of matrices has one less elements, because we
+        # --! do not predict beyond the sequence of known function values
+        var_ni = fun_nsample * nfun
+        var_no = (fun_nsample - 1) * nfun * nfun
+        self.model_var_gen = utils_nn.fcnn(feat=[var_ni, 128, 128, var_no], actfun_hid='relu')
 
         # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
         dec_ni          = nfun
         dec_no          = self.param_kernsize * self.timeseries_ndim
         self.dec_mean   = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
-        self.dec_unc    = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
+        self.dec_var    = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -194,7 +203,7 @@ class operator_stationary(operator):
         # --! prune extra dimensionality caused by multidimensional data
         return self.fun_prune(fun)
 
-    def predict(self, functions, model):
+    def predict_mean(self, functions):
 
         horizon = functions.shape[1]
 
@@ -202,7 +211,7 @@ class operator_stationary(operator):
         #
         # --! the matrix is unsqueezed to a shape [1, nfun, nfun] to allow
         # --! broadcasting when multiplying with functions
-        mat = torch.unsqueeze(model.weight, 0)
+        mat = torch.unsqueeze(self.model_mean.weight, 0)
 
         # --! stack together matrices raised to powers to cover all prediction horizon
         #
@@ -230,13 +239,35 @@ class operator_stationary(operator):
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
         return torch.squeeze(fun_predict, -2)
 
+    def predict_var(self, errors):
+
+        # --! constants for convenience
+        batsize     = errors.shape[0]
+        fun_nsample = errors.shape[1]
+        nfun        = errors.shape[2]
+
+        i           = torch.flatten(errors, start_dim=1)
+        mat         = self.model_var_gen(i).reshape(batsize, fun_nsample - 1, nfun, nfun)
+        mat         = utils_nn.cumprod_mat(mat)
+
+        err_ic      = torch.unsqueeze(errors[:, :1], -2)
+
+        err_predict = torch.matmul(err_ic, mat)
+
+        # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
+        return torch.squeeze(err_predict, -2)
+
     def forward(self, timeseries):
 
         # --! from given timeseries, embed latent function values and then predict these embeddings
         # --! starting from the first value (initial condition) upto a specified horizon
         fun          = self.embed(timeseries)
-        fun_predict  = self.predict(fun, self.model_mean)
+        fun_predict  = self.predict_mean(fun)
         fun_predict  = torch.cat([fun[:, :1], fun_predict], dim=1)
+
+        # --! some constants for convenience
+        batsize = fun.shape[0]
+        nfun    = fun.shape[-1]
 
         # --! compute function prediction error (difference) and normalize the error to
         # --! improve, stabilize subsequent learning of the error dynamics
@@ -248,7 +279,7 @@ class operator_stationary(operator):
 
         # --! predict the evolution of function error starting from the first error value upto
         # --! a specified horizon
-        dfun_predict = self.predict(dfun, self.model_unc)
+        dfun_predict = self.predict_var(dfun)
         dfun_predict = torch.cat([dfun[:, :1], dfun_predict], dim=1)
 
         # --! denormalize predicted errors to restore original magnitudes, which are essential for
@@ -264,11 +295,11 @@ class operator_stationary(operator):
         timeseries_predict_mean  = self.dec_mean(fun_predict)
         timeseries_predict_mean  = timeseries_predict_mean.reshape(timeseries_predict_mean.shape[0], -1, self.timeseries_ndim)
 
-        # --! decode predicted and denormalized function errors to model uncertainty
-        timeseries_predict_unc   = self.dec_unc(dfun_predict_unsca)
-        timeseries_predict_unc   = timeseries_predict_unc.reshape(timeseries_predict_unc.shape[0], -1, self.timeseries_ndim)
+        # --! decode predicted and denormalized function errors to model uncertainty (variance)
+        timeseries_predict_var   = self.dec_var(dfun_predict_unsca)
+        timeseries_predict_var   = timeseries_predict_var.reshape(timeseries_predict_var.shape[0], -1, self.timeseries_ndim)
 
-        return timeseries_predict_mean, timeseries_predict_unc, fun, fun_predict, dfun, dfun_predict
+        return timeseries_predict_mean, timeseries_predict_var, fun, fun_predict, dfun, dfun_predict
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.enc)
@@ -277,16 +308,16 @@ class operator_stationary(operator):
         utils_nn.freeze_module(self.dec_mean)
 
     def freeze_var(self):
-        utils_nn.freeze_module(self.model_unc)
-        utils_nn.freeze_module(self.dec_unc)
+        utils_nn.freeze_module(self.model_var_gen)
+        utils_nn.freeze_module(self.dec_var)
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.enc)
         utils_nn.unfreeze_module(self.fun_prune)
         utils_nn.unfreeze_module(self.model_mean)
-        utils_nn.unfreeze_module(self.model_unc)
+        utils_nn.unfreeze_module(self.model_var_gen)
         utils_nn.unfreeze_module(self.dec_mean)
-        utils_nn.unfreeze_module(self.dec_unc)
+        utils_nn.unfreeze_module(self.dec_var)
 
 
 class operator_transient(operator):
@@ -396,7 +427,7 @@ class operator_transient(operator):
         # --! prune extra dimensionality caused by multidimensional data
         return self.fun_prune(fun)
 
-    def predict(self, functions):
+    def predict_mean(self, functions):
 
         batsize = functions.shape[0]
         horizon = functions.shape[1]
@@ -438,9 +469,12 @@ class operator_transient(operator):
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
         return torch.squeeze(fun_predict, -2)
 
+    def predict_var(self, errors):
+        pass
+
     def forward(self, timeseries):
         fun         = self.embed(timeseries)
-        fun_predict = self.predict(fun)
+        fun_predict = self.predict_mean(fun)
 
         # --! concatenate an initial condiction of a function with its predicted part to get a full trajectory
         fun_predict = torch.cat([fun[:, :1], fun_predict], dim=1)
