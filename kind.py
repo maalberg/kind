@@ -107,55 +107,55 @@ class operator_stationary(operator):
         nparam      = sum(self.fun.values())
         fun_nsample = self.timeseries_nsample // self.param_kernsize
 
-        # --! create an MLP-based encoder to encode timeseries into embeddings
+        # --! create an encoder to encode timeseries into embedded functions
         #
         # --! more precisely, input timeseries are partitioned into slices, and the encoder
         # --! encodes slice-specific kernels for every function parameter
         # --! in the embedded (latent) space
-        enc_ni   = self.param_kernsize * self.timeseries_ndim
-        enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
-        self.enc = utils_nn.fcnn(feat=[enc_ni, 64, 64, enc_no], actfun_hid='relu')
+        fun_enc_ni   = self.param_kernsize * self.timeseries_ndim
+        fun_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
+        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 64, 64, fun_enc_no], actfun_hid='relu')
 
         # --! this linear transformation is supposed to prune the dimensionality of the
         # --! basis functions, such that only the number of these basis functions
-        # --! influences the order of the DMD matrix and the number of data
+        # --! influences the order of the DMD matrix, whereas the number of data
         # --! dimensions has no effect on the order
         fun_prune_ni = nfun * self.timeseries_ndim
         fun_prune_no = nfun
         self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
-        # --! create a learnable DMD-like model (a matrix) that captures stationary (mean) dynamics
+        # --! create a DMD-like model (a matrix) that captures stationary (mean) dynamics
         #
         # --! since this matrix is learned only once and does not adapt during runtime,
         # --! this operator can also be called static, instead of stationary
-        mean_ni = nfun
-        mean_no = nfun
-        self.model_mean = torch.nn.Linear(mean_ni, mean_no, bias=False)
+        mod_mean_ni = nfun
+        mod_mean_no = nfun
+        self.mod_mean = torch.nn.Linear(mod_mean_ni, mod_mean_no, bias=False)
 
-        # --! create a learnable model to capture the evolution of function variance
+        # --! create a model generator that produces models capturing the evolution of variance (uncertainty)
         #
-        # --! the model takes a flattened sequence of function values and returns
+        # --! the generator takes a flattened sequence of function values and returns
         # --! a flattened sequence of square matrices
         #
         # --! note that the sequence of matrices has one less elements, because we
         # --! do not predict beyond the sequence of known function values
-        var_ni = fun_nsample * nfun
-        var_no = (fun_nsample - 1) * nfun * nfun
-        self.model_var_gen = utils_nn.fcnn(feat=[var_ni, 128, 128, var_no], actfun_hid='relu')
+        mod_var_gen_ni = fun_nsample * nfun
+        mod_var_gen_no = (fun_nsample - 1) * nfun * nfun
+        self.mod_var_gen = utils_nn.fcnn(feat=[mod_var_gen_ni, 64, 64, mod_var_gen_no], actfun_hid='relu')
 
-        # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
-        dec_ni          = nfun
-        dec_no          = self.param_kernsize * self.timeseries_ndim
-        self.dec_mean   = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
-        self.dec_var    = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
+        # --! create prediction decoders to decode predicted embeddings back to timeseries and uncertainty
+        pre_dec_ni        = nfun
+        pre_dec_no        = self.param_kernsize * self.timeseries_ndim
+        self.pre_mean_dec = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
+        self.pre_var_dec  = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
 
     def embed(self, timeseries):
 
         # --! reshape timeseries to form an input to embeddings encoder
         #
         # --! the length of timeseries is reshaped to put kernels into the prelast dimension, i.e.
-        # --! [B, T, C] -> [B, T / kernsize, kernsize, C], where
-        # --! B, T and C are the number of batch elements,
+        # --! [B, T, ndim] -> [B, T / kernsize, kernsize, ndim], where
+        # --! B, T and ndim are the number of batch elements,
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
@@ -163,7 +163,7 @@ class operator_stationary(operator):
         i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.timeseries_ndim)
 
         # --! based on inputs, encode parameter kernels (filters)
-        kern = self.enc(i)
+        kern = self.fun_enc(i)
 
         nparam = sum(self.fun.values())
 
@@ -211,17 +211,16 @@ class operator_stationary(operator):
         #
         # --! the matrix is unsqueezed to a shape [1, nfun, nfun] to allow
         # --! broadcasting when multiplying with functions
-        mat = torch.unsqueeze(self.model_mean.weight, 0)
+        mat = torch.unsqueeze(self.mod_mean.weight, 0)
 
         # --! stack together matrices raised to powers to cover all prediction horizon
         #
         # --! powered matrices are shaped as [B, H - 1, nfun, nfun], where H is the number of horizon steps
         # --! and -1 is because we do not predict the first time step
         #
-        # --! note that dynamics matrices are also transposed to allow multiplication with functions
+        # --! note that we omit matrix transpose here, relying on training to figure it out
         mat_power = torch.stack([
-            torch.transpose(
-                torch.linalg.matrix_power(mat, power), -2, -1) for power in range(1, horizon)], dim=1)
+            torch.linalg.matrix_power(mat, power) for power in range(1, horizon)], dim=1)
 
         # --! extract the initial conditions of function values, i.e. the first slice
         #
@@ -233,11 +232,11 @@ class operator_stationary(operator):
         # --! by powered dynamics matrices
         #
         # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun], i.e.
-        # --! batches with functions trajectories consisting of inidividual function-points [1, nfun]
-        fun_predict = torch.matmul(fun_ic, mat_power)
+        # --! batches with functions trajectories consisting of individual function-points [1, nfun]
+        fun_pre = torch.matmul(fun_ic, mat_power)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        return torch.squeeze(fun_predict, -2)
+        return torch.squeeze(fun_pre, -2)
 
     def predict_var(self, errors):
 
@@ -246,78 +245,88 @@ class operator_stationary(operator):
         fun_nsample = errors.shape[1]
         nfun        = errors.shape[2]
 
+        # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
+        # --! capture the evolution of error values
         i           = torch.flatten(errors, start_dim=1)
-        mat         = self.model_var_gen(i).reshape(batsize, fun_nsample - 1, nfun, nfun)
+        mat         = self.mod_var_gen(i).reshape(batsize, fun_nsample - 1, nfun, nfun)
         mat         = utils_nn.cumprod_mat(mat)
 
+        # --! extract the initial condition of error history
+        #
+        # --! the initial condition (ic) is shaped as [B, 1, 1, nfun] to allow tensor broadcasting
+        # --! when multiplying by the matrices
         err_ic      = torch.unsqueeze(errors[:, :1], -2)
 
-        err_predict = torch.matmul(err_ic, mat)
+        # --! predict the evolution of errors by multiplying their initial conditions by the matrices
+        #
+        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun],
+        # --! i.e. a batch with error trajectories consisting of individual error-points [1, nfun]
+        err_pre = torch.matmul(err_ic, mat)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        return torch.squeeze(err_predict, -2)
+        return torch.squeeze(err_pre, -2)
 
     def forward(self, timeseries):
 
         # --! from given timeseries, embed latent function values and then predict these embeddings
         # --! starting from the first value (initial condition) upto a specified horizon
-        fun          = self.embed(timeseries)
-        fun_predict  = self.predict_mean(fun)
-        fun_predict  = torch.cat([fun[:, :1], fun_predict], dim=1)
+        fun      = self.embed(timeseries)
+        fun_pre  = self.predict_mean(fun)
+        fun_pre  = torch.cat([fun[:, :1], fun_pre], dim=1)
 
         # --! some constants for convenience
         batsize = fun.shape[0]
         nfun    = fun.shape[-1]
 
-        # --! compute function prediction error (difference) and normalize the error to
-        # --! improve, stabilize subsequent learning of the error dynamics
-        dfun         = fun_predict - fun
+        # --! compute a function prediction error (difference) and normalize the error in order to
+        # --! facilitate subsequent learning of the error dynamics
+        dfun         = fun_pre - fun
         dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
         dfun         = dfun - dfun_mean
         scaler       = utils_data.minmax_scaler(feature_range=(-1, 1))
         dfun         = scaler.fit_transform(dfun)
 
-        # --! predict the evolution of function error starting from the first error value upto
+        # --! predict the evolution of a function error starting from the first error value upto
         # --! a specified horizon
-        dfun_predict = self.predict_var(dfun)
-        dfun_predict = torch.cat([dfun[:, :1], dfun_predict], dim=1)
+        dfun_pre = self.predict_var(dfun)
+        dfun_pre = torch.cat([dfun[:, :1], dfun_pre], dim=1)
 
         # --! denormalize predicted errors to restore original magnitudes, which are essential for
         # --! decoding the right uncertainty magnitudes
-        dfun_predict_unsca = scaler.inverse_transform(dfun_predict)
-        dfun_predict_unsca = dfun_predict_unsca + dfun_mean
+        dfun_pre_unsca = scaler.inverse_transform(dfun_pre)
+        dfun_pre_unsca = dfun_pre_unsca + dfun_mean
 
         # --! decode predicted embeddings to timeseries
         #
         # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
         # --! so we reshape the decoded results back to their
         # --! original shape [B, T, ndim]
-        timeseries_predict_mean  = self.dec_mean(fun_predict)
-        timeseries_predict_mean  = timeseries_predict_mean.reshape(timeseries_predict_mean.shape[0], -1, self.timeseries_ndim)
+        timeseries_pre_mean  = self.pre_mean_dec(fun_pre)
+        timeseries_pre_mean  = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.timeseries_ndim)
 
         # --! decode predicted and denormalized function errors to model uncertainty (variance)
-        timeseries_predict_var   = self.dec_var(dfun_predict_unsca)
-        timeseries_predict_var   = timeseries_predict_var.reshape(timeseries_predict_var.shape[0], -1, self.timeseries_ndim)
+        timeseries_pre_var   = self.pre_var_dec(dfun_pre_unsca)
+        timeseries_pre_var   = timeseries_pre_var.reshape(timeseries_pre_var.shape[0], -1, self.timeseries_ndim)
 
-        return timeseries_predict_mean, timeseries_predict_var, fun, fun_predict, dfun, dfun_predict
+        return timeseries_pre_mean, timeseries_pre_var, fun, fun_pre, dfun, dfun_pre
 
     def freeze_mean(self):
-        utils_nn.freeze_module(self.enc)
+        utils_nn.freeze_module(self.fun_enc)
         utils_nn.freeze_module(self.fun_prune)
-        utils_nn.freeze_module(self.model_mean)
-        utils_nn.freeze_module(self.dec_mean)
+        utils_nn.freeze_module(self.mod_mean)
+        utils_nn.freeze_module(self.pre_mean_dec)
 
     def freeze_var(self):
-        utils_nn.freeze_module(self.model_var_gen)
-        utils_nn.freeze_module(self.dec_var)
+        utils_nn.freeze_module(self.mod_var_gen)
+        utils_nn.freeze_module(self.pre_var_dec)
 
     def unfreeze(self):
-        utils_nn.unfreeze_module(self.enc)
+        utils_nn.unfreeze_module(self.fun_enc)
         utils_nn.unfreeze_module(self.fun_prune)
-        utils_nn.unfreeze_module(self.model_mean)
-        utils_nn.unfreeze_module(self.model_var_gen)
-        utils_nn.unfreeze_module(self.dec_mean)
-        utils_nn.unfreeze_module(self.dec_var)
+        utils_nn.unfreeze_module(self.mod_mean)
+        utils_nn.unfreeze_module(self.mod_var_gen)
+        utils_nn.unfreeze_module(self.pre_mean_dec)
+        utils_nn.unfreeze_module(self.pre_var_dec)
 
 
 class operator_transient(operator):
@@ -331,15 +340,16 @@ class operator_transient(operator):
         # --! derive some details of basis functions for convenience
         nfun   = len(self.fun)
         nparam = sum(self.fun.values())
+        fun_nsample = self.timeseries_nsample // self.param_kernsize
 
-        # --! create an MLP-based encoder to encode timeseries into embeddings
+        # --! create an MLP-based encoder to encode timeseries into embedded functions
         #
         # --! more precisely, input timeseries are partitioned into slices, and the encoder
         # --! encodes slice-specific kernels for every function parameter
         # --! in the embedded (latent) space
-        embed_enc_ni   = self.param_kernsize * self.timeseries_ndim
-        embed_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
-        self.embed_enc = utils_nn.fcnn(feat=[embed_enc_ni, 64, 64, embed_enc_no], actfun_hid='relu')
+        fun_enc_ni   = self.param_kernsize * self.timeseries_ndim
+        fun_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
+        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 64, 64, fun_enc_no], actfun_hid='relu')
 
         # --! this linear transformation is supposed to prune the dimensionality of the
         # --! basis functions, such that only the number of these basis functions
@@ -350,36 +360,36 @@ class operator_transient(operator):
         self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
         # --! encoder network which learns to attend over slices of embedded function values
-        attend_enc_ni = nfun
+        att_enc_ni = nfun
 
         # --! the attention encoder is implemented in terms of a Transformer encoder network
-        self.attend_enc = torch.nn.TransformerEncoder(
+        self.att_enc = torch.nn.TransformerEncoder(
             torch.nn.TransformerEncoderLayer(
-                d_model=attend_enc_ni,
+                d_model=att_enc_ni,
                 nhead=1,
                 dim_feedforward=128,
                 batch_first=True),
             num_layers=3,
             enable_nested_tensor=False)
 
-        # --! an additional MLP-based neural network to generate linear time-varying matrices from
+        # --! an additional generator to create linear time-varying matrices from
         # --! encoded attention; these matrices enable piecewise-linear
-        # --! predictions of embedding sequences
-        self.model_gen = utils_nn.fcnn(feat=[nfun, 64, 64, nfun*nfun], actfun_hid='relu')
+        # --! predictions of mean embedding sequences
+        self.mod_mean_gen = utils_nn.fcnn(feat=[nfun, 64, 64, nfun*nfun], actfun_hid='relu')
 
         # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
-        dec_ni        = nfun
-        dec_no        = self.param_kernsize * self.timeseries_ndim
-        self.dec_mean = utils_nn.fcnn(feat=[dec_ni, 64, 64, dec_no], actfun_hid='relu')
-        self.dec_var  = utils_nn.fcnn(feat=[dec_ni * 3, 64, 64, dec_no], actfun_hid='relu')
+        pre_dec_ni        = nfun
+        pre_dec_no        = self.param_kernsize * self.timeseries_ndim
+        self.pre_mean_dec = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
+        self.pre_var_dec  = utils_nn.fcnn(feat=[pre_dec_ni * 3, 64, 64, pre_dec_no], actfun_hid='relu')
 
     def embed(self, timeseries):
 
         # --! reshape timeseries to form an input to embeddings encoder
         #
         # --! the length of timeseries is reshaped to put kernels into the prelast dimension, i.e.
-        # --! [B, T, C] -> [B, T / kernsize, kernsize, C], where
-        # --! B, T and C are the number of batch elements,
+        # --! [B, T, ndim] -> [B, T / kernsize, kernsize, ndim], where
+        # --! B, T and ndim are the number of batch elements,
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
@@ -387,7 +397,7 @@ class operator_transient(operator):
         i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.timeseries_ndim)
 
         # --! based on inputs, encode parameter kernels (filters)
-        kern = self.embed_enc(i)
+        kern = self.fun_enc(i)
 
         nparam = sum(self.fun.values())
 
@@ -435,23 +445,22 @@ class operator_transient(operator):
 
         # --! encode attention over the sequence of function values
         #
-        # --! functions, which are shaped as [B, S, F] are encoded to a shape of [B, S, C],
-        # --! where B and S are the number of batch elements batsize and sequence steps,
-        # --! and where F and C are the number of functions nfun and
-        # --! context channels, respectively
-        attend = torch.split(self.attend_enc(functions), 1, dim=1)
+        # --! functions, which are shaped as [B, T / kernzise, nfun] are encoded into attention with the same shape
+        att = torch.split(self.att_enc(functions), 1, dim=1)
 
-        # --! using context for each sequence step, produce a sequence of linear time-varying matrices
-        # --! that locally adapt to changes in dynamics
+        # --! using attention for each sequence step (rows of attention matrix), produce a sequence of
+        # --! linear time-varying matrices that locally adapt to changes in dynamics
+        #
+        # --! note that we omit matrix transpose here, relying on training to figure it out
         mat = torch.cat([
-            self.model_gen(context).reshape(batsize, 1, nfun, nfun).transpose(-2, -1) for context in attend], dim=1)
+            self.mod_mean_gen(a).reshape(batsize, 1, nfun, nfun) for a in att], dim=1)
 
         # --! accumulate matrix products to enable predictions, such as z2 = A1*z1, z3 = A2*A1*z1, etc,
         # --! where zi are our embeddings, and where Ai are linear time-varying matrices
         #
         # --! we omit the last matrix in the sequence An, because there is no way to check the correctness
         # --! of the corresponding forecasted result z{n+1}
-        mat = torch.cumprod(mat[:, :-1], dim=1)
+        mat = utils_nn.cumprod_mat(mat[:, :-1])
 
         # --! extract the initial conditions of function values, i.e. the first slice
         #
@@ -464,52 +473,54 @@ class operator_transient(operator):
         #
         # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun], i.e.
         # --! batches with functions trajectories consisting of inidividual function-points [1, nfun]
-        fun_predict = torch.matmul(fun_ic, mat)
+        fun_pre = torch.matmul(fun_ic, mat)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        return torch.squeeze(fun_predict, -2)
+        return torch.squeeze(fun_pre, -2)
 
     def predict_var(self, errors):
         pass
 
     def forward(self, timeseries):
-        fun         = self.embed(timeseries)
-        fun_predict = self.predict_mean(fun)
+        fun     = self.embed(timeseries)
+        fun_pre = self.predict_mean(fun)
 
         # --! concatenate an initial condiction of a function with its predicted part to get a full trajectory
-        fun_predict = torch.cat([fun[:, :1], fun_predict], dim=1)
+        fun_pre = torch.cat([fun[:, :1], fun_pre], dim=1)
 
         # --! decode predicted embeddings to timeseries
         #
         # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
         # --! so we reshape the decoded timeseries back to their
         # --! original shape [B, T, C]
-        timeseries_predict_mean = self.dec_mean(fun_predict)
-        timeseries_predict_mean = timeseries_predict_mean.reshape(timeseries_predict_mean.shape[0], -1, self.timeseries_ndim)
+        timeseries_pre_mean = self.pre_mean_dec(fun_pre)
+        timeseries_pre_mean = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.timeseries_ndim)
 
         # --! to facilitate variance learning we explicitly provide prediction error along the prediction itself
-        dfun                     = fun_predict - fun
-        dec_var_i                = torch.cat([fun, fun_predict, dfun], dim=-1)
-        timeseries_predict_var   = self.dec_var(dec_var_i)
-        timeseries_predict_var   = timeseries_predict_var.reshape(timeseries_predict_var.shape[0], -1, self.timeseries_ndim)
+        dfun                 = fun_pre - fun
+        dec_var_i            = torch.cat([fun, fun_pre, dfun], dim=-1)
+        timeseries_pre_var   = self.pre_var_dec(dec_var_i)
+        timeseries_pre_var   = timeseries_pre_var.reshape(timeseries_pre_var.shape[0], -1, self.timeseries_ndim)
 
-        return timeseries_predict_mean, timeseries_predict_var, fun, fun_predict
+        return timeseries_pre_mean, timeseries_pre_var, fun, fun_pre
 
     def freeze_mean(self):
-        utils_nn.freeze_module(self.embed_enc)
-        utils_nn.freeze_module(self.attend_enc)
-        utils_nn.freeze_module(self.model_gen)
-        utils_nn.freeze_module(self.dec_mean)
+        utils_nn.freeze_module(self.fun_enc)
+        utils_nn.freeze_module(self.fun_prune)
+        utils_nn.freeze_module(self.att_enc)
+        utils_nn.freeze_module(self.mod_mean_gen)
+        utils_nn.freeze_module(self.pre_mean_dec)
 
     def freeze_var(self):
-        utils_nn.freeze_module(self.dec_var)
+        utils_nn.freeze_module(self.pre_var_dec)
 
     def unfreeze(self):
-        utils_nn.unfreeze_module(self.embed_enc)
-        utils_nn.unfreeze_module(self.attend_enc)
-        utils_nn.unfreeze_module(self.model_gen)
-        utils_nn.unfreeze_module(self.dec_mean)
-        utils_nn.unfreeze_module(self.dec_var)
+        utils_nn.unfreeze_module(self.fun_enc)
+        utils_nn.unfreeze_module(self.fun_prune)
+        utils_nn.unfreeze_module(self.att_enc)
+        utils_nn.unfreeze_module(self.mod_mean_gen)
+        utils_nn.unfreeze_module(self.pre_mean_dec)
+        utils_nn.unfreeze_module(self.pre_var_dec)
 
 
 class run_mode(interface):

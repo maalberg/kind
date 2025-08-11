@@ -71,9 +71,9 @@ def plot_dataset(datadir, timeseries_nsample, timestep):
 
 def plot_eigs(model):
     """Displays eigenvalues of given ``model`` on the unit circle."""
-    print(model.operator_stat.model_mean.weight)
+    print(model.operator_stat.mod_mean.weight)
 
-    eigvals, _ = torch.linalg.eig(model.operator_stat.model_mean.weight)
+    eigvals, _ = torch.linalg.eig(model.operator_stat.mod_mean.weight)
 
     reals = eigvals.real.view(-1, 1)
     imags = eigvals.imag.view(-1, 1)
@@ -101,7 +101,7 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     """
 
     # --! extract eigenvalues and eigenvectors from a stationary DMD-like operator
-    eigval, eigvec        = torch.linalg.eig(model.operator_stat.model_mean.weight)
+    eigval, eigvec        = torch.linalg.eig(model.operator_stat.mod_mean.weight)
     testdata              = utils_data.read_datafile(f'{datadir}/test', timeseries_nsample)
     subtimeseries_nsample = model.timeseries_nsample
     timeseries_ndim       = model.timeseries_ndim
