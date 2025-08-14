@@ -103,7 +103,7 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     # --! extract eigenvalues and eigenvectors from a stationary DMD-like operator
     eigval, eigvec        = torch.linalg.eig(model.operator_stat.mod_mean.weight)
     testdata              = utils_data.read_datafile(f'{datadir}/test', timeseries_nsample)
-    subtimeseries_nsample = model.timeseries_nsample
+    lookback_nsample      = model.lookback_nsample
     timeseries_ndim       = model.timeseries_ndim
 
     # --! take the initial condition of timeseries specified by index j and
@@ -131,23 +131,24 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     jamp        = np.array([range(len(amp[:, 0]))]).reshape(-1, 1) + 1.0
 
     data        = testdata[jtimeseries]
-    timeseries  = torch.unsqueeze(data[:subtimeseries_nsample, :], dim=0)
-    o           = model(timeseries)
+    timeseries  = torch.unsqueeze(data, dim=0)
+    model_i     = timeseries[:, :lookback_nsample]
+    model_o     = model.operator_stat(model_i)
 
-    timeseries_predict_mean   = o[1]
-    timeseries_predict_logvar = o[2]
+    timeseries_pre_mean   = model_o[0]
+    timeseries_pre_logvar = model_o[1]
 
-    timeseries                = torch.squeeze(timeseries, dim=0)
-    timeseries_predict_mean   = torch.squeeze(timeseries_predict_mean, dim=0)
-    timeseries_predict_logvar = torch.squeeze(timeseries_predict_logvar, dim=0)
+    timeseries            = torch.squeeze(timeseries, dim=0)
+    timeseries_pre_mean   = torch.squeeze(timeseries_pre_mean, dim=0)
+    timeseries_pre_logvar = torch.squeeze(timeseries_pre_logvar, dim=0)
 
-    timeseries_predict_var = torch.exp(timeseries_predict_logvar) + 1e-6
+    timeseries_pre_var    = torch.exp(timeseries_pre_logvar) + 1e-6
 
-    var_max = torch.max(timeseries_predict_var)
+    var_max = torch.max(timeseries_pre_var)
     var_max = 0.1 if var_max < 0.1 else var_max
 
     timestep = model.timestep
-    t = np.arange(0., subtimeseries_nsample*timestep, timestep).reshape(-1, 1)
+    t = np.arange(0., timeseries_nsample*timestep, timestep).reshape(-1, 1)
 
     plt.figure(figsize=(9,3))
 
@@ -162,7 +163,7 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     plt.title('Model response')
     for k in range(timeseries_ndim):
         plt.plot(t[:, 0], timeseries[:, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
-        plt.plot(t[:, 0], timeseries_predict_mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
+        plt.plot(t[:, 0], timeseries_pre_mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
     plt.xlabel('Time [s]')
     plt.legend()
     plt.tight_layout()
@@ -170,7 +171,7 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     plt.subplot(1, 3, 3)
     plt.title('Uncertainty')
     for k in range(timeseries_ndim):
-        plt.plot(t[:, 0], timeseries_predict_var[:, k], alpha=1, label='$\\zeta_{' f'{k+1}' + '}$')
+        plt.plot(t[:, 0], timeseries_pre_var[:, k], alpha=1, label='$\\zeta_{' f'{k+1}' + '}$')
     plt.xlabel('Time [s]')
     plt.ylim((0., var_max))
     plt.legend()
@@ -191,10 +192,10 @@ def plot_stationary(model, datadir, timeseries_nsample, datasaved=False):
     data = utils_data.read_datafile(f'{datadir}/eval', timeseries_nsample)
 
     # --! helping variables
-    subtimeseries_nsample = model.timeseries_nsample
     timestep              = model.timestep
+    timeseries_dur        = timeseries_nsample * timestep
     timeseries_ndim       = model.timeseries_ndim
-    timeseries_dur        = subtimeseries_nsample * timestep
+    lookback_nsample      = model.lookback_nsample
     indeces               = range(data.shape[0])
 
     # --! data is a batch/array with timeseries, so split it along the batch dimension
@@ -202,9 +203,11 @@ def plot_stationary(model, datadir, timeseries_nsample, datasaved=False):
 
     for j, x in zip(indeces, timeseries):
 
-        # --! call the model
-        o = model(x)
+        # --! extract the lookback window
+        model_i = x[:, :lookback_nsample]
 
+        # --! call the model
+        o      = model(model_i)
         mean   = o[1]
         logvar = o[2]
 
@@ -220,13 +223,19 @@ def plot_stationary(model, datadir, timeseries_nsample, datasaved=False):
         t = np.arange(0., timeseries_dur, timestep).reshape(-1, 1)
         t = t + j*timeseries_dur
 
+        # --! shift the forecast begin to the current window
+        t_forecast_begin = timestep * lookback_nsample + j*timeseries_dur
+        mean_min = torch.min(mean)
+        mean_max = torch.max(mean)
+
         # --! plot prediction result
         plt.figure(figsize=(6, 3))
 
         plt.subplot(1, 2, 1)
+        plt.plot([t_forecast_begin, t_forecast_begin], [mean_min, mean_max], linestyle='dotted', color='gray')
         for k in range(timeseries_ndim):
-            plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
-            plt.plot(t[:subtimeseries_nsample, 0], mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
+            plt.plot(t[:, 0], x[:, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(t[:, 0], mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
         plt.ylabel('Amplitude')
         plt.xlabel('Time [s]')
         plt.legend()
@@ -236,8 +245,9 @@ def plot_stationary(model, datadir, timeseries_nsample, datasaved=False):
         maxvar = 0.1 if maxvar < 0.1 else maxvar
 
         plt.subplot(1, 2, 2)
+        plt.plot([t_forecast_begin, t_forecast_begin], [mean_min, mean_max], linestyle='dotted', color='gray')
         for k in range(timeseries_ndim):
-            plt.plot(t[:subtimeseries_nsample, 0], var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
+            plt.plot(t[:, 0], var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
         plt.xlabel('Time [s]')
         plt.ylim((0., maxvar))
         plt.legend()
@@ -258,10 +268,10 @@ def plot_transient(model, datadir, timeseries_nsample, datasaved=False):
     data = utils_data.read_datafile(f'{datadir}/eval', timeseries_nsample)
 
     # --! helping variables
-    subtimeseries_nsample = model.timeseries_nsample
+    lookback_nsample      = model.lookback_nsample
     timestep              = model.timestep
     timeseries_ndim       = model.timeseries_ndim
-    timeseries_dur        = subtimeseries_nsample * timestep
+    timeseries_dur        = timeseries_nsample * timestep
     indeces               = range(data.shape[0])
 
     # --! data is a batch/array with timeseries, so split it along the batch dimension
@@ -269,9 +279,11 @@ def plot_transient(model, datadir, timeseries_nsample, datasaved=False):
 
     for j, x in zip(indeces, timeseries):
 
-        # --! call the model
-        o = model(x)
+        # --! extract the lookback window
+        model_i = x[:, :lookback_nsample]
 
+        # --! call the model
+        o      = model(model_i)
         mean   = o[3]
         logvar = o[4]
 
@@ -287,13 +299,19 @@ def plot_transient(model, datadir, timeseries_nsample, datasaved=False):
         t = np.arange(0., timeseries_dur, timestep).reshape(-1, 1)
         t = t + j*timeseries_dur
 
+        # --! shift the forecast begin to the current window
+        t_forecast_begin = timestep * lookback_nsample + j*timeseries_dur
+        mean_min = torch.min(mean)
+        mean_max = torch.max(mean)
+
         # --! plot prediction result
         plt.figure(figsize=(6, 3))
 
         plt.subplot(1, 2, 1)
+        plt.plot([t_forecast_begin, t_forecast_begin], [mean_min, mean_max], linestyle='dotted', color='gray')
         for k in range(timeseries_ndim):
-            plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
-            plt.plot(t[:subtimeseries_nsample, 0], mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
+            plt.plot(t[:, 0], x[:, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(t[:, 0], mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
         plt.ylabel('Amplitude')
         plt.xlabel('Time [s]')
         plt.legend()
@@ -303,8 +321,9 @@ def plot_transient(model, datadir, timeseries_nsample, datasaved=False):
         maxvar = 0.1 if maxvar < 0.1 else maxvar
 
         plt.subplot(1, 2, 2)
+        plt.plot([t_forecast_begin, t_forecast_begin], [mean_min, mean_max], linestyle='dotted', color='gray')
         for k in range(timeseries_ndim):
-            plt.plot(t[:subtimeseries_nsample, 0], var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
+            plt.plot(t[:, 0], var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
         plt.xlabel('Time [s]')
         plt.ylim((0., maxvar))
         plt.legend()
@@ -321,10 +340,10 @@ def plot_blend(model, datadir, timeseries_nsample, datasaved=False):
     data = utils_data.read_datafile(f'{datadir}/eval', timeseries_nsample)
 
     # --! helping variables
-    subtimeseries_nsample = model.timeseries_nsample
+    lookback_nsample      = model.lookback_nsample
     timestep              = model.timestep
     timeseries_ndim       = model.timeseries_ndim
-    timeseries_dur        = subtimeseries_nsample * timestep
+    timeseries_dur        = timeseries_nsample * timestep
     indeces               = range(data.shape[0])
 
     # --! data is a batch/array with timeseries, so split it along the batch dimension
@@ -332,67 +351,78 @@ def plot_blend(model, datadir, timeseries_nsample, datasaved=False):
 
     for j, x in zip(indeces, timeseries):
 
-        # --! call the model
-        o = model(x)
+        # --! extract the lookback window
+        model_i = x[:, :lookback_nsample]
 
-        mean       = o[0]
-        sta_logvar = o[2]
-        dyn_logvar = o[4]
-        alpha      = o[9]
+        # --! call the model
+        o             = model(model_i)
+        mean          = o[0]
+        stat_logvar   = o[2]
+        trans_logvar  = o[4]
+        alpha         = o[9]
 
         # --! remove the batch dimension
-        x          = torch.squeeze(x, dim=0)
-        mean       = torch.squeeze(mean, dim=0)
-        sta_logvar = torch.squeeze(sta_logvar, dim=0)
-        dyn_logvar = torch.squeeze(dyn_logvar, dim=0)
-        alpha      = torch.squeeze(alpha, dim=0)
+        x            = torch.squeeze(x, dim=0)
+        mean         = torch.squeeze(mean, dim=0)
+        stat_logvar  = torch.squeeze(stat_logvar, dim=0)
+        trans_logvar = torch.squeeze(trans_logvar, dim=0)
+        alpha        = torch.squeeze(alpha, dim=0)
 
         # --! convert log-variance to variance
-        sta_var    = torch.exp(sta_logvar) + 1e-6
-        dyn_var    = torch.exp(dyn_logvar) + 1e-6
+        stat_var     = torch.exp(stat_logvar) + 1e-6
+        trans_var    = torch.exp(trans_logvar) + 1e-6
 
         # --! create a time vector
         t = np.arange(0., timeseries_dur, timestep).reshape(-1, 1)
         t = t + j*timeseries_dur
 
+        # --! shift the forecast begin to the current window
+        t_forecast_begin = timestep * lookback_nsample + j*timeseries_dur
+        mean_min = torch.min(mean)
+        mean_max = torch.max(mean)
+
         # --! plot prediction result
         plt.figure(figsize=(12, 3))
 
         plt.subplot(1, 4, 1)
+        plt.plot([t_forecast_begin, t_forecast_begin], [mean_min, mean_max], linestyle='dotted', color='gray')
         for k in range(timeseries_ndim):
-            plt.plot(t[:subtimeseries_nsample, 0], x[:subtimeseries_nsample, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
-            plt.plot(t[:subtimeseries_nsample, 0], mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
+            plt.plot(t[:, 0], x[:, k], alpha=0.8, label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(t[:, 0], mean[:, k], alpha=1, linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
         plt.ylabel('Amplitude')
         plt.xlabel('Time [s]')
         plt.legend()
         plt.tight_layout()
 
         plt.subplot(1, 4, 2)
+        plt.plot([t_forecast_begin, t_forecast_begin], [mean_min, mean_max], linestyle='dotted', color='gray')
         for k in range(timeseries_ndim):
-            plt.plot(t[:subtimeseries_nsample, 0], alpha[:, k], alpha=1, linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
+            plt.plot(t[:, 0], alpha[:, k], alpha=1, linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
         plt.xlabel('Time [s]')
         plt.ylim((0., 1.))
         plt.xlabel('Time [s]')
         plt.legend()
         plt.tight_layout()
 
-        maxvar = torch.max(sta_var)
+        maxvar = torch.max(stat_var)
         maxvar = 0.1 if maxvar < 0.1 else maxvar
 
         plt.subplot(1, 4, 3)
+        plt.plot([t_forecast_begin, t_forecast_begin], [mean_min, mean_max], linestyle='dotted', color='gray')
         for k in range(timeseries_ndim):
-            plt.plot(t[:subtimeseries_nsample, 0], sta_var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
+            plt.plot(t[:, 0], stat_var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
         plt.xlabel('Time [s]')
         plt.ylim((0., maxvar))
         plt.legend()
         plt.tight_layout()
 
-        maxvar = torch.max(dyn_var)
+        maxvar = torch.max(trans_var)
         maxvar = 0.1 if maxvar < 0.1 else maxvar
 
         plt.subplot(1, 4, 4)
+        plt.plot([t_forecast_begin, t_forecast_begin], [mean_min, mean_max], linestyle='dotted', color='gray')
         for k in range(timeseries_ndim):
-            plt.plot(t[:subtimeseries_nsample, 0], dyn_var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
+            plt.plot(t[:, 0], trans_var[:, k], alpha=1, linestyle='solid', label='$\\zeta_{' f'{k+1}' + '}$')
         plt.xlabel('Time [s]')
         plt.ylim((0., maxvar))
         plt.legend()
@@ -401,5 +431,5 @@ def plot_blend(model, datadir, timeseries_nsample, datasaved=False):
         plt.show()
 
         if datasaved:
-            savedata = np.expand_dims(np.concatenate([t, x, mean, sta_var, dyn_var, alpha], axis=1), 0)
+            savedata = np.expand_dims(np.concatenate([t, x, mean, stat_var, trans_var, alpha], axis=1), 0)
             utils_data.write_datafile(f'savedata/blendtest_sim{k}', savedata, delim=' ')

@@ -21,9 +21,14 @@ class operator(torch.nn.Module, interface):
 
         # --! store mutual configuration inside this base class
         self.timeseries_ndim       = config.timeseries_ndim
-        self.timeseries_nsample    = config.timeseries_nsample
         self.timestep              = config.timestep
+        self.lookback_nsample      = config.lookback_nsample
+        self.forecast_nsample      = config.forecast_nsample
         self.param_kernsize        = config.param_kernsize
+
+        self.fun_nsample_forecast  = self.forecast_nsample // self.param_kernsize
+        if self.forecast_nsample % self.param_kernsize:
+            self.fun_nsample_forecast = self.fun_nsample_forecast + 1
 
     @abstractmethod
     def embed(self, timeseries):
@@ -105,7 +110,7 @@ class operator_stationary(operator):
         # --! derive some details of basis functions for convenience
         nfun        = len(self.fun)
         nparam      = sum(self.fun.values())
-        fun_nsample = self.timeseries_nsample // self.param_kernsize
+        fun_nsample = self.lookback_nsample // self.param_kernsize
 
         # --! create an encoder to encode timeseries into embedded functions
         #
@@ -136,11 +141,8 @@ class operator_stationary(operator):
         #
         # --! the generator takes a flattened sequence of function values and returns
         # --! a flattened sequence of square matrices
-        #
-        # --! note that the sequence of matrices has one less elements, because we
-        # --! do not predict beyond the sequence of known function values
         mod_var_gen_ni = fun_nsample * nfun
-        mod_var_gen_no = (fun_nsample - 1) * nfun * nfun
+        mod_var_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
         self.mod_var_gen = utils_nn.fcnn(feat=[mod_var_gen_ni, 64, 64, mod_var_gen_no], actfun_hid='relu')
 
         # --! create prediction decoders to decode predicted embeddings back to timeseries and uncertainty
@@ -205,7 +207,10 @@ class operator_stationary(operator):
 
     def predict_mean(self, functions):
 
-        horizon = functions.shape[1]
+        lookback_nsample = functions.shape[1]
+        forecast_nsample = self.fun_nsample_forecast
+
+        horizon = lookback_nsample + forecast_nsample
 
         # --! extract the matrix of stationary dynamics
         #
@@ -236,26 +241,31 @@ class operator_stationary(operator):
         fun_pre = torch.matmul(fun_ic, mat_power)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        return torch.squeeze(fun_pre, -2)
+        fun_pre = torch.squeeze(fun_pre, -2)
+
+        return torch.split(fun_pre, [lookback_nsample - 1, forecast_nsample], dim=1)
 
     def predict_var(self, errors):
 
         # --! constants for convenience
         batsize     = errors.shape[0]
-        fun_nsample = errors.shape[1]
+        err_nsample = errors.shape[1]
         nfun        = errors.shape[2]
 
         # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
         # --! capture the evolution of error values
-        i           = torch.flatten(errors, start_dim=1)
-        mat         = self.mod_var_gen(i).reshape(batsize, fun_nsample - 1, nfun, nfun)
-        mat         = utils_nn.cumprod_mat(mat)
+        #
+        # --! the neural network that generates matrices is already configured to cover the entire
+        # --! prediction horizon, i.e. lookback and forecast windows
+        i    = torch.flatten(errors, start_dim=1)
+        mat  = self.mod_var_gen(i).reshape(batsize, -1, nfun, nfun)
+        mat  = utils_nn.cumprod_mat(mat[:, 1:])
 
         # --! extract the initial condition of error history
         #
         # --! the initial condition (ic) is shaped as [B, 1, 1, nfun] to allow tensor broadcasting
         # --! when multiplying by the matrices
-        err_ic      = torch.unsqueeze(errors[:, :1], -2)
+        err_ic = torch.unsqueeze(errors[:, :1], -2)
 
         # --! predict the evolution of errors by multiplying their initial conditions by the matrices
         #
@@ -264,19 +274,24 @@ class operator_stationary(operator):
         err_pre = torch.matmul(err_ic, mat)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        return torch.squeeze(err_pre, -2)
+        err_pre = torch.squeeze(err_pre, -2)
+
+        # --! return separate predictions for lookback and forecast windows
+        #
+        # --! note that the lookback window is -1, because we do not predict the initial condition
+        return torch.split(err_pre, [err_nsample - 1, self.fun_nsample_forecast], dim=1)
 
     def forward(self, timeseries):
 
         # --! from given timeseries, embed latent function values and then predict these embeddings
         # --! starting from the first value (initial condition) upto a specified horizon
-        fun      = self.embed(timeseries)
-        fun_pre  = self.predict_mean(fun)
-        fun_pre  = torch.cat([fun[:, :1], fun_pre], dim=1)
+        fun                        = self.embed(timeseries)
+        fun_pre, fun_pre_forecast  = self.predict_mean(fun)
+        fun_pre                    = torch.cat([fun[:, :1], fun_pre], dim=1)
 
         # --! some constants for convenience
-        batsize = fun.shape[0]
-        nfun    = fun.shape[-1]
+        batsize          = fun.shape[0]
+        nfun             = fun.shape[-1]
 
         # --! compute a function prediction error (difference) and normalize the error in order to
         # --! facilitate subsequent learning of the error dynamics
@@ -288,12 +303,12 @@ class operator_stationary(operator):
 
         # --! predict the evolution of a function error starting from the first error value upto
         # --! a specified horizon
-        dfun_pre = self.predict_var(dfun)
-        dfun_pre = torch.cat([dfun[:, :1], dfun_pre], dim=1)
+        dfun_pre, dfun_pre_forecast = self.predict_var(dfun)
+        dfun_pre                    = torch.cat([dfun[:, :1], dfun_pre], dim=1)
 
         # --! denormalize predicted errors to restore original magnitudes, which are essential for
         # --! decoding the right uncertainty magnitudes
-        dfun_pre_unsca = scaler.inverse_transform(dfun_pre)
+        dfun_pre_unsca = scaler.inverse_transform(torch.cat([dfun_pre, dfun_pre_forecast], dim=1))
         dfun_pre_unsca = dfun_pre_unsca + dfun_mean
 
         # --! decode predicted embeddings to timeseries
@@ -301,7 +316,7 @@ class operator_stationary(operator):
         # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
         # --! so we reshape the decoded results back to their
         # --! original shape [B, T, ndim]
-        timeseries_pre_mean  = self.pre_mean_dec(fun_pre)
+        timeseries_pre_mean  = self.pre_mean_dec(torch.cat([fun_pre, fun_pre_forecast], dim=1))
         timeseries_pre_mean  = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.timeseries_ndim)
 
         # --! decode predicted and denormalized function errors to model uncertainty (variance)
@@ -340,7 +355,7 @@ class operator_transient(operator):
         # --! derive some details of basis functions for convenience
         nfun   = len(self.fun)
         nparam = sum(self.fun.values())
-        fun_nsample = self.timeseries_nsample // self.param_kernsize
+        fun_nsample = self.lookback_nsample // self.param_kernsize
 
         # --! create an MLP-based encoder to encode timeseries into embedded functions
         #
@@ -375,19 +390,20 @@ class operator_transient(operator):
         # --! an additional generator to create linear time-varying matrices from
         # --! encoded attention; these matrices enable piecewise-linear
         # --! predictions of mean embedding sequences
+        #
+        # --! the generator takes a flattened sequence of function values and
+        # --! returns a flattened sequence of square matrices,
+        # --! covering all prediction horizon
         mod_mean_gen_ni = fun_nsample * nfun
-        mod_mean_gen_no = fun_nsample * nfun * nfun
+        mod_mean_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
         self.mod_mean_gen = utils_nn.fcnn(feat=[mod_mean_gen_ni, 64, 64, mod_mean_gen_no], actfun_hid='relu')
 
         # --! create a generator that produces models capturing the evolution of variance (uncertainty)
         #
         # --! the generator takes a flattened sequence of function values and returns
         # --! a flattened sequence of square matrices
-        #
-        # --! note that the sequence of matrices has one less elements, because we
-        # --! do not predict beyond the sequence of known function values
         mod_var_gen_ni = fun_nsample * nfun
-        mod_var_gen_no = (fun_nsample - 1) * nfun * nfun
+        mod_var_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
         self.mod_var_gen = utils_nn.fcnn(feat=[mod_var_gen_ni, 64, 64, mod_var_gen_no], actfun_hid='relu')
 
         # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
@@ -452,9 +468,9 @@ class operator_transient(operator):
 
     def predict_mean(self, functions):
 
-        batsize = functions.shape[0]
-        horizon = functions.shape[1]
-        nfun    = functions.shape[-1]
+        batsize     = functions.shape[0]
+        fun_nsample = functions.shape[1]
+        nfun        = functions.shape[2]
 
         # --! encode attention over the sequence of function values
         #
@@ -465,12 +481,15 @@ class operator_transient(operator):
         # --! linear time-varying matrices that locally adapt to changes in dynamics
         #
         # --! note that we omit matrix transpose here, relying on training to figure it out
+        #
+        # --! note also that the neural network, which generates matrices, is already configured to
+        # --! cover the entire prediction horizon, i.e. lookback and forecast windows
         mod_mean_gen_i = torch.flatten(att, start_dim=1)
-        mat            = self.mod_mean_gen(mod_mean_gen_i).reshape(batsize, horizon, nfun, nfun)
+        mat            = self.mod_mean_gen(mod_mean_gen_i).reshape(batsize, -1, nfun, nfun)
 
         # --! accumulate matrix products to enable predictions, such as z2 = A1*z1, z3 = A2*A1*z1, etc,
         # --! where zi are our embeddings, and where Ai are linear time-varying matrices
-        mat = utils_nn.cumprod_mat(mat[:, :-1])
+        mat = utils_nn.cumprod_mat(mat[:, 1:])
 
         # --! extract the initial conditions of function values, i.e. the first slice
         #
@@ -486,20 +505,25 @@ class operator_transient(operator):
         fun_pre = torch.matmul(fun_ic, mat)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        return torch.squeeze(fun_pre, -2)
+        fun_pre = torch.squeeze(fun_pre, -2)
+
+        # --! return separate predictions for lookback and forecast windows
+        #
+        # --! note that the lookback window is -1, because we do not predict the initial condition
+        return torch.split(fun_pre, [fun_nsample - 1, self.fun_nsample_forecast], dim=1)
 
     def predict_var(self, errors):
 
         # --! constants for convenience
         batsize     = errors.shape[0]
-        fun_nsample = errors.shape[1]
+        err_nsample = errors.shape[1]
         nfun        = errors.shape[2]
 
         # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
         # --! capture the evolution of error values
         i           = torch.flatten(errors, start_dim=1)
-        mat         = self.mod_var_gen(i).reshape(batsize, fun_nsample - 1, nfun, nfun)
-        mat         = utils_nn.cumprod_mat(mat)
+        mat         = self.mod_var_gen(i).reshape(batsize, -1, nfun, nfun)
+        mat         = utils_nn.cumprod_mat(mat[:, 1:])
 
         # --! extract the initial condition of error history
         #
@@ -514,15 +538,20 @@ class operator_transient(operator):
         err_pre = torch.matmul(err_ic, mat)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        return torch.squeeze(err_pre, -2)
+        err_pre = torch.squeeze(err_pre, -2)
+
+        # --! return separate predictions for lookback and forecast windows
+        #
+        # --! note that the lookback window is -1, because we do not predict the initial condition
+        return torch.split(err_pre, [err_nsample - 1, self.fun_nsample_forecast], dim=1)
 
     def forward(self, timeseries):
 
         # --! from given timeseries, embed latent function values and then predict these embeddings
         # --! starting from the first value (initial condition) upto a specified horizon
-        fun     = self.embed(timeseries)
-        fun_pre = self.predict_mean(fun)
-        fun_pre = torch.cat([fun[:, :1], fun_pre], dim=1)
+        fun                       = self.embed(timeseries)
+        fun_pre, fun_pre_forecast = self.predict_mean(fun)
+        fun_pre                   = torch.cat([fun[:, :1], fun_pre], dim=1)
 
         # --! compute a function prediction error (difference) and normalize the error in order to
         # --! facilitate subsequent learning of the error dynamics
@@ -534,12 +563,12 @@ class operator_transient(operator):
 
         # --! predict the evolution of a function error starting from the first error value upto
         # --! a specified horizon
-        dfun_pre = self.predict_var(dfun)
-        dfun_pre = torch.cat([dfun[:, :1], dfun_pre], dim=1)
+        dfun_pre, dfun_pre_forecast = self.predict_var(dfun)
+        dfun_pre                    = torch.cat([dfun[:, :1], dfun_pre], dim=1)
 
         # --! denormalize predicted errors to restore original magnitudes, which are essential for
         # --! decoding the right uncertainty magnitudes
-        dfun_pre_unsca = scaler.inverse_transform(dfun_pre)
+        dfun_pre_unsca = scaler.inverse_transform(torch.cat([dfun_pre, dfun_pre_forecast], dim=1))
         dfun_pre_unsca = dfun_pre_unsca + dfun_mean
 
         # --! decode predicted embeddings to timeseries
@@ -547,7 +576,7 @@ class operator_transient(operator):
         # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
         # --! so we reshape the decoded results back to their
         # --! original shape [B, T, ndim]
-        timeseries_pre_mean = self.pre_mean_dec(fun_pre)
+        timeseries_pre_mean = self.pre_mean_dec(torch.cat([fun_pre, fun_pre_forecast], dim=1))
         timeseries_pre_mean = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.timeseries_ndim)
 
         # --! decode predicted and denormalized function errors to model uncertainty (variance)
@@ -619,10 +648,10 @@ class run_mode(interface):
         alpha = timeseries_trans_var / (timeseries_trans_var + timeseries_stat_var)
 
         # --! blend the two types of time series using the derived alpha to get the final prediction
-        timeseries_pred = alpha * timeseries_stat + (1 - alpha) * timeseries_trans
+        timeseries_pre = alpha * timeseries_stat + (1 - alpha) * timeseries_trans
 
         o = (
-            timeseries_pred,
+            timeseries_pre,
             timeseries_stat, timeseries_stat_logvar,
             timeseries_trans, timeseries_trans_logvar,
             fun_stat, fun_stat_pre,
@@ -648,10 +677,11 @@ class mode_eval(run_mode):
         return None
 
     def forward(self, timeseries):
-        """Predicts given ``timeseries`` in evaluation mode.
+        """Forecasts given ``timeseries`` in evaluation mode.
 
-        The ``timeseries`` are expected to be unscaled, so that they can be scaled before the main algorithm and
-        then unscaled once results are obtained.
+        The ``timeseries`` are expected to represent an unnormalized lookback window. The window is
+        then normalized and forecasted by a number of steps configured in
+        model parameter ``forecast_nsample``.
         """
 
         # --! remove mean
@@ -665,21 +695,21 @@ class mode_eval(run_mode):
         o = self._forward(timeseries)
 
         # --! extract to-be-unscaled timeseries from the forwarded result
-        timeseries_pred         = o[0]
-        timeseries_stat         = o[1]
-        timeseries_trans        = o[3]
+        timeseries_pre       = o[0]
+        timeseries_stat      = o[1]
+        timeseries_trans     = o[3]
 
         # --! unscale resulting timeseries
-        timeseries_pred       = scaler.inverse_transform(timeseries_pred)
-        timeseries_pred       = timeseries_pred + mean
-        timeseries_stat       = scaler.inverse_transform(timeseries_stat)
-        timeseries_stat       = timeseries_stat + mean
-        timeseries_trans      = scaler.inverse_transform(timeseries_trans)
-        timeseries_trans      = timeseries_trans + mean
+        timeseries_pre       = scaler.inverse_transform(timeseries_pre)
+        timeseries_pre       = timeseries_pre + mean
+        timeseries_stat      = scaler.inverse_transform(timeseries_stat)
+        timeseries_stat      = timeseries_stat + mean
+        timeseries_trans     = scaler.inverse_transform(timeseries_trans)
+        timeseries_trans     = timeseries_trans + mean
 
         # --! put unscaled timeseries back to the result tuple and return the tuple
         o    = list(o)
-        o[0] = timeseries_pred
+        o[0] = timeseries_pre
         o[1] = timeseries_stat
         o[3] = timeseries_trans
 
@@ -731,7 +761,7 @@ class mode_fit(run_mode):
             for epoch in range(self._model._fit_phase.nepoch):
                 for data in traindatafun:
                     # --! take all channels of these time series for training
-                    timeseries = data[0][:, :self._model._fit_phase.subtimeseries_nsample]
+                    timeseries = data[0]
                     optimizer.zero_grad()
 
                     # --! fit a model to training time series
@@ -770,7 +800,6 @@ class fit_phase(interface):
 
         # --! create placeholders for phase parameters
         self.timeseries_nsample    = None
-        self.subtimeseries_nsample = None
         self.train_nfile           = None
         self.nepoch                = None
         self.batsize               = None
@@ -787,7 +816,6 @@ class fit_phase(interface):
 
         # --! initialize phase parameters
         self.timeseries_nsample    = param['timeseries_nsample']
-        self.subtimeseries_nsample = param['subtimeseries_nsample']
         self.train_nfile           = param['train_nfile']
         self.nepoch                = param['nepoch']
         self.batsize               = param['batsize']
@@ -840,7 +868,9 @@ class phase_stationary_mean(fit_phase):
         self.datadir = param['stadatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_pre_mean, _, fun, fun_pre, _, _ = self._model.operator_stat(timeseries)
+
+        lookback = timeseries[:, :self._model.lookback_nsample]
+        timeseries_pre_mean, _, fun, fun_pre, _, _ = self._model.operator_stat(lookback)
 
         loss_recon  = self._compute_meanloss(timeseries, timeseries_pre_mean)
         loss_linear = self._compute_meanloss(fun, fun_pre)
@@ -850,7 +880,7 @@ class phase_stationary_mean(fit_phase):
         return loss, loss_recon, loss_linear, 0.
 
     def next(self):
-        self._model._set_phase(self._model._get_phase_sta_var())
+        self._model._set_phase(self._model._get_phase_stat_var())
         return True
 
 
@@ -872,7 +902,9 @@ class phase_stationary_var(fit_phase):
         self.datadir = param['mixdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_pre_mean, timeseries_pre_var, _, _, dfun, dfun_pre = self._model.operator_stat(timeseries)
+
+        lookback = timeseries[:, :self._model.lookback_nsample]
+        timeseries_pre_mean, timeseries_pre_var, _, _, dfun, dfun_pre = self._model.operator_stat(lookback)
 
         loss_linear = self._compute_meanloss(dfun, dfun_pre)
         loss_recon  = self._compute_varloss(timeseries, timeseries_pre_mean, timeseries_pre_var)
@@ -882,7 +914,7 @@ class phase_stationary_var(fit_phase):
         return loss, loss_recon, loss_linear, 0.
 
     def next(self):
-        self._model._set_phase(self._model._get_phase_dyn_mean())
+        self._model._set_phase(self._model._get_phase_trans_mean())
         return True
 
 
@@ -905,7 +937,9 @@ class phase_transient_mean(fit_phase):
         self.datadir = param['transdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_pre_mean, _, fun, fun_pre, _, _ = self._model.operator_trans(timeseries)
+
+        lookback = timeseries[:, :self._model.lookback_nsample]
+        timeseries_pre_mean, _, fun, fun_pre, _, _ = self._model.operator_trans(lookback)
 
         loss_recon  = self._compute_meanloss(timeseries, timeseries_pre_mean)
         loss_linear = self._compute_meanloss(fun, fun_pre)
@@ -915,7 +949,7 @@ class phase_transient_mean(fit_phase):
         return loss, loss_recon, 0., loss_linear
 
     def next(self):
-        self._model._set_phase(self._model._get_phase_dyn_var())
+        self._model._set_phase(self._model._get_phase_trans_var())
         return True
 
 
@@ -938,7 +972,9 @@ class phase_transient_var(fit_phase):
         self.datadir = param['mixdatadir']
 
     def compute_loss(self, timeseries):
-        timeseries_pre_mean, timeseries_pre_var, _, _, dfun, dfun_pre = self._model.operator_trans(timeseries)
+
+        lookback = timeseries[:, :self._model.lookback_nsample]
+        timeseries_pre_mean, timeseries_pre_var, _, _, dfun, dfun_pre = self._model.operator_trans(lookback)
 
         loss_linear = self._compute_meanloss(dfun, dfun_pre)
         loss_recon  = self._compute_varloss(timeseries, timeseries_pre_mean, timeseries_pre_var)
@@ -956,12 +992,17 @@ class model_config:
     Stores KIND model configuration.
     """
 
-    # --! number of dimensions and samples in timeseries
+    # --! number of dimensions in time series
     timeseries_ndim: int
-    timeseries_nsample: int
-
+ 
     # --! timestep that was used to sample timeseries
     timestep: float
+
+    # --! number of time series samples in a lookback window
+    lookback_nsample: int
+
+    # --! number of time series samples in a forecast window
+    forecast_nsample: int
 
     # --! basis functions used to build lifted embeddings for stationary and transient operators
     #
@@ -996,18 +1037,19 @@ class model(torch.nn.Module):
         super().__init__()
 
         self.timeseries_ndim       = config.timeseries_ndim
-        self.timeseries_nsample    = config.timeseries_nsample
         self.timestep              = config.timestep
+        self.lookback_nsample      = config.lookback_nsample
+        self.forecast_nsample      = config.forecast_nsample
         self.param_kernsize        = config.param_kernsize
 
         self.operator_stat = operator_stationary(config)
         self.operator_trans = operator_transient(config)
 
-        self._fit_phase_sta_mean = phase_stationary_mean(self)
-        self._fit_phase_sta_var  = phase_stationary_var(self)
-        self._fit_phase_dyn_mean = phase_transient_mean(self)
-        self._fit_phase_dyn_var  = phase_transient_var(self)
-        self._fit_phase          = self._fit_phase_sta_mean
+        self._fit_phase_stat_mean  = phase_stationary_mean(self)
+        self._fit_phase_stat_var   = phase_stationary_var(self)
+        self._fit_phase_trans_mean = phase_transient_mean(self)
+        self._fit_phase_trans_var  = phase_transient_var(self)
+        self._fit_phase            = self._fit_phase_stat_mean
 
         self._mode_fit  = mode_fit(self)
         self._mode_eval = mode_eval(self)
@@ -1053,17 +1095,17 @@ class model(torch.nn.Module):
     def _set_mode(self, mode):
         self._mode = mode
 
-    def _get_phase_sta_mean(self):
-        return self._fit_phase_sta_mean
+    def _get_phase_stat_mean(self):
+        return self._fit_phase_stat_mean
 
-    def _get_phase_sta_var(self):
-        return self._fit_phase_sta_var
+    def _get_phase_stat_var(self):
+        return self._fit_phase_stat_var
 
-    def _get_phase_dyn_mean(self):
-        return self._fit_phase_dyn_mean
+    def _get_phase_trans_mean(self):
+        return self._fit_phase_trans_mean
 
-    def _get_phase_dyn_var(self):
-        return self._fit_phase_dyn_var
+    def _get_phase_trans_var(self):
+        return self._fit_phase_trans_var
 
     def _get_phase(self):
         return self._fit_phase
