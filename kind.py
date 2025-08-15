@@ -25,6 +25,7 @@ class operator(torch.nn.Module, interface):
         self.lookback_nsample      = config.lookback_nsample
         self.forecast_nsample      = config.forecast_nsample
         self.param_kernsize        = config.param_kernsize
+        self.attention_used        = config.attention_used
 
         self.fun_nsample_forecast  = self.forecast_nsample // self.param_kernsize
         if self.forecast_nsample % self.param_kernsize:
@@ -374,18 +375,19 @@ class operator_transient(operator):
         fun_prune_no = nfun
         self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
-        # --! encoder network which learns to attend over slices of embedded function values
-        att_enc_ni = nfun
+        if self.attention_used:
+            # --! encoder network which learns to attend over slices of embedded function values
+            att_enc_ni = nfun
 
-        # --! the attention encoder is implemented in terms of a Transformer encoder network
-        self.att_enc = torch.nn.TransformerEncoder(
-            torch.nn.TransformerEncoderLayer(
-                d_model=att_enc_ni,
-                nhead=1,
-                dim_feedforward=128,
-                batch_first=True),
-            num_layers=3,
-            enable_nested_tensor=False)
+            # --! the attention encoder is implemented in terms of a Transformer encoder network
+            self.att_enc = torch.nn.TransformerEncoder(
+                torch.nn.TransformerEncoderLayer(
+                    d_model=att_enc_ni,
+                    nhead=1,
+                    dim_feedforward=128,
+                    batch_first=True),
+                num_layers=3,
+                enable_nested_tensor=False)
 
         # --! an additional generator to create linear time-varying matrices from
         # --! encoded attention; these matrices enable piecewise-linear
@@ -472,19 +474,20 @@ class operator_transient(operator):
         fun_nsample = functions.shape[1]
         nfun        = functions.shape[2]
 
-        # --! encode attention over the sequence of function values
-        #
-        # --! functions, which are shaped as [B, T / kernzise, nfun] are encoded into attention with the same shape
-        att = self.att_enc(functions)
+        if self.attention_used:
+            # --! encode attention over the sequence of function values
+            #
+            # --! functions, which are shaped as [B, T / kernzise, nfun] are encoded into attention with the same shape
+            #
+            # --! attention is produced for each sequence step (rows of attention matrix); this information can be
+            # --! used to derive linear time-varying matrices that locally adapt to changes in dynamics
+            functions = self.att_enc(functions)
 
-        # --! using attention for each sequence step (rows of attention matrix), produce a sequence of
-        # --! linear time-varying matrices that locally adapt to changes in dynamics
-        #
         # --! note that we omit matrix transpose here, relying on training to figure it out
         #
         # --! note also that the neural network, which generates matrices, is already configured to
         # --! cover the entire prediction horizon, i.e. lookback and forecast windows
-        mod_mean_gen_i = torch.flatten(att, start_dim=1)
+        mod_mean_gen_i = torch.flatten(functions, start_dim=1)
         mat            = self.mod_mean_gen(mod_mean_gen_i).reshape(batsize, -1, nfun, nfun)
 
         # --! accumulate matrix products to enable predictions, such as z2 = A1*z1, z3 = A2*A1*z1, etc,
@@ -588,7 +591,8 @@ class operator_transient(operator):
     def freeze_mean(self):
         utils_nn.freeze_module(self.fun_enc)
         utils_nn.freeze_module(self.fun_prune)
-        utils_nn.freeze_module(self.att_enc)
+        if self.attention_used:
+            utils_nn.freeze_module(self.att_enc)
         utils_nn.freeze_module(self.mod_mean_gen)
         utils_nn.freeze_module(self.pre_mean_dec)
 
@@ -599,7 +603,8 @@ class operator_transient(operator):
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
         utils_nn.unfreeze_module(self.fun_prune)
-        utils_nn.unfreeze_module(self.att_enc)
+        if self.attention_used:
+            utils_nn.unfreeze_module(self.att_enc)
         utils_nn.unfreeze_module(self.mod_mean_gen)
         utils_nn.unfreeze_module(self.mod_var_gen)
         utils_nn.unfreeze_module(self.pre_mean_dec)
@@ -1024,6 +1029,9 @@ class model_config:
     # --! are produced from the timeseries every time.
     param_kernsize: int
 
+    # --! flag that enables attention in prediction routines
+    attention_used: bool
+
 
 class model(torch.nn.Module):
     """Models Kalman-inpired neural decomposition, or KIND.
@@ -1041,6 +1049,7 @@ class model(torch.nn.Module):
         self.lookback_nsample      = config.lookback_nsample
         self.forecast_nsample      = config.forecast_nsample
         self.param_kernsize        = config.param_kernsize
+        self.attention_used        = config.attention_used
 
         self.operator_stat = operator_stationary(config)
         self.operator_trans = operator_transient(config)
