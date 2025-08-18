@@ -24,12 +24,7 @@ class operator(torch.nn.Module, interface):
         self.timestep              = config.timestep
         self.lookback_nsample      = config.lookback_nsample
         self.forecast_nsample      = config.forecast_nsample
-        self.param_kernsize        = config.param_kernsize
         self.attention_used        = config.attention_used
-
-        self.fun_nsample_forecast  = self.forecast_nsample // self.param_kernsize
-        if self.forecast_nsample % self.param_kernsize:
-            self.fun_nsample_forecast = self.fun_nsample_forecast + 1
 
     @abstractmethod
     def embed(self, timeseries):
@@ -104,9 +99,17 @@ class operator_stationary(operator):
     """Models dynamics of stationary timeseries in a DMD-like manner."""
 
     def __init__(self, config):
+
+        # --! initialize common operator parameters
         super().__init__(config)
 
-        self.fun = config.fun_stat
+        # --! initialize stationary-specific parameters
+        self.fun                   = config.fun_stat
+        self.param_kernsize        = config.param_kernsize_stat
+
+        if self.forecast_nsample % self.param_kernsize:
+            raise Exception('the number of forecast samples must be a multiple of a kernel size!')
+        self.fun_nsample_forecast  = self.forecast_nsample // self.param_kernsize
 
         # --! derive some details of basis functions for convenience
         nfun        = len(self.fun)
@@ -349,9 +352,17 @@ class operator_transient(operator):
     """Models dynamics of transient timeseries using a Transformer-based attention mechanism."""
 
     def __init__(self, config):
+
+        # --! initialize common operator parameters
         super().__init__(config)
 
-        self.fun = config.fun_trans
+        # --! initialize transient-specific parameters
+        self.fun            = config.fun_trans
+        self.param_kernsize = config.param_kernsize_trans
+
+        if self.forecast_nsample % self.param_kernsize:
+            raise Exception('the number of forecast samples must be a multiple of a kernel size!')
+        self.fun_nsample_forecast  = self.forecast_nsample // self.param_kernsize
 
         # --! derive some details of basis functions for convenience
         nfun   = len(self.fun)
@@ -639,9 +650,6 @@ class run_mode(interface):
         return
 
     def _forward(self, timeseries):
-
-        if timeseries.shape[1] % self._model.param_kernsize:
-            raise Exception('the size of timeseries is not a multiple of a kernel size')
 
         # --! execute both operators on given time series
         timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pre, _, _ = self._model.operator_stat(timeseries)
@@ -1027,7 +1035,11 @@ class model_config:
     # --! static kernels in convolutional neural networks,
     # --! the kernels here are dynamic, because they
     # --! are produced from the timeseries every time.
-    param_kernsize: int
+    #
+    # --! there are two sizes: one dedicated to a stationary operator,
+    # --! the other - to a transient one.
+    param_kernsize_stat: int
+    param_kernsize_trans : int
 
     # --! flag that enables attention in prediction routines
     attention_used: bool
@@ -1048,7 +1060,6 @@ class model(torch.nn.Module):
         self.timestep              = config.timestep
         self.lookback_nsample      = config.lookback_nsample
         self.forecast_nsample      = config.forecast_nsample
-        self.param_kernsize        = config.param_kernsize
         self.attention_used        = config.attention_used
 
         self.operator_stat = operator_stationary(config)

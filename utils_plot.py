@@ -109,7 +109,7 @@ def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
     # --! take the initial condition of timeseries specified by index j and
     # --! embed this initial condition into the latent space
     # --! of the stationary model
-    data_ic     = torch.unsqueeze(testdata[jtimeseries][:model.param_kernsize, :], 0)
+    data_ic     = torch.unsqueeze(testdata[jtimeseries][:model.operator_stat.param_kernsize, :], 0)
     fun_ic      = model.operator_stat.embed(data_ic)
 
     # --! now multiply eigenvectors and initial conditions together in a dot product fashion to
