@@ -24,7 +24,6 @@ class operator(torch.nn.Module, interface):
         self.timestep              = config.timestep
         self.lookback_nsample      = config.lookback_nsample
         self.forecast_nsample      = config.forecast_nsample
-        self.attention_used        = config.attention_used
 
     @abstractmethod
     def embed(self, timeseries):
@@ -359,6 +358,8 @@ class operator_transient(operator):
         # --! initialize transient-specific parameters
         self.fun            = config.fun_trans
         self.param_kernsize = config.param_kernsize_trans
+        self.mean_att_used  = config.mean_att_used
+        self.var_att_used   = config.var_att_used
 
         if self.forecast_nsample % self.param_kernsize:
             raise Exception('the number of forecast samples must be a multiple of a kernel size!')
@@ -386,14 +387,14 @@ class operator_transient(operator):
         fun_prune_no = nfun
         self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
-        if self.attention_used:
+        if self.mean_att_used:
             # --! encoder network which learns to attend over slices of embedded function values
-            att_enc_ni = nfun
+            mod_mean_att_enc_ni = nfun
 
             # --! the attention encoder is implemented in terms of a Transformer encoder network
-            self.att_enc = torch.nn.TransformerEncoder(
+            self.mod_mean_att_enc = torch.nn.TransformerEncoder(
                 torch.nn.TransformerEncoderLayer(
-                    d_model=att_enc_ni,
+                    d_model=mod_mean_att_enc_ni,
                     nhead=1,
                     dim_feedforward=128,
                     batch_first=True),
@@ -410,6 +411,20 @@ class operator_transient(operator):
         mod_mean_gen_ni = fun_nsample * nfun
         mod_mean_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
         self.mod_mean_gen = utils_nn.fcnn(feat=[mod_mean_gen_ni, 64, 64, mod_mean_gen_no], actfun_hid='relu')
+
+        if self.var_att_used:
+            # --! encoder network which learns to attend over slices of embedded function errors
+            mod_var_att_enc_ni = nfun
+
+            # --! the attention encoder is implemented in terms of a Transformer encoder network
+            self.mod_var_att_enc = torch.nn.TransformerEncoder(
+                torch.nn.TransformerEncoderLayer(
+                    d_model=mod_var_att_enc_ni,
+                    nhead=1,
+                    dim_feedforward=128,
+                    batch_first=True),
+                num_layers=3,
+                enable_nested_tensor=False)
 
         # --! create a generator that produces models capturing the evolution of variance (uncertainty)
         #
@@ -485,14 +500,14 @@ class operator_transient(operator):
         fun_nsample = functions.shape[1]
         nfun        = functions.shape[2]
 
-        if self.attention_used:
+        if self.mean_att_used:
             # --! encode attention over the sequence of function values
             #
             # --! functions, which are shaped as [B, T / kernzise, nfun] are encoded into attention with the same shape
             #
             # --! attention is produced for each sequence step (rows of attention matrix); this information can be
             # --! used to derive linear time-varying matrices that locally adapt to changes in dynamics
-            functions = self.att_enc(functions)
+            functions = self.mod_mean_att_enc(functions)
 
         # --! note that we omit matrix transpose here, relying on training to figure it out
         #
@@ -532,6 +547,9 @@ class operator_transient(operator):
         batsize     = errors.shape[0]
         err_nsample = errors.shape[1]
         nfun        = errors.shape[2]
+
+        if self.var_att_used:
+            errors = self.mod_var_att_enc(errors)
 
         # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
         # --! capture the evolution of error values
@@ -602,20 +620,24 @@ class operator_transient(operator):
     def freeze_mean(self):
         utils_nn.freeze_module(self.fun_enc)
         utils_nn.freeze_module(self.fun_prune)
-        if self.attention_used:
-            utils_nn.freeze_module(self.att_enc)
+        if self.mean_att_used:
+            utils_nn.freeze_module(self.mod_mean_att_enc)
         utils_nn.freeze_module(self.mod_mean_gen)
         utils_nn.freeze_module(self.pre_mean_dec)
 
     def freeze_var(self):
+        if self.var_att_used:
+            utils_nn.freeze_module(self.mod_var_att_enc)
         utils_nn.freeze_module(self.mod_var_gen)
         utils_nn.freeze_module(self.pre_var_dec)
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
         utils_nn.unfreeze_module(self.fun_prune)
-        if self.attention_used:
-            utils_nn.unfreeze_module(self.att_enc)
+        if self.mean_att_used:
+            utils_nn.unfreeze_module(self.mod_mean_att_enc)
+        if self.var_att_used:
+            utils_nn.unfreeze_module(self.mod_var_att_enc)
         utils_nn.unfreeze_module(self.mod_mean_gen)
         utils_nn.unfreeze_module(self.mod_var_gen)
         utils_nn.unfreeze_module(self.pre_mean_dec)
@@ -1041,8 +1063,9 @@ class model_config:
     param_kernsize_stat: int
     param_kernsize_trans : int
 
-    # --! flag that enables attention in prediction routines
-    attention_used: bool
+    # --! flags that enable attention in transient prediction routines
+    mean_att_used: bool
+    var_att_used: bool
 
 
 class model(torch.nn.Module):
@@ -1060,7 +1083,6 @@ class model(torch.nn.Module):
         self.timestep              = config.timestep
         self.lookback_nsample      = config.lookback_nsample
         self.forecast_nsample      = config.forecast_nsample
-        self.attention_used        = config.attention_used
 
         self.operator_stat = operator_stationary(config)
         self.operator_trans = operator_transient(config)
