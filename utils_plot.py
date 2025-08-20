@@ -9,6 +9,210 @@ from matplotlib import pyplot as plt
 import utils_data
 
 
+def plot_mse(model, datadir, timeseries_nsample):
+
+    # --! read test data
+    data               = utils_data.read_datafile(f'{datadir}/eval', timeseries_nsample)
+    data               = data.reshape(-1, data.shape[-1])
+
+    # --! get window constants from the model
+    lookback_nsample   = model.lookback_nsample
+    forecast_nsample   = model.forecast_nsample
+    forecast_begin     = lookback_nsample
+    forecast_end       = data.shape[0] - forecast_nsample
+    lookback           = data[:lookback_nsample]
+
+    mse = []
+
+    # --! the lookback window is already full, so we can start the sliding forecasts
+    #
+    # --! forecasts are compared to the actual data - the truth - and a mean
+    # --! square error is calculated each time
+    with torch.no_grad():
+        for j in range(forecast_begin, forecast_end):
+
+            # --! concatenate the current lookback and the true forecast to have a properly normalized forecast region
+            # --! for comparison afterward
+            traj = torch.unsqueeze(torch.cat([lookback, data[j:j+forecast_nsample, :]], dim=0), dim=0)
+
+            # --! normalize concatenated trajectory
+            mean   = torch.mean(traj, dim=1, keepdim=True)
+            traj   = traj - mean
+            scaler = utils_data.minmax_scaler(feature_range=(-1, 1))
+            traj   = scaler.fit_transform(traj)
+
+            # --! extract normalized lookback and call forward method directly to
+            # --! bypass model internal normalization
+            model_i  = traj[:, :lookback_nsample, :]
+            model_o  = torch.squeeze(model._get_mode()._forward(model_i)[0], dim=0)
+
+            # --! extract predicted forecast region
+            forecast = model_o[lookback_nsample:]
+
+            # --! extract true forecast region
+            truth = traj[0, lookback_nsample:]
+
+            # --! calculate mean square error
+            loss_fn = torch.nn.MSELoss(reduction='mean')
+            mse.append(loss_fn(forecast, truth))
+
+            # --! update lookback with a new measurement
+            meas     = data[[j]]
+            lookback = torch.cat([lookback[1:], meas], dim=0)
+
+        # --! gather some result details
+        jworst = np.argmax(mse)
+        worst  = mse[jworst]
+        jbest  = np.argmin(mse)
+        best   = mse[jbest]
+        avg    = np.mean(mse)
+
+        # --! convert floats to strings with precision specification
+        sbest  = f'{best:.3f}'
+        sworst = f'{worst:.3f}'
+        savg   = f'{avg:.3f}'
+
+        # --! assemble results as a table
+        data_table = [
+            (     'mse',         'index',         'value'),
+            ('--------',      '--------',      '--------'),
+            (    'best',           jbest,           sbest),
+            (   'worst',          jworst,          sworst),
+            (     'avg',            'na',            savg)
+        ]
+
+        # --! print results
+        print('')
+        print('inf >> evaluation results:')
+        print('')
+        for row in data_table:
+            print(f'{row[0]:>10} {row[1]:>10} {row[2]:>10}')
+        print('')
+
+        return mse
+
+
+def plot_mse_extreme(model, mse, datadir, timeseries_nsample):
+
+    # --! read test data
+    data   = utils_data.read_datafile(f'{datadir}/eval', timeseries_nsample)
+    data   = data.reshape(-1, data.shape[-1])
+
+    # --! get window constants from the model
+    lookback_nsample   = model.lookback_nsample
+    forecast_nsample   = model.forecast_nsample
+    forecast_begin     = lookback_nsample
+    forecast_end       = data.shape[0] - forecast_nsample
+
+    with torch.no_grad():
+
+        jworst             = np.argmax(mse)
+        jbest              = np.argmin(mse)
+
+        lookback           = data[jbest:jbest + lookback_nsample, :]
+        model_i            = torch.unsqueeze(lookback, dim=0)
+        model_o            = model(model_i)
+        mean_best          = model_o[0]
+        stat_logvar_best   = model_o[2]
+        trans_logvar_best  = model_o[4]
+        alpha_best         = model_o[9]
+        mean_best          = torch.squeeze(mean_best, dim=0)
+        stat_logvar_best   = torch.squeeze(stat_logvar_best, dim=0)
+        trans_logvar_best  = torch.squeeze(trans_logvar_best, dim=0)
+        alpha_best         = torch.squeeze(alpha_best, dim=0)
+        stat_var_best      = torch.exp(stat_logvar_best) + 1e-6
+        trans_var_best     = torch.exp(trans_logvar_best) + 1e-6
+        truth_best         = data[jbest:jbest + timeseries_nsample, :]
+
+        lookback           = data[jworst:jworst + lookback_nsample, :]
+        model_i            = torch.unsqueeze(lookback, dim=0)
+        model_o            = model(model_i)
+        mean_worst         = model_o[0]
+        stat_logvar_worst  = model_o[2]
+        trans_logvar_worst = model_o[4]
+        alpha_worst        = model_o[9]
+        mean_worst         = torch.squeeze(mean_worst, dim=0)
+        alpha_worst        = torch.squeeze(alpha_worst, dim=0)
+        stat_logvar_worst  = torch.squeeze(stat_logvar_worst, dim=0)
+        trans_logvar_worst = torch.squeeze(trans_logvar_worst, dim=0)
+        stat_var_worst     = torch.exp(stat_logvar_worst) + 1e-6
+        trans_var_worst    = torch.exp(trans_logvar_worst) + 1e-6
+        truth_worst        = data[jworst:jworst + timeseries_nsample, :]
+
+        plt.figure(figsize=(8, 10))
+
+        maxo = torch.max(truth_best)
+        mino = torch.min(truth_best)
+        plt.subplot(4, 2, 1)
+        plt.title('Best MSE')
+        for k in range(model.timeseries_ndim):
+            plt.plot(truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
+        plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
+        plt.legend(loc="upper left")
+
+        maxo = torch.max(truth_worst)
+        mino = torch.min(truth_worst)
+        plt.subplot(4, 2, 2)
+        plt.title('Worst MSE')
+        for k in range(model.timeseries_ndim):
+            plt.plot(truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
+        plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
+        plt.legend(loc="upper left")
+
+        plt.subplot(4, 2, 3)
+        for k in range(model.timeseries_ndim):
+            plt.plot(alpha_best[:, k], linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
+        plt.plot([forecast_begin, forecast_begin], [0, 1], linestyle='dotted', color='gray')
+        plt.legend(loc="upper left")
+
+        plt.subplot(4, 2, 4)
+        for k in range(model.timeseries_ndim):
+            plt.plot(alpha_worst[:, k], linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
+        plt.plot([forecast_begin, forecast_begin], [0, 1], linestyle='dotted', color='gray')
+        plt.legend(loc="upper left")
+
+        plt.subplot(4, 2, 5)
+        maxvar = torch.max(stat_var_best)
+        maxvar = 0.1 if maxvar < 0.1 else maxvar
+        for k in range(model.timeseries_ndim):
+            plt.plot(stat_var_best[:, k], linestyle='solid', label='$\\zeta^{stat}_{' + f'{k+1}' + '}$')
+        plt.plot([forecast_begin, forecast_begin], [0, maxvar], linestyle='dotted', color='gray')
+        plt.ylim((0., maxvar))
+        plt.legend(loc="upper left")
+
+        plt.subplot(4, 2, 6)
+        maxvar = torch.max(stat_var_worst)
+        maxvar = 0.1 if maxvar < 0.1 else maxvar
+        for k in range(model.timeseries_ndim):
+            plt.plot(stat_var_worst[:, k], linestyle='solid', label='$\\zeta^{stat}_{' + f'{k+1}' + '}$')
+        plt.plot([forecast_begin, forecast_begin], [0, maxvar], linestyle='dotted', color='gray')
+        plt.ylim((0., maxvar))
+        plt.legend(loc="upper left")
+
+        plt.subplot(4, 2, 7)
+        maxvar = torch.max(trans_var_best)
+        maxvar = 0.1 if maxvar < 0.1 else maxvar
+        for k in range(model.timeseries_ndim):
+            plt.plot(trans_var_best[:, k], linestyle='solid', label='$\\zeta^{trans}_{' + f'{k+1}' + '}$')
+        plt.plot([forecast_begin, forecast_begin], [0, maxvar], linestyle='dotted', color='gray')
+        plt.ylim((0., maxvar))
+        plt.legend(loc="upper left")
+        plt.xlabel('Samples')
+
+        plt.subplot(4, 2, 8)
+        maxvar = torch.max(trans_var_worst)
+        maxvar = 0.1 if maxvar < 0.1 else maxvar
+        for k in range(model.timeseries_ndim):
+            plt.plot(trans_var_worst[:, k], linestyle='solid', label='$\\zeta^{trans}_{' + f'{k+1}' + '}$')
+        plt.plot([forecast_begin, forecast_begin], [0, maxvar], linestyle='dotted', color='gray')
+        plt.ylim((0., maxvar))
+        plt.legend(loc="upper left")
+        plt.xlabel('Samples')
+
+        plt.show()
+
 def plot_dataset(datadir, timeseries_nsample, timestep):
     """
     Displays metrics of a dataset located in a folder named ``datadir``. The size of timeseries
@@ -53,12 +257,14 @@ def plot_dataset(datadir, timeseries_nsample, timestep):
     fig_h = ndata * sub_h
 
     plt.figure(figsize=(fig_w, fig_h))
+    jsubplot = 1
 
     for j in range(ndata):
         data = data_train[j]
 
         for k in range(nchannel):
-            plt.subplot(ndata, nchannel, j*ndata + k + 1)
+            plt.subplot(ndata, nchannel, jsubplot)
+            jsubplot = jsubplot + 1
             if j==0: plt.title(f'Detuning index {k}')
             plt.plot(t, data[:, k], color='tab:blue', alpha=0.75)
             plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
@@ -71,7 +277,6 @@ def plot_dataset(datadir, timeseries_nsample, timestep):
 
 def plot_eigs(model):
     """Displays eigenvalues of given ``model`` on the unit circle."""
-    print(model.operator_stat.mod_mean.weight)
 
     eigvals, _ = torch.linalg.eig(model.operator_stat.mod_mean.weight)
 
@@ -90,6 +295,7 @@ def plot_eigs(model):
     plt.grid(True)
     plt.axis('equal')
     plt.show()
+    print(eigvals)
 
 
 def plot_modes(model, datadir, timeseries_nsample, jtimeseries):
