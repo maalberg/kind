@@ -16,6 +16,12 @@ import utils_nn
 class operator(torch.nn.Module, interface):
     """Models dynamics of timeseries."""
 
+    sin_nparam  = 2
+    cos_nparam  = 2
+    data_nparam = 1
+    poly_nparam = 1
+    exp_nparam  = 1
+
     def __init__(self, config):
         super().__init__()
 
@@ -60,38 +66,67 @@ class operator(torch.nn.Module, interface):
         """Makes all trainable submodules trainable again."""
         return
 
+    def _respec_fun(self, spec):
+        """Adapts function specifications ``spec`` to facilitate model internal workings.
+
+        The adaptation converts the number of specific functions, e.g., 'sin', into
+        the total number of parameters required by these specific functions. For
+        example, if 5 functions of 'sin' are to be used, then the total number
+        of parameters becomes 5 * 2 = 10, as a 'sin' takes 2 parameters.
+        """
+
+        newspec = spec.copy()
+
+        for fun in newspec:
+            if fun == 'sin':
+                newspec[fun] = newspec[fun] * self.sin_nparam # sine takes two parameters
+            elif fun == 'cos':
+                newspec[fun] = newspec[fun] * self.cos_nparam # cosine takes two parameters
+
+        return newspec
+
     def _eval_fun(self, fun, param):
         if fun == 'sin':
             return self._eval_sin(param)
         elif fun == 'cos':
             return self._eval_cos(param)
+        elif fun == 'data':
+            return self._eval_data(param)
+        elif fun == 'poly':
+            return self._eval_poly(param)
         elif fun == 'exp':
             return self._eval_exp(param)
-        elif 'data' in fun:
-            return self._eval_data(param)
-        elif 'poly' in fun:
-            deg = utils_nn.extract_poly_deg(fun)
-            return self._eval_poly(param, deg)
         else:
             raise Exception("unsupported basis function!")
 
-    def _eval_sin(self, params):
-        amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.sin(self.timestep * freq)
+    def _eval_sinx(self, param, n):
+        amp, ang = torch.split(param, 1, dim=-1)
+        return amp * torch.sin(n * ang)
 
-    def _eval_cos(self, params):
-        amp, freq = torch.split(params, 1, dim=-1)
-        return amp * torch.cos(self.timestep * freq)
+    def _eval_sin(self, param):
+        param = torch.split(param, self.sin_nparam, dim=-1)
+        mult  = torch.arange(len(param)) + 1
+        return torch.cat([self._eval_sinx(p, m) for p, m in zip(param, mult)], dim=-1)
 
-    def _eval_data(self, params):
-        return params
+    def _eval_cosx(self, param, n):
+        amp, ang = torch.split(param, 1, dim=-1)
+        return amp * torch.cos(n * ang)
 
-    def _eval_exp(self, params):
-        power = params
-        return torch.exp(power)
+    def _eval_cos(self, param):
+        param   = torch.split(param, self.cos_nparam, dim=-1)
+        factor  = torch.arange(len(param)) + 1
+        return torch.cat([self._eval_cosx(p, f) for p, f in zip(param, factor)], dim=-1)
 
-    def _eval_poly(self, params, deg):
-        return torch.sum(torch.cat([params**(i+1) for i in range(deg)], dim=-1), -1, keepdim=True)
+    def _eval_data(self, param):
+        return param
+
+    def _eval_poly(self, param):
+        param = torch.split(param, self.poly_nparam, dim=-1)
+        degree = torch.arange(len(param)) + 1
+        return torch.cat([p**d for p, d in zip(param, degree)], dim=-1)
+
+    def _eval_exp(self, param):
+        return torch.exp(param)
 
 
 class operator_stationary(operator):
@@ -102,16 +137,23 @@ class operator_stationary(operator):
         # --! initialize common operator parameters
         super().__init__(config)
 
+        # --! this here is a convenient place to get the total number of functions, because
+        # --! later the function configuration becomes respecified
+        # --! to facilitate other things
+        nfun = sum(config.fun_stat.values())
+
         # --! initialize stationary-specific parameters
-        self.fun                   = config.fun_stat
-        self.param_kernsize        = config.param_kernsize_stat
+        #
+        # --! note that here the function configuration becomes respecified
+        self.fun            = self._respec_fun(config.fun_stat)
+        self.param_kernsize = config.param_kernsize_stat
 
         if self.forecast_nsample % self.param_kernsize:
             raise Exception('the number of forecast samples must be a multiple of a kernel size!')
         self.fun_nsample_forecast  = self.forecast_nsample // self.param_kernsize
 
-        # --! derive some details of basis functions for convenience
-        nfun        = len(self.fun)
+        # --! here the function configuration is already respecified, such that it is convenient
+        # --! to get the total number of required function parameters
         nparam      = sum(self.fun.values())
         fun_nsample = self.lookback_nsample // self.param_kernsize
 
@@ -192,13 +234,11 @@ class operator_stationary(operator):
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
 
-        # --! split extracted parameters based on number of parameters required by each basis function
+        # --! split extracted parameters based on the number of parameters required by each
+        # --! type of grouped basis functions
         param = torch.split(param, list(self.fun.values()), dim=-1)
 
         # --! evaluate embedding functions at each slice of timeseries
-        #
-        # --! note that there is one single measurement of each function to describe
-        # --! a slice, so the granularity of slicing plays an important a role
         fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nfun]
@@ -355,8 +395,15 @@ class operator_transient(operator):
         # --! initialize common operator parameters
         super().__init__(config)
 
+        # --! this here is a convenient place to get the total number of functions, because
+        # --! later the function configuration becomes respecified
+        # --! to facilitate other things
+        nfun = sum(config.fun_trans.values())
+
         # --! initialize transient-specific parameters
-        self.fun            = config.fun_trans
+        #
+        # --! note that here the function configuration becomes respecified
+        self.fun            = self._respec_fun(config.fun_trans)
         self.param_kernsize = config.param_kernsize_trans
         self.mean_att_used  = config.mean_att_used
         self.var_att_used   = config.var_att_used
@@ -365,8 +412,8 @@ class operator_transient(operator):
             raise Exception('the number of forecast samples must be a multiple of a kernel size!')
         self.fun_nsample_forecast  = self.forecast_nsample // self.param_kernsize
 
-        # --! derive some details of basis functions for convenience
-        nfun   = len(self.fun)
+        # --! here the function configuration is already respecified, such that it is convenient
+        # --! to get the total number of required function parameters
         nparam = sum(self.fun.values())
         fun_nsample = self.lookback_nsample // self.param_kernsize
 
@@ -1043,8 +1090,8 @@ class model_config:
     #
     # --! these dictionaries are structured as
     #
-    # --!  *  key: function name [str]
-    # --!  *  value: number of function parameters [int]
+    # --!  *  key:   function name [str]
+    # --!  *  value: number of functions of this type [int]
     fun_stat: dict
     fun_trans: dict
 
