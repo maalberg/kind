@@ -182,13 +182,10 @@ class operator_stationary(operator):
         mod_mean_no = nfun
         self.mod_mean = torch.nn.Linear(mod_mean_ni, mod_mean_no, bias=False)
 
-        # --! create a generator that produces models capturing the evolution of variance (uncertainty)
-        #
-        # --! the generator takes a flattened sequence of function values and returns
-        # --! a flattened sequence of square matrices
-        mod_var_gen_ni = fun_nsample * nfun
-        mod_var_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
-        self.mod_var_gen = utils_nn.fcnn(feat=[mod_var_gen_ni, 64, 64, mod_var_gen_no], actfun_hid='relu')
+        # --! create a DMD-like model to capture stationary error dynamics
+        mod_var_ni = nfun
+        mod_var_no = nfun
+        self.mod_var = torch.nn.Linear(mod_var_ni, mod_var_no, bias=False)
 
         # --! create prediction decoders to decode predicted embeddings back to timeseries and uncertainty
         pre_dec_ni        = nfun
@@ -290,19 +287,25 @@ class operator_stationary(operator):
 
     def predict_var(self, errors):
 
-        # --! constants for convenience
-        batsize     = errors.shape[0]
-        err_nsample = errors.shape[1]
-        nfun        = errors.shape[2]
+        lookback_nsample = errors.shape[1]
+        forecast_nsample = self.fun_nsample_forecast
 
-        # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
-        # --! capture the evolution of error values
+        horizon = lookback_nsample + forecast_nsample
+
+        # --! extract the matrix of stationary dynamics
         #
-        # --! the neural network that generates matrices is already configured to cover the entire
-        # --! prediction horizon, i.e. lookback and forecast windows
-        i    = torch.flatten(errors, start_dim=1)
-        mat  = self.mod_var_gen(i).reshape(batsize, -1, nfun, nfun)
-        mat  = utils_nn.cumprod_mat(mat[:, 1:])
+        # --! the matrix is unsqueezed to a shape [1, nfun, nfun] to allow
+        # --! broadcasting when multiplying with functions
+        mat = torch.unsqueeze(self.mod_var.weight, 0)
+
+        # --! stack together matrices raised to powers to cover all prediction horizon
+        #
+        # --! powered matrices are shaped as [B, H - 1, nfun, nfun], where H is the number of horizon steps
+        # --! and -1 is because we do not predict the first time step
+        #
+        # --! note that we omit matrix transpose here, relying on training to figure it out
+        mat_power = torch.stack([
+            torch.linalg.matrix_power(mat, power) for power in range(1, horizon)], dim=1)
 
         # --! extract the initial condition of error history
         #
@@ -314,7 +317,7 @@ class operator_stationary(operator):
         #
         # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun],
         # --! i.e. a batch with error trajectories consisting of individual error-points [1, nfun]
-        err_pre = torch.matmul(err_ic, mat)
+        err_pre = torch.matmul(err_ic, mat_power)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
         err_pre = torch.squeeze(err_pre, -2)
@@ -322,6 +325,7 @@ class operator_stationary(operator):
         # --! return separate predictions for lookback and forecast windows
         #
         # --! note that the lookback window is -1, because we do not predict the initial condition
+        err_nsample = errors.shape[1]
         return torch.split(err_pre, [err_nsample - 1, self.fun_nsample_forecast], dim=1)
 
     def forward(self, timeseries):
@@ -375,14 +379,14 @@ class operator_stationary(operator):
         utils_nn.freeze_module(self.pre_mean_dec)
 
     def freeze_var(self):
-        utils_nn.freeze_module(self.mod_var_gen)
+        utils_nn.freeze_module(self.mod_var)
         utils_nn.freeze_module(self.pre_var_dec)
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
         utils_nn.unfreeze_module(self.fun_prune)
         utils_nn.unfreeze_module(self.mod_mean)
-        utils_nn.unfreeze_module(self.mod_var_gen)
+        utils_nn.unfreeze_module(self.mod_var)
         utils_nn.unfreeze_module(self.pre_mean_dec)
         utils_nn.unfreeze_module(self.pre_var_dec)
 
