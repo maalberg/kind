@@ -141,7 +141,7 @@ class detuning_sim:
         self.modes_m_n  = None
         self.t_m        = None
 
-    def __call__(self, param, noise=None):
+    def __call__(self, param, start: int=10, noise=None):
         """Simulates detuning according to given parameters ``param``."""
 
         # --! simulate with different parameters
@@ -152,10 +152,6 @@ class detuning_sim:
         # --! the first two data in y are rf i and q, after that come mechanical modes
         # --! as displacement and velocity
         detuning = [self.__sum(o.y[2:]) for o in sim_o]
-
-        # --! we want to skip the transient process of an RF cavity when scaling data,
-        # --! so we specify the start
-        start = 10
 
         # --! skip the first transient samples and reshape detuning row arrays into column arrays
         detuning = [d[:, start:].T for d in detuning]

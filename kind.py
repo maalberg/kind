@@ -943,6 +943,7 @@ class phase_stationary_mean(fit_phase):
         super().enter(param)
 
         self._model.operator_trans.freeze_mean()
+        self._model.operator_trans.freeze_var()
 
         self._model.operator_stat.unfreeze()
         self._model.operator_stat.freeze_var()
@@ -977,6 +978,7 @@ class phase_stationary_var(fit_phase):
         super().enter(param)
 
         self._model.operator_trans.freeze_mean()
+        self._model.operator_trans.freeze_var()
 
         self._model.operator_stat.unfreeze()
         self._model.operator_stat.freeze_mean()
