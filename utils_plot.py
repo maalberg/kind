@@ -213,7 +213,7 @@ def plot_mse_extreme(model, mse, datadir, timeseries_nsample):
 
         plt.show()
 
-def plot_dataset(datadir, timeseries_nsample, timestep):
+def plot_dataset(datadir, timeseries_nsample, timestep, plot_ndata: int=2):
     """
     Displays metrics of a dataset located in a folder named ``datadir``. The size of timeseries
     stored in this dataset is defined by ``timeseries_nsample``. The ``timestep`` that
@@ -246,7 +246,7 @@ def plot_dataset(datadir, timeseries_nsample, timestep):
     zero = torch.zeros_like(t)
 
     # --! show two examples for each channel
-    ndata = 2
+    ndata = plot_ndata
 
     # --! limit the number of displayed channels
     nchannel = 3 if data_train.shape[2] > 3 else data_train.shape[2]

@@ -164,7 +164,7 @@ class operator_stationary(operator):
         # --! in the embedded (latent) space
         fun_enc_ni   = self.param_kernsize * self.timeseries_ndim
         fun_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
-        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 64, 64, fun_enc_no], actfun_hid='relu')
+        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, 128, fun_enc_no], actfun_hid='relu')
 
         # --! this linear transformation is supposed to prune the dimensionality of the
         # --! basis functions, such that only the number of these basis functions
@@ -1139,6 +1139,8 @@ class model(torch.nn.Module):
 
         self.operator_stat = operator_stationary(config)
         self.operator_trans = operator_transient(config)
+
+        self.maxerr_stat = None
 
         self._fit_phase_stat_mean  = phase_stationary_mean(self)
         self._fit_phase_stat_var   = phase_stationary_var(self)

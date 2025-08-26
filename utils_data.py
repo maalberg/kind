@@ -6,30 +6,103 @@ import torch
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 
+from matplotlib import pyplot as plt
 
-def read_datafile(name: str, datachunk_len) -> torch.Tensor:
+
+class minmax_scaler:
+    def __init__(self, feature_range=(-1, 1)):
+        self.min = None
+        self.max = None
+        self.scale_min, self.scale_max = feature_range
+
+    def fit_transform(self, timeseries, dim=1):
+
+        # --! remember min and max values of given timeseries
+        self.min = timeseries.min(dim=dim, keepdim=True)[0]
+        self.max = timeseries.max(dim=dim, keepdim=True)[0]
+
+        # --! transform given timeseries according to scaling range
+        scale = (self.scale_max - self.scale_min) / (self.max - self.min + 1e-8)
+        return self.scale_min + (timeseries - self.min) * scale
+
+    def inverse_transform(self, timeseries):
+        scale = (self.max - self.min + 1e-8) / (self.scale_max - self.scale_min)
+        return self.min + (timeseries - self.scale_min) * scale
+
+
+def scale_timeseries2(timeseries):
+    scaler = minmax_scaler(feature_range=(-1, 1))
+    return scaler.fit_transform(timeseries, dim=0)
+
+
+def remove_mean(timeseries, dim: int=0):
+    """Removes mean from ``timeseries`` in dimension ``dim``. Dimensions are preserved."""
+    return timeseries - np.mean(timeseries, axis=dim, keepdims=True)
+
+
+def remove_mean2(timeseries, dim: int=0):
+    """Removes mean from ``timeseries`` in dimension ``dim``. Dimensions are preserved."""
+    return timeseries - torch.mean(timeseries, dim, keepdim=True)
+
+
+def label_timeseries(timeseries, model):
     """
-    Reads data from a file called ``name`` and formats the data based on ``datachunk_len``,
-    i.e. the length of one contiguous chunk of data. The file data are expected to be
-    in format [T, C], such that the read data could be formatted as [B, T, C],
-    where B, T and C are the number of batches, time steps and data channels,
-    repectively.
+    Returns a tuple with ``timeseries`` and a label,
+    where a True label denotes stationary time series, whereas a False label signifies transient time series.
     """
 
-    # --! note that we force numpy loadtxt to return at least a two-dimensional array
-    # --! by setting ndmin=2
-    data = torch.tensor(
-        np.loadtxt(name + '.csv', delimiter=',', dtype=np.float32, ndmin=2))
-    datachunks_n = int(data.shape[0] / datachunk_len)
+    timeseries     = torch.unsqueeze(timeseries, 0)
+    lookback       = timeseries[:, :model.lookback_nsample]
+    timeseries_pre = model.operator_stat(lookback)[0]
 
-    # return read data in channels-last format
-    return torch.reshape(data, (datachunks_n, datachunk_len, data.shape[1]))
+    err_fn  = torch.nn.MSELoss(reduction='mean')
+    err     = err_fn(timeseries_pre, timeseries)
+
+    timeseries = torch.squeeze(timeseries, 0)
+    label      = True if err < model.maxerr_stat else False
+
+    return timeseries, label
 
 
-def write_datafile(name: str, data, delim: str = ','):
-    """Writes ``data`` to a file named ``name``. The file is written using a comma-separated-value format."""
-    filedata = np.reshape(data, (data.shape[0] * data.shape[1], data.shape[2]))
-    np.savetxt(name + '.csv', filedata, fmt='%.14f', delimiter=delim)
+def label_stationarity(model, res_max, datadir, timeseries_nsample):
+    """
+    Based on DMD model residuals, creates a set of labels for stationary/transient data.
+    """
+    lookback_nsample = model.lookback_nsample
+    data             = read_datafile(f'{datadir}/test', timeseries_nsample)
+    labels           = torch.zeros(data.shape[0], dtype=torch.bool)
+
+    for this, timeseries in enumerate(data):
+        timeseries = torch.unsqueeze(timeseries, 0)
+
+        # --! call stationary operator
+        model_i  = timeseries[:, :lookback_nsample]
+        model_o  = model.operator_stat(model_i)
+
+        timeseries_pre_mean = model_o[0]
+
+        res_fn  = torch.nn.MSELoss(reduction='mean')
+        res     = res_fn(timeseries_pre_mean, timeseries)
+
+        label = True if res < res_max else False
+        labels[this] = label
+
+    return labels
+
+
+def sample_timeseries2(nsample, rng, jdata, *data):
+
+    # --! select current datum
+    datum         = data[jdata]
+    datum_nsample = len(datum)
+
+    # --! randomly locate a suitable sample region inside the selected datum
+    sample_start = int((datum_nsample - nsample) * rng.random())
+    sample_end   = sample_start + nsample
+    sample       = datum[sample_start:sample_end, :]
+
+    # --! remove the mean of this sample and scale it between -1 and 1
+    return scale_timeseries2(remove_mean2(sample))
 
 
 def sample_timeseries(rng, nsample, timeseries_nsample, jtimeseries, *timeseries_bank):
@@ -57,6 +130,48 @@ def sample_timeseries(rng, nsample, timeseries_nsample, jtimeseries, *timeseries
 def next_index(j, n):
     """Gets the next index."""
     return np.remainder(j, n)
+
+
+def create_dataset(size, model, data):
+
+    timeseries_nsample = model.lookback_nsample + model.forecast_nsample
+    ndata              = len(data)
+
+    # --! initialize a random number generator with a new seed
+    rng = np.random.default_rng(seed=123)
+
+    dataset = [label_timeseries(
+        sample_timeseries2(
+            timeseries_nsample,
+            rng,
+            next_index(j, ndata),
+            *data), model) for j in range(size)]
+
+    return dataset
+
+def read_datafile(name: str, datachunk_len) -> torch.Tensor:
+    """
+    Reads data from a file called ``name`` and formats the data based on ``datachunk_len``,
+    i.e. the length of one contiguous chunk of data. The file data are expected to be
+    in format [T, C], such that the read data could be formatted as [B, T, C],
+    where B, T and C are the number of batches, time steps and data channels,
+    repectively.
+    """
+
+    # --! note that we force numpy loadtxt to return at least a two-dimensional array
+    # --! by setting ndmin=2
+    data = torch.tensor(
+        np.loadtxt(name + '.csv', delimiter=',', dtype=np.float32, ndmin=2))
+    datachunks_n = int(data.shape[0] / datachunk_len)
+
+    # return read data in channels-last format
+    return torch.reshape(data, (datachunks_n, datachunk_len, data.shape[1]))
+
+
+def write_datafile(name: str, data, delim: str = ','):
+    """Writes ``data`` to a file named ``name``. The file is written using a comma-separated-value format."""
+    filedata = np.reshape(data, (data.shape[0] * data.shape[1], data.shape[2]))
+    np.savetxt(name + '.csv', filedata, fmt='%.14f', delimiter=delim)
 
 
 def save_traindata(timeseries, dirname, snippet_nsample):
@@ -103,11 +218,6 @@ def save_traindata(timeseries, dirname, snippet_nsample):
         print('err >> saved data size must be less than input timeseries size!')
 
 
-def remove_mean(timeseries, dim: int=0):
-    """Removes mean from ``timeseries`` in dimension ``dim``. Dimensions are preserved."""
-    return timeseries - np.mean(timeseries, axis=dim, keepdims=True)
-
-
 def save_testdata(timeseries, dirname, snippet_nsample):
     """
     Saves ``timeseries`` into folder named ``dirname`` for model testing.
@@ -144,25 +254,4 @@ def scale_timeseries(timeseries):
     scaler = MinMaxScaler(feature_range=(-1, 1))
 
     return scaler.fit_transform(timeseries)
-
-
-class minmax_scaler:
-    def __init__(self, feature_range=(-1, 1)):
-        self.min = None
-        self.max = None
-        self.scale_min, self.scale_max = feature_range
-
-    def fit_transform(self, timeseries, dim=1):
-
-        # --! remember min and max values of given timeseries
-        self.min = timeseries.min(dim=dim, keepdim=True)[0]
-        self.max = timeseries.max(dim=dim, keepdim=True)[0]
-
-        # --! transform given timeseries according to scaling range
-        scale = (self.scale_max - self.scale_min) / (self.max - self.min + 1e-8)
-        return self.scale_min + (timeseries - self.min) * scale
-
-    def inverse_transform(self, timeseries):
-        scale = (self.max - self.min + 1e-8) / (self.scale_max - self.scale_min)
-        return self.min + (timeseries - self.scale_min) * scale
 
