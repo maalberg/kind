@@ -22,9 +22,10 @@ def plot_mse(model, datadir, data_nsample):
     forecast_end       = data.shape[0] - forecast_nsample
     lookback           = data[:lookback_nsample]
 
-    mse_blend = []
-    mse_stat  = []
-    mse_trans = []
+    mse_blend  = []
+    mse_stat   = []
+    mse_trans  = []
+    mean_alpha = []
 
     # --! the lookback window is already full, so we can start the sliding forecasts
     #
@@ -51,11 +52,13 @@ def plot_mse(model, datadir, data_nsample):
             blend    = torch.squeeze(model_o[0], dim=0)
             stat     = torch.squeeze(model_o[1], dim=0)
             trans    = torch.squeeze(model_o[3], dim=0)
+            alpha    = torch.squeeze(model_o[9], dim=0)
 
             # --! extract predicted forecast region
             forecast_blend = blend[lookback_nsample:]
             forecast_stat  = stat[lookback_nsample:]
             forecast_trans = trans[lookback_nsample:]
+            forecast_alpha = alpha[lookback_nsample:]
 
             # --! extract true forecast region
             truth = traj[0, lookback_nsample:]
@@ -66,6 +69,7 @@ def plot_mse(model, datadir, data_nsample):
             mse_blend.append(loss_fn(forecast_blend, truth))
             mse_stat.append(loss_fn(forecast_stat, truth))
             mse_trans.append(loss_fn(forecast_trans, truth))
+            mean_alpha.append(torch.mean(forecast_alpha))
 
             # --! update lookback with a new measurement
             meas     = data[[j]]
@@ -107,6 +111,8 @@ def plot_mse(model, datadir, data_nsample):
         sworst_trans = f'{worst_trans:.3f}'
         savg_trans   = f'{avg_trans:.3f}'
 
+        mean_alpha   = np.mean(mean_alpha)
+
         # --! assemble results as a table
         data_table = [
             (        'mse',         'index',         'value'),
@@ -126,10 +132,12 @@ def plot_mse(model, datadir, data_nsample):
 
         # --! print results
         print('')
-        print('inf >> evaluation results:')
+        print('inf >> forecasting results:')
         print('')
         for row in data_table:
             print(f'{row[0]:>12} {row[1]:>10} {row[2]:>10}')
+        print('')
+        print(f'inf >> mean alpha is {mean_alpha:.2f}')
         print('')
 
         return mse_blend

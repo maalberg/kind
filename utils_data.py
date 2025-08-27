@@ -153,6 +153,8 @@ def save_mixed_dataset(dir_stat, dir_trans, timeseries_nsample, savedir):
         data_stack = torch.stack([data_stat, data_trans], dim=1)
         data_mix   = torch.flatten(data_stack, start_dim=0, end_dim=1)
 
+        mixed_size = data_stat.shape[0]
+        data_mix   = data_mix[:mixed_size, :]
         write_datafile(f'{savedir}/{cfg}', data_mix)
 
 def create_dataset(size, model, rng, data):

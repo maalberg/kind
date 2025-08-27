@@ -164,15 +164,16 @@ class operator_stationary(operator):
         # --! in the embedded (latent) space
         fun_enc_ni   = self.param_kernsize * self.timeseries_ndim
         fun_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
-        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, 128, fun_enc_no], actfun_hid='relu')
+        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, fun_enc_no], actfun_hid='relu')
 
-        # --! this linear transformation is supposed to prune the dimensionality of the
-        # --! basis functions, such that only the number of these basis functions
-        # --! influences the order of the DMD matrix, whereas the number of data
-        # --! dimensions has no effect on the order
-        fun_prune_ni = nfun * self.timeseries_ndim
-        fun_prune_no = nfun
-        self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
+        if self.timeseries_ndim > 1:
+            # --! this linear transformation is supposed to prune the dimensionality of the
+            # --! basis functions, such that only the number of these basis functions
+            # --! influences the order of the DMD matrix, whereas the number of data
+            # --! dimensions has no effect on the order
+            fun_prune_ni = nfun * self.timeseries_ndim
+            fun_prune_no = nfun
+            self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
         # --! create a DMD-like model (a matrix) that captures stationary (mean) dynamics
         #
@@ -190,8 +191,8 @@ class operator_stationary(operator):
         # --! create prediction decoders to decode predicted embeddings back to timeseries and uncertainty
         pre_dec_ni        = nfun
         pre_dec_no        = self.param_kernsize * self.timeseries_ndim
-        self.pre_mean_dec = utils_nn.fcnn(feat=[pre_dec_ni, 128, 128, pre_dec_no], actfun_hid='relu')
-        self.pre_var_dec  = utils_nn.fcnn(feat=[pre_dec_ni, 128, 128, pre_dec_no], actfun_hid='relu')
+        self.pre_mean_dec = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
+        self.pre_var_dec  = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -243,7 +244,7 @@ class operator_stationary(operator):
         fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(fun)
+        return self.fun_prune(fun) if self.timeseries_ndim > 1 else fun
 
     def predict_mean(self, functions):
 
@@ -374,7 +375,8 @@ class operator_stationary(operator):
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.fun_enc)
-        utils_nn.freeze_module(self.fun_prune)
+        if self.timeseries_ndim > 1:
+            utils_nn.freeze_module(self.fun_prune)
         utils_nn.freeze_module(self.mod_mean)
         utils_nn.freeze_module(self.pre_mean_dec)
 
@@ -384,7 +386,8 @@ class operator_stationary(operator):
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
-        utils_nn.unfreeze_module(self.fun_prune)
+        if self.timeseries_ndim > 1:
+            utils_nn.unfreeze_module(self.fun_prune)
         utils_nn.unfreeze_module(self.mod_mean)
         utils_nn.unfreeze_module(self.mod_var)
         utils_nn.unfreeze_module(self.pre_mean_dec)
@@ -428,15 +431,16 @@ class operator_transient(operator):
         # --! in the embedded (latent) space
         fun_enc_ni   = self.param_kernsize * self.timeseries_ndim
         fun_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
-        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, 128, fun_enc_no], actfun_hid='relu')
+        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, fun_enc_no], actfun_hid='relu')
 
-        # --! this linear transformation is supposed to prune the dimensionality of the
-        # --! basis functions, such that only the number of these basis functions
-        # --! influences the order of linear matrices and the number of data
-        # --! dimensions has no effect on that order
-        fun_prune_ni = nfun * self.timeseries_ndim
-        fun_prune_no = nfun
-        self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
+        if self.timeseries_ndim > 1:
+            # --! this linear transformation is supposed to prune the dimensionality of the
+            # --! basis functions, such that only the number of these basis functions
+            # --! influences the order of linear matrices and the number of data
+            # --! dimensions has no effect on that order
+            fun_prune_ni = nfun * self.timeseries_ndim
+            fun_prune_no = nfun
+            self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
         if self.mean_att_used:
             # --! encoder network which learns to attend over slices of embedded function values
@@ -447,9 +451,9 @@ class operator_transient(operator):
                 torch.nn.TransformerEncoderLayer(
                     d_model=mod_mean_att_enc_ni,
                     nhead=1,
-                    dim_feedforward=128,
+                    dim_feedforward=64,
                     batch_first=True),
-                num_layers=3,
+                num_layers=2,
                 enable_nested_tensor=False)
 
         # --! an additional generator to create linear time-varying matrices from
@@ -472,9 +476,9 @@ class operator_transient(operator):
                 torch.nn.TransformerEncoderLayer(
                     d_model=mod_var_att_enc_ni,
                     nhead=1,
-                    dim_feedforward=128,
+                    dim_feedforward=64,
                     batch_first=True),
-                num_layers=3,
+                num_layers=2,
                 enable_nested_tensor=False)
 
         # --! create a generator that produces models capturing the evolution of variance (uncertainty)
@@ -543,7 +547,7 @@ class operator_transient(operator):
         fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(fun)
+        return self.fun_prune(fun) if self.timeseries_ndim > 1 else fun
 
     def predict_mean(self, functions):
 
@@ -670,7 +674,8 @@ class operator_transient(operator):
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.fun_enc)
-        utils_nn.freeze_module(self.fun_prune)
+        if self.timeseries_ndim > 1:
+            utils_nn.freeze_module(self.fun_prune)
         if self.mean_att_used:
             utils_nn.freeze_module(self.mod_mean_att_enc)
         utils_nn.freeze_module(self.mod_mean_gen)
@@ -684,7 +689,8 @@ class operator_transient(operator):
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
-        utils_nn.unfreeze_module(self.fun_prune)
+        if self.timeseries_ndim > 1:
+            utils_nn.unfreeze_module(self.fun_prune)
         if self.mean_att_used:
             utils_nn.unfreeze_module(self.mod_mean_att_enc)
         if self.var_att_used:
