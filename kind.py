@@ -190,8 +190,8 @@ class operator_stationary(operator):
         # --! create prediction decoders to decode predicted embeddings back to timeseries and uncertainty
         pre_dec_ni        = nfun
         pre_dec_no        = self.param_kernsize * self.timeseries_ndim
-        self.pre_mean_dec = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
-        self.pre_var_dec  = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
+        self.pre_mean_dec = utils_nn.fcnn(feat=[pre_dec_ni, 128, 128, pre_dec_no], actfun_hid='relu')
+        self.pre_var_dec  = utils_nn.fcnn(feat=[pre_dec_ni, 128, 128, pre_dec_no], actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -428,7 +428,7 @@ class operator_transient(operator):
         # --! in the embedded (latent) space
         fun_enc_ni   = self.param_kernsize * self.timeseries_ndim
         fun_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
-        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 64, 64, fun_enc_no], actfun_hid='relu')
+        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, 128, fun_enc_no], actfun_hid='relu')
 
         # --! this linear transformation is supposed to prune the dimensionality of the
         # --! basis functions, such that only the number of these basis functions

@@ -132,13 +132,33 @@ def next_index(j, n):
     return np.remainder(j, n)
 
 
-def create_dataset(size, model, data):
+def save_mixed_dataset(dir_stat, dir_trans, timeseries_nsample, savedir):
+    
+    dataconfig = [
+        'train1',
+        'train2',
+        'train3',
+        'train4',
+        'train5',
+        'train6',
+        'train7',
+        'valid',
+        'test'
+    ]
+
+    for cfg in dataconfig:
+        data_stat  = read_datafile(dir_stat  + '/' + cfg, timeseries_nsample)
+        data_trans = read_datafile(dir_trans + '/' + cfg, timeseries_nsample)
+
+        data_stack = torch.stack([data_stat, data_trans], dim=1)
+        data_mix   = torch.flatten(data_stack, start_dim=0, end_dim=1)
+
+        write_datafile(f'{savedir}/{cfg}', data_mix)
+
+def create_dataset(size, model, rng, data):
 
     timeseries_nsample = model.lookback_nsample + model.forecast_nsample
     ndata              = len(data)
-
-    # --! initialize a random number generator with a new seed
-    rng = np.random.default_rng(seed=123)
 
     dataset = [label_timeseries(
         sample_timeseries2(
@@ -148,6 +168,33 @@ def create_dataset(size, model, data):
             *data), model) for j in range(size)]
 
     return dataset
+
+def save_trans(model, savedir, data):
+
+    dataconfig = [
+        # number of timeseries in a file, file name
+        (3500, 'train1'),
+        (3500, 'train2'),
+        (3500, 'train3'),
+        (3500, 'train4'),
+        (3500, 'train5'),
+        (3500, 'train6'),
+        (3500, 'train7'),
+        (1000,  'valid'),
+        (500,    'test')
+    ]
+
+    for this, cfg in enumerate(dataconfig):
+
+        # --! initialize a random number generator with a new seed
+        rng = np.random.default_rng(seed=this + 1)
+
+        dataset       = create_dataset(cfg[0] * 2, model, rng, data)
+        dataset_trans = torch.stack([item for item, stat in dataset if not stat], dim=0)
+
+        d1, d2 = torch.split(dataset_trans, [cfg[0], dataset_trans.shape[0] - cfg[0]], dim=0)
+
+        write_datafile(f'{savedir}/{cfg[1]}', d1)
 
 def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     """

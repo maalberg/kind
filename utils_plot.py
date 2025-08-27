@@ -9,10 +9,10 @@ from matplotlib import pyplot as plt
 import utils_data
 
 
-def plot_mse(model, datadir, timeseries_nsample):
+def plot_mse(model, datadir, data_nsample):
 
     # --! read test data
-    data               = utils_data.read_datafile(f'{datadir}/eval', timeseries_nsample)
+    data               = utils_data.read_datafile(f'{datadir}/eval', data_nsample)
     data               = data.reshape(-1, data.shape[-1])
 
     # --! get window constants from the model
@@ -22,7 +22,9 @@ def plot_mse(model, datadir, timeseries_nsample):
     forecast_end       = data.shape[0] - forecast_nsample
     lookback           = data[:lookback_nsample]
 
-    mse = []
+    mse_blend = []
+    mse_stat  = []
+    mse_trans = []
 
     # --! the lookback window is already full, so we can start the sliding forecasts
     #
@@ -44,41 +46,82 @@ def plot_mse(model, datadir, timeseries_nsample):
             # --! extract normalized lookback and call forward method directly to
             # --! bypass model internal normalization
             model_i  = traj[:, :lookback_nsample, :]
-            model_o  = torch.squeeze(model._get_mode()._forward(model_i)[0], dim=0)
+            model_o  = model._get_mode()._forward(model_i)
+
+            blend    = torch.squeeze(model_o[0], dim=0)
+            stat     = torch.squeeze(model_o[1], dim=0)
+            trans    = torch.squeeze(model_o[3], dim=0)
 
             # --! extract predicted forecast region
-            forecast = model_o[lookback_nsample:]
+            forecast_blend = blend[lookback_nsample:]
+            forecast_stat  = stat[lookback_nsample:]
+            forecast_trans = trans[lookback_nsample:]
 
             # --! extract true forecast region
             truth = traj[0, lookback_nsample:]
 
             # --! calculate mean square error
             loss_fn = torch.nn.MSELoss(reduction='mean')
-            mse.append(loss_fn(forecast, truth))
+
+            mse_blend.append(loss_fn(forecast_blend, truth))
+            mse_stat.append(loss_fn(forecast_stat, truth))
+            mse_trans.append(loss_fn(forecast_trans, truth))
 
             # --! update lookback with a new measurement
             meas     = data[[j]]
             lookback = torch.cat([lookback[1:], meas], dim=0)
 
-        # --! gather some result details
-        jworst = np.argmax(mse)
-        worst  = mse[jworst]
-        jbest  = np.argmin(mse)
-        best   = mse[jbest]
-        avg    = np.mean(mse)
+        # --! gather blending results
+        jworst_blend = np.argmax(mse_blend)
+        worst_blend  = mse_blend[jworst_blend]
+        jbest_blend  = np.argmin(mse_blend)
+        best_blend   = mse_blend[jbest_blend]
+        avg_blend    = np.mean(mse_blend)
 
         # --! convert floats to strings with precision specification
-        sbest  = f'{best:.3f}'
-        sworst = f'{worst:.3f}'
-        savg   = f'{avg:.3f}'
+        sbest_blend  = f'{best_blend:.3f}'
+        sworst_blend = f'{worst_blend:.3f}'
+        savg_blend   = f'{avg_blend:.3f}'
+
+        # --! gather stationary results
+        jworst_stat  = np.argmax(mse_stat)
+        worst_stat   = mse_blend[jworst_stat]
+        jbest_stat   = np.argmin(mse_stat)
+        best_stat    = mse_blend[jbest_stat]
+        avg_stat     = np.mean(mse_stat)
+
+        # --! convert floats to strings with precision specification
+        sbest_stat   = f'{best_stat:.3f}'
+        sworst_stat  = f'{worst_stat:.3f}'
+        savg_stat    = f'{avg_stat:.3f}'
+
+        # --! gather transient results
+        jworst_trans = np.argmax(mse_trans)
+        worst_trans  = mse_blend[jworst_trans]
+        jbest_trans  = np.argmin(mse_trans)
+        best_trans   = mse_blend[jbest_trans]
+        avg_trans    = np.mean(mse_trans)
+
+        # --! convert floats to strings with precision specification
+        sbest_trans  = f'{best_trans:.3f}'
+        sworst_trans = f'{worst_trans:.3f}'
+        savg_trans   = f'{avg_trans:.3f}'
 
         # --! assemble results as a table
         data_table = [
-            (     'mse',         'index',         'value'),
-            ('--------',      '--------',      '--------'),
-            (    'best',           jbest,           sbest),
-            (   'worst',          jworst,          sworst),
-            (     'avg',            'na',            savg)
+            (        'mse',         'index',         'value'),
+            ('-----------',      '--------',      '--------'),
+            ( 'best blend',     jbest_blend,     sbest_blend),
+            ('worst blend',    jworst_blend,    sworst_blend),
+            (  'avg blend',            'na',      savg_blend),
+            ('', '', ''),
+            (  'best stat',      jbest_stat,      sbest_stat),
+            ( 'worst stat',     jworst_stat,     sworst_stat),
+            (   'avg stat',            'na',       savg_stat),
+            ('', '', ''),
+            ( 'best trans',     jbest_trans,     sbest_trans),
+            ('worst trans',    jworst_trans,    sworst_trans),
+            (  'avg trans',            'na',      savg_trans),
         ]
 
         # --! print results
@@ -86,65 +129,78 @@ def plot_mse(model, datadir, timeseries_nsample):
         print('inf >> evaluation results:')
         print('')
         for row in data_table:
-            print(f'{row[0]:>10} {row[1]:>10} {row[2]:>10}')
+            print(f'{row[0]:>12} {row[1]:>10} {row[2]:>10}')
         print('')
 
-        return mse
+        return mse_blend
 
 
-def plot_mse_extreme(model, mse, datadir, timeseries_nsample):
+def plot_mse_extreme(model, mse, datadir, data_nsample):
 
     # --! read test data
-    data   = utils_data.read_datafile(f'{datadir}/eval', timeseries_nsample)
+    data   = utils_data.read_datafile(f'{datadir}/eval', data_nsample)
     data   = data.reshape(-1, data.shape[-1])
 
     # --! get window constants from the model
     lookback_nsample   = model.lookback_nsample
     forecast_nsample   = model.forecast_nsample
+    timeseries_nsample = lookback_nsample + forecast_nsample
     forecast_begin     = lookback_nsample
     forecast_end       = data.shape[0] - forecast_nsample
 
     with torch.no_grad():
 
+        # --! get locations of the best and worst performance
         jworst             = np.argmax(mse)
         jbest              = np.argmin(mse)
 
+        # --! invoke the best case to get all data
         lookback           = data[jbest:jbest + lookback_nsample, :]
         model_i            = torch.unsqueeze(lookback, dim=0)
         model_o            = model(model_i)
         mean_best          = model_o[0]
+        stat_mean_best     = model_o[1]
         stat_logvar_best   = model_o[2]
+        trans_mean_best    = model_o[3]
         trans_logvar_best  = model_o[4]
         alpha_best         = model_o[9]
         mean_best          = torch.squeeze(mean_best, dim=0)
+        stat_mean_best     = torch.squeeze(stat_mean_best, dim=0)
         stat_logvar_best   = torch.squeeze(stat_logvar_best, dim=0)
+        trans_mean_best    = torch.squeeze(trans_mean_best, dim=0)
         trans_logvar_best  = torch.squeeze(trans_logvar_best, dim=0)
         alpha_best         = torch.squeeze(alpha_best, dim=0)
         stat_var_best      = torch.exp(stat_logvar_best) + 1e-6
         trans_var_best     = torch.exp(trans_logvar_best) + 1e-6
         truth_best         = data[jbest:jbest + timeseries_nsample, :]
 
+        # --! invoke the worst case to get all data
         lookback           = data[jworst:jworst + lookback_nsample, :]
         model_i            = torch.unsqueeze(lookback, dim=0)
         model_o            = model(model_i)
         mean_worst         = model_o[0]
+        stat_mean_worst    = model_o[1]
         stat_logvar_worst  = model_o[2]
+        trans_mean_worst   = model_o[3]
         trans_logvar_worst = model_o[4]
         alpha_worst        = model_o[9]
         mean_worst         = torch.squeeze(mean_worst, dim=0)
+        stat_mean_worst    = torch.squeeze(stat_mean_worst, dim=0)
         alpha_worst        = torch.squeeze(alpha_worst, dim=0)
         stat_logvar_worst  = torch.squeeze(stat_logvar_worst, dim=0)
+        trans_mean_worst   = torch.squeeze(trans_mean_worst, dim=0)
         trans_logvar_worst = torch.squeeze(trans_logvar_worst, dim=0)
         stat_var_worst     = torch.exp(stat_logvar_worst) + 1e-6
         trans_var_worst    = torch.exp(trans_logvar_worst) + 1e-6
         truth_worst        = data[jworst:jworst + timeseries_nsample, :]
 
-        plt.figure(figsize=(8, 10))
+        # --! start plotting everything
+        plt.figure(figsize=(8, 15))
 
         maxo = torch.max(truth_best)
         mino = torch.min(truth_best)
-        plt.subplot(4, 2, 1)
-        plt.title('Best MSE')
+        plt.subplot(6, 2, 1)
+        plt.title('Best blend MSE')
         for k in range(model.timeseries_ndim):
             plt.plot(truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
             plt.plot(mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
@@ -153,27 +209,64 @@ def plot_mse_extreme(model, mse, datadir, timeseries_nsample):
 
         maxo = torch.max(truth_worst)
         mino = torch.min(truth_worst)
-        plt.subplot(4, 2, 2)
-        plt.title('Worst MSE')
+        plt.subplot(6, 2, 2)
+        plt.title('Worst blend MSE')
         for k in range(model.timeseries_ndim):
             plt.plot(truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
             plt.plot(mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
         plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
+        plt.legend(loc="upper left")
 
-        plt.subplot(4, 2, 3)
+        maxo = torch.max(truth_best)
+        mino = torch.min(truth_best)
+        plt.subplot(6, 2, 3)
+        for k in range(model.timeseries_ndim):
+            plt.plot(truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(stat_mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{stat}}$')
+        plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
+        plt.legend(loc="upper left")
+
+        maxo = torch.max(truth_worst)
+        mino = torch.min(truth_worst)
+        plt.subplot(6, 2, 4)
+        for k in range(model.timeseries_ndim):
+            plt.plot(truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(stat_mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{stat}}$')
+        plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
+        plt.legend(loc="upper left")
+
+        maxo = torch.max(truth_best)
+        mino = torch.min(truth_best)
+        plt.subplot(6, 2, 5)
+        for k in range(model.timeseries_ndim):
+            plt.plot(truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(trans_mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{trans}}$')
+        plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
+        plt.legend(loc="upper left")
+
+        maxo = torch.max(truth_worst)
+        mino = torch.min(truth_worst)
+        plt.subplot(6, 2, 6)
+        for k in range(model.timeseries_ndim):
+            plt.plot(truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(trans_mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{trans}}$')
+        plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
+        plt.legend(loc="upper left")
+
+        plt.subplot(6, 2, 7)
         for k in range(model.timeseries_ndim):
             plt.plot(alpha_best[:, k], linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
         plt.plot([forecast_begin, forecast_begin], [0, 1], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
 
-        plt.subplot(4, 2, 4)
+        plt.subplot(6, 2, 8)
         for k in range(model.timeseries_ndim):
             plt.plot(alpha_worst[:, k], linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
         plt.plot([forecast_begin, forecast_begin], [0, 1], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
 
-        plt.subplot(4, 2, 5)
+        plt.subplot(6, 2, 9)
         maxvar = torch.max(stat_var_best)
         maxvar = 0.1 if maxvar < 0.1 else maxvar
         for k in range(model.timeseries_ndim):
@@ -182,7 +275,7 @@ def plot_mse_extreme(model, mse, datadir, timeseries_nsample):
         plt.ylim((0., maxvar))
         plt.legend(loc="upper left")
 
-        plt.subplot(4, 2, 6)
+        plt.subplot(6, 2, 10)
         maxvar = torch.max(stat_var_worst)
         maxvar = 0.1 if maxvar < 0.1 else maxvar
         for k in range(model.timeseries_ndim):
@@ -191,7 +284,7 @@ def plot_mse_extreme(model, mse, datadir, timeseries_nsample):
         plt.ylim((0., maxvar))
         plt.legend(loc="upper left")
 
-        plt.subplot(4, 2, 7)
+        plt.subplot(6, 2, 11)
         maxvar = torch.max(trans_var_best)
         maxvar = 0.1 if maxvar < 0.1 else maxvar
         for k in range(model.timeseries_ndim):
@@ -201,7 +294,7 @@ def plot_mse_extreme(model, mse, datadir, timeseries_nsample):
         plt.legend(loc="upper left")
         plt.xlabel('Samples')
 
-        plt.subplot(4, 2, 8)
+        plt.subplot(6, 2, 12)
         maxvar = torch.max(trans_var_worst)
         maxvar = 0.1 if maxvar < 0.1 else maxvar
         for k in range(model.timeseries_ndim):
