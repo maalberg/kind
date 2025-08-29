@@ -344,6 +344,14 @@ def plot_dataset(datadir, timeseries_nsample, timestep, plot_ndata: int=2):
 
     # --! make time array and a helping line to demarcate a zero level on a plot
     t = torch.linspace(0., timestep*timeseries_nsample, timeseries_nsample)
+    if timestep >= 3600:
+        t = t // 3600
+        timestr = 'Time [h]'
+    elif timestep >= 60:
+        t = t // 60
+        timestr = 'Time [m]'
+    else:
+        timestr = 'Time [s]'
     zero = torch.zeros_like(t)
 
     # --! show two examples for each channel
@@ -366,10 +374,10 @@ def plot_dataset(datadir, timeseries_nsample, timestep, plot_ndata: int=2):
         for k in range(nchannel):
             plt.subplot(ndata, nchannel, jsubplot)
             jsubplot = jsubplot + 1
-            if j==0: plt.title(f'Detuning index {k}')
+            if j==0: plt.title(f'Data channel {k}')
             plt.plot(t, data[:, k], color='tab:blue', alpha=0.75)
             plt.plot(t, zero, color='tab:gray', linestyle='dotted', alpha=0.75)
-            if j == ndata - 1: plt.xlabel('Time [s]')
+            if j == ndata - 1: plt.xlabel(timestr)
             if k == 0: plt.ylabel('Amplitude')
             plt.tight_layout()
 
