@@ -89,9 +89,9 @@ def plot_mse(model, datadir, data_nsample):
 
         # --! gather stationary results
         jworst_stat  = np.argmax(mse_stat)
-        worst_stat   = mse_blend[jworst_stat]
+        worst_stat   = mse_stat[jworst_stat]
         jbest_stat   = np.argmin(mse_stat)
-        best_stat    = mse_blend[jbest_stat]
+        best_stat    = mse_stat[jbest_stat]
         avg_stat     = np.mean(mse_stat)
 
         # --! convert floats to strings with precision specification
@@ -101,9 +101,9 @@ def plot_mse(model, datadir, data_nsample):
 
         # --! gather transient results
         jworst_trans = np.argmax(mse_trans)
-        worst_trans  = mse_blend[jworst_trans]
+        worst_trans  = mse_trans[jworst_trans]
         jbest_trans  = np.argmin(mse_trans)
-        best_trans   = mse_blend[jbest_trans]
+        best_trans   = mse_trans[jbest_trans]
         avg_trans    = np.mean(mse_trans)
 
         # --! convert floats to strings with precision specification
@@ -140,10 +140,10 @@ def plot_mse(model, datadir, data_nsample):
         print(f'inf >> mean alpha is {mean_alpha:.2f}')
         print('')
 
-        return mse_blend
+        return mse_stat, mse_trans, mse_blend
 
 
-def plot_mse_extreme(model, mse, datadir, data_nsample):
+def plot_mse_extreme(model, datadir, data_nsample, mse, mse_type: str='blend', datasaved: bool=False, savedir: str='savedata/'):
 
     # --! read test data
     data   = utils_data.read_datafile(f'{datadir}/eval', data_nsample)
@@ -205,23 +205,25 @@ def plot_mse_extreme(model, mse, datadir, data_nsample):
         # --! start plotting everything
         plt.figure(figsize=(8, 15))
 
+        step = torch.arange(len(truth_best)).reshape(-1, 1)
+
         maxo = torch.max(truth_best)
         mino = torch.min(truth_best)
         plt.subplot(6, 2, 1)
-        plt.title('Best blend MSE')
+        plt.title(f'Best {mse_type} MSE')
         for k in range(model.timeseries_ndim):
-            plt.plot(truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
-            plt.plot(mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
+            plt.plot(step[:, 0], truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
         plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
 
         maxo = torch.max(truth_worst)
         mino = torch.min(truth_worst)
         plt.subplot(6, 2, 2)
-        plt.title('Worst blend MSE')
+        plt.title(f'Worst {mse_type} MSE')
         for k in range(model.timeseries_ndim):
-            plt.plot(truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
-            plt.plot(mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
+            plt.plot(step[:, 0], truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
         plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
         plt.legend(loc="upper left")
@@ -230,8 +232,8 @@ def plot_mse_extreme(model, mse, datadir, data_nsample):
         mino = torch.min(truth_best)
         plt.subplot(6, 2, 3)
         for k in range(model.timeseries_ndim):
-            plt.plot(truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
-            plt.plot(stat_mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{stat}}$')
+            plt.plot(step[:, 0], truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], stat_mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{stat}}$')
         plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
 
@@ -239,8 +241,8 @@ def plot_mse_extreme(model, mse, datadir, data_nsample):
         mino = torch.min(truth_worst)
         plt.subplot(6, 2, 4)
         for k in range(model.timeseries_ndim):
-            plt.plot(truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
-            plt.plot(stat_mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{stat}}$')
+            plt.plot(step[:, 0], truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], stat_mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{stat}}$')
         plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
 
@@ -248,8 +250,8 @@ def plot_mse_extreme(model, mse, datadir, data_nsample):
         mino = torch.min(truth_best)
         plt.subplot(6, 2, 5)
         for k in range(model.timeseries_ndim):
-            plt.plot(truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
-            plt.plot(trans_mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{trans}}$')
+            plt.plot(step[:, 0], truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], trans_mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{trans}}$')
         plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
 
@@ -257,20 +259,20 @@ def plot_mse_extreme(model, mse, datadir, data_nsample):
         mino = torch.min(truth_worst)
         plt.subplot(6, 2, 6)
         for k in range(model.timeseries_ndim):
-            plt.plot(truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
-            plt.plot(trans_mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{trans}}$')
+            plt.plot(step[:, 0], truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], trans_mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})^{\\text{trans}}$')
         plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
 
         plt.subplot(6, 2, 7)
         for k in range(model.timeseries_ndim):
-            plt.plot(alpha_best[:, k], linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], alpha_best[:, k], linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
         plt.plot([forecast_begin, forecast_begin], [0, 1], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
 
         plt.subplot(6, 2, 8)
         for k in range(model.timeseries_ndim):
-            plt.plot(alpha_worst[:, k], linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], alpha_worst[:, k], linestyle='solid', label='$\\alpha_{' + f'{k+1}' + '}$')
         plt.plot([forecast_begin, forecast_begin], [0, 1], linestyle='dotted', color='gray')
         plt.legend(loc="upper left")
 
@@ -278,7 +280,7 @@ def plot_mse_extreme(model, mse, datadir, data_nsample):
         maxvar = torch.max(stat_var_best)
         maxvar = 0.1 if maxvar < 0.1 else maxvar
         for k in range(model.timeseries_ndim):
-            plt.plot(stat_var_best[:, k], linestyle='solid', label='$\\zeta^{stat}_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], stat_var_best[:, k], linestyle='solid', label='$\\zeta^{stat}_{' + f'{k+1}' + '}$')
         plt.plot([forecast_begin, forecast_begin], [0, maxvar], linestyle='dotted', color='gray')
         plt.ylim((0., maxvar))
         plt.legend(loc="upper left")
@@ -287,7 +289,7 @@ def plot_mse_extreme(model, mse, datadir, data_nsample):
         maxvar = torch.max(stat_var_worst)
         maxvar = 0.1 if maxvar < 0.1 else maxvar
         for k in range(model.timeseries_ndim):
-            plt.plot(stat_var_worst[:, k], linestyle='solid', label='$\\zeta^{stat}_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], stat_var_worst[:, k], linestyle='solid', label='$\\zeta^{stat}_{' + f'{k+1}' + '}$')
         plt.plot([forecast_begin, forecast_begin], [0, maxvar], linestyle='dotted', color='gray')
         plt.ylim((0., maxvar))
         plt.legend(loc="upper left")
@@ -296,7 +298,7 @@ def plot_mse_extreme(model, mse, datadir, data_nsample):
         maxvar = torch.max(trans_var_best)
         maxvar = 0.1 if maxvar < 0.1 else maxvar
         for k in range(model.timeseries_ndim):
-            plt.plot(trans_var_best[:, k], linestyle='solid', label='$\\zeta^{trans}_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], trans_var_best[:, k], linestyle='solid', label='$\\zeta^{trans}_{' + f'{k+1}' + '}$')
         plt.plot([forecast_begin, forecast_begin], [0, maxvar], linestyle='dotted', color='gray')
         plt.ylim((0., maxvar))
         plt.legend(loc="upper left")
@@ -306,13 +308,102 @@ def plot_mse_extreme(model, mse, datadir, data_nsample):
         maxvar = torch.max(trans_var_worst)
         maxvar = 0.1 if maxvar < 0.1 else maxvar
         for k in range(model.timeseries_ndim):
-            plt.plot(trans_var_worst[:, k], linestyle='solid', label='$\\zeta^{trans}_{' + f'{k+1}' + '}$')
+            plt.plot(step[:, 0], trans_var_worst[:, k], linestyle='solid', label='$\\zeta^{trans}_{' + f'{k+1}' + '}$')
         plt.plot([forecast_begin, forecast_begin], [0, maxvar], linestyle='dotted', color='gray')
         plt.ylim((0., maxvar))
         plt.legend(loc="upper left")
         plt.xlabel('Samples')
 
         plt.show()
+
+        if datasaved:
+            savedata = np.expand_dims(np.concatenate([step, truth_best], axis=1), 0)
+            utils_data.write_datafile(f'{savedir}/mse_best_{mse_type}_truth', savedata, delim=' ')
+
+            savedata = np.expand_dims(np.concatenate([
+                step[forecast_begin:],
+                stat_mean_best[forecast_begin:], trans_mean_best[forecast_begin:], mean_best[forecast_begin:],
+                stat_var_best[forecast_begin:], trans_var_best[forecast_begin:],
+                alpha_best[forecast_begin:]], axis=1), 0)
+            utils_data.write_datafile(f'{savedir}/mse_best_{mse_type}_forecast', savedata, delim=' ')
+
+            savedata = np.expand_dims(np.concatenate([step, truth_worst], axis=1), 0)
+            utils_data.write_datafile(f'{savedir}/mse_worst_{mse_type}_truth', savedata, delim=' ')
+
+            savedata = np.expand_dims(np.concatenate([
+                step[forecast_begin:],
+                stat_mean_worst[forecast_begin:], trans_mean_worst[forecast_begin:], mean_worst[forecast_begin:],
+                stat_var_worst[forecast_begin:], trans_var_worst[forecast_begin:],
+                alpha_worst[forecast_begin:]], axis=1), 0)
+            utils_data.write_datafile(f'{savedir}/mse_worst_{mse_type}_forecast', savedata, delim=' ')
+
+
+def plot_mse_extreme2(
+    model, datadir, data_nsample, mse, mse_type: str='blend', k: int=3, jsave: int=0, datasaved: bool=False, savedir: str='savedata/'):
+
+    # --! read test data
+    data   = utils_data.read_datafile(f'{datadir}/eval', data_nsample)
+    data   = data.reshape(-1, data.shape[-1])
+
+    # --! get window constants from the model
+    lookback_nsample   = model.lookback_nsample
+    forecast_nsample   = model.forecast_nsample
+    timeseries_nsample = lookback_nsample + forecast_nsample
+    forecast_begin     = lookback_nsample
+    forecast_end       = data.shape[0] - forecast_nsample
+
+    with torch.no_grad():
+
+        # --! 
+        jbest              = np.argpartition(mse, k)
+        jbest              = jbest[:k]
+
+        for j in jbest:
+            lookback           = data[j:j + lookback_nsample, :]
+            model_i            = torch.unsqueeze(lookback, dim=0)
+            model_o            = model(model_i)
+            mean_best          = model_o[0]
+            stat_mean_best     = model_o[1]
+            stat_logvar_best   = model_o[2]
+            trans_mean_best    = model_o[3]
+            trans_logvar_best  = model_o[4]
+            alpha_best         = model_o[9]
+            mean_best          = torch.squeeze(mean_best, dim=0)
+            stat_mean_best     = torch.squeeze(stat_mean_best, dim=0)
+            stat_logvar_best   = torch.squeeze(stat_logvar_best, dim=0)
+            trans_mean_best    = torch.squeeze(trans_mean_best, dim=0)
+            trans_logvar_best  = torch.squeeze(trans_logvar_best, dim=0)
+            alpha_best         = torch.squeeze(alpha_best, dim=0)
+            stat_var_best      = torch.exp(stat_logvar_best) + 1e-6
+            trans_var_best     = torch.exp(trans_logvar_best) + 1e-6
+            truth_best         = data[j:j + timeseries_nsample, :]
+
+            plt.figure(figsize=(6, 3))
+
+            step = torch.arange(len(truth_best)).reshape(-1, 1)
+
+            maxo = torch.max(truth_best)
+            mino = torch.min(truth_best)
+            plt.title(f'Index {j}')
+            for k in range(model.timeseries_ndim):
+                plt.plot(step[:, 0], truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
+                plt.plot(step[:, 0], mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
+            plt.plot([forecast_begin, forecast_begin], [mino, maxo], linestyle='dotted', color='gray')
+            plt.legend(loc="upper left")
+
+            plt.show()
+
+            if datasaved and j == jsave:
+                savedata = np.expand_dims(np.concatenate([step, truth_best], axis=1), 0)
+                utils_data.write_datafile(f'{savedir}/mse_j_{mse_type}_truth', savedata, delim=' ')
+
+                savedata = np.expand_dims(np.concatenate([
+                    step[forecast_begin:],
+                    stat_mean_best[forecast_begin:], trans_mean_best[forecast_begin:], mean_best[forecast_begin:],
+                    stat_var_best[forecast_begin:], trans_var_best[forecast_begin:],
+                    alpha_best[forecast_begin:]], axis=1), 0)
+                utils_data.write_datafile(f'{savedir}/mse_j_{mse_type}_forecast', savedata, delim=' ')
+
 
 def plot_dataset(datadir, timeseries_nsample, timestep, plot_ndata: int=2):
     """
