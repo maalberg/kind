@@ -191,10 +191,43 @@ def save_trans(model, savedir, data):
         # --! initialize a random number generator with a new seed
         rng = np.random.default_rng(seed=this + 1)
 
-        dataset       = create_dataset(cfg[0] * 2, model, rng, data)
+        # --! increase requested data by a factor to make sure there is enough transient data
+        size_factor   = 2
+
+        dataset       = create_dataset(cfg[0] * size_factor, model, rng, data)
         dataset_trans = torch.stack([item for item, stat in dataset if not stat], dim=0)
 
         d1, d2 = torch.split(dataset_trans, [cfg[0], dataset_trans.shape[0] - cfg[0]], dim=0)
+
+        write_datafile(f'{savedir}/{cfg[1]}', d1)
+
+def save_stat(model, savedir, data):
+
+    dataconfig = [
+        # number of timeseries in a file, file name
+        (3500, 'train1'),
+        (3500, 'train2'),
+        (3500, 'train3'),
+        (3500, 'train4'),
+        (3500, 'train5'),
+        (3500, 'train6'),
+        (3500, 'train7'),
+        (1000,  'valid'),
+        (500,    'test')
+    ]
+
+    for this, cfg in enumerate(dataconfig):
+
+        # --! initialize a random number generator with a new seed
+        rng = np.random.default_rng(seed=this + 1)
+
+        # --! increase requested data by a factor to make sure there is enough stationary data
+        size_factor   = 100
+
+        dataset       = create_dataset(cfg[0] * size_factor, model, rng, data)
+        dataset_stat  = torch.stack([item for item, stat in dataset if stat], dim=0)
+
+        d1, d2 = torch.split(dataset_stat, [cfg[0], dataset_stat.shape[0] - cfg[0]], dim=0)
 
         write_datafile(f'{savedir}/{cfg[1]}', d1)
 
