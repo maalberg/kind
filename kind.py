@@ -9,6 +9,8 @@ from abc import ABC as interface
 
 from dataclasses import dataclass
 
+import time
+
 import utils_data
 import utils_nn
 
@@ -836,6 +838,8 @@ class mode_fit(run_mode):
         trainloss_sta_lin    = []
         trainloss_dyn_lin    = []
 
+        t = []
+
         # --! training duration
         if self._model._fit_phase.isverbose: print(f"inf >> number of data files for training is {self._model._fit_phase.train_nfile}")
 
@@ -854,12 +858,21 @@ class mode_fit(run_mode):
                 for data in traindatafun:
                     # --! take all channels of these time series for training
                     timeseries = data[0]
+
+                    # --! reset optimizer gradients
                     optimizer.zero_grad()
 
                     # --! fit a model to training time series
-                    loss, loss_predict, loss_lin_g, loss_lin_l = self._model._fit_phase.compute_loss(timeseries)
+                    t_start = time.time()
 
+                    loss, loss_predict, loss_lin_g, loss_lin_l = self._model._fit_phase.compute_loss(timeseries)
                     loss.backward()
+
+                    t_end     = time.time()
+                    t_elapsed = t_end - t_start
+                    t.append(t_elapsed)
+
+                    # --! update optimizer gradients
                     optimizer.step()
 
                     with torch.no_grad():
@@ -867,6 +880,7 @@ class mode_fit(run_mode):
                         trainloss_sta_lin.append(loss_lin_g)
                         trainloss_dyn_lin.append(loss_lin_l)
 
+        self._model._fit_phase.exit(t)
         o = (
             trainloss_predict,
             trainloss_sta_lin, trainloss_dyn_lin
@@ -916,6 +930,25 @@ class fit_phase(interface):
         self.isverbose             = param['isverbose']
 
     @abstractmethod
+    def exit(self, t):
+        times  = torch.mean(torch.tensor(t))
+        stimes = f'{times:.1e}'
+
+        data_table = [
+            ( 'batch size',   'time per iteration [s]'),
+            ( '----------',   '----------------------'),
+            ( self.batsize,                     stimes),
+        ]
+
+        # --! print results
+        print('')
+        print('inf >> fit details:')
+        print('')
+        for row in data_table:
+            print(f'{row[0]:>12} {row[1]:>24}')
+        print('')
+    
+    @abstractmethod
     def compute_loss(self, timeseries):
         """Use given ``timeseries`` to compute the loss of this fit phase."""
         return
@@ -960,6 +993,10 @@ class phase_stationary_mean(fit_phase):
 
         self.datadir = param['stadatadir']
 
+    def exit(self, t):
+        print(f'inf >> exiting stationary mean phase')
+        super().exit(t)
+
     def compute_loss(self, timeseries):
 
         lookback = timeseries[:, :self._model.lookback_nsample]
@@ -994,6 +1031,10 @@ class phase_stationary_var(fit_phase):
         self._model.operator_stat.freeze_mean()
 
         self.datadir = param['mixdatadir']
+
+    def exit(self, t):
+        print(f'inf >> exiting stationary variance phase')
+        super().exit(t)
 
     def compute_loss(self, timeseries):
 
@@ -1030,6 +1071,10 @@ class phase_transient_mean(fit_phase):
 
         self.datadir = param['transdatadir']
 
+    def exit(self, t):
+        print(f'inf >> exiting transient mean phase')
+        super().exit(t)
+
     def compute_loss(self, timeseries):
 
         lookback = timeseries[:, :self._model.lookback_nsample]
@@ -1064,6 +1109,10 @@ class phase_transient_var(fit_phase):
         self._model.operator_stat.freeze_var()
 
         self.datadir = param['mixdatadir']
+
+    def exit(self, t):
+        print(f'inf >> exiting transient variance phase')
+        super().exit(t)
 
     def compute_loss(self, timeseries):
 
