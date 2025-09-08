@@ -5,6 +5,9 @@
 import torch
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.linear_model import LinearRegression
+from scipy.spatial.distance import cdist
+from statsmodels.tsa.stattools import acf
 
 from matplotlib import pyplot as plt
 
@@ -28,6 +31,72 @@ class minmax_scaler:
     def inverse_transform(self, timeseries):
         scale = (self.max - self.min + 1e-8) / (self.scale_max - self.scale_min)
         return self.min + (timeseries - self.scale_min) * scale
+
+
+def forecastability(x, n_fft=None):
+    """
+    Calculate the forecastability of a time series using the entropy of its normalized power spectrum.
+    Reference: Goerg (2013)
+
+    Forecastability = 1 - H / log(N)
+    where H is the Shannon entropy of the normalized power spectrum.
+    """
+    x = np.asarray(x)
+    x = x - np.mean(x)  # remove mean
+    
+    # Compute the power spectrum
+    n_fft = n_fft or len(x)
+    fft = np.fft.fft(x, n=n_fft)
+    power_spectrum = np.abs(fft[:n_fft // 2])**2
+    power_spectrum /= np.sum(power_spectrum)  # normalize to get a probability distribution
+
+    # Compute entropy
+    ps_nonzero = power_spectrum[power_spectrum > 0]
+    entropy = -np.sum(ps_nonzero * np.log(ps_nonzero))
+
+    # Normalize by maximum entropy
+    max_entropy = np.log(len(power_spectrum))
+    forecastability_score = 1 - entropy / max_entropy
+    return forecastability_score
+
+
+def is_seasonal(slice_data, alpha=0.05):
+    # Compute autocorrelations and confidence intervals
+    acfs, confint = acf(slice_data, nlags=len(slice_data)//2, alpha=alpha, fft=False)
+    # Exclude lag 0
+    lower = confint[1:, 0]
+    upper = confint[1:, 1]
+    significant = (lower > 0) | (upper < 0)
+    return significant.any()
+
+
+def compute_seasonality_percent(ts, slice_len=20):
+    n_slices = len(ts) // slice_len
+    seasonal_count = 0
+    for i in range(n_slices):
+        slice_data = ts[i*slice_len : (i+1)*slice_len]
+        if is_seasonal(slice_data):
+            seasonal_count += 1
+    return seasonal_count / n_slices
+
+
+def compute_slice_trend(slice_data):
+    t = np.arange(len(slice_data)).reshape(-1, 1)
+    y = slice_data.reshape(-1, 1)
+    model = LinearRegression().fit(t, y)
+    slope = model.coef_[0][0]
+    scale = np.mean(np.abs(y)) + 1e-8  # Prevent division by zero
+    return slope / scale
+
+
+def compute_trend_over_series(ts, slice_len=20):
+    n_slices = len(ts) // slice_len
+    trends = []
+    for i in range(n_slices):
+        slice_data = ts[i*slice_len : (i+1)*slice_len]
+        trend = compute_slice_trend(slice_data)
+        trends.append(trend)
+    return np.mean(trends)
 
 
 def scale_timeseries2(timeseries):
