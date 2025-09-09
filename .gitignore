@@ -9,3 +9,8 @@ savedata
 figures
 models
 external
+
+notebooks/baselines/checkpoints
+notebooks/baselines/test_results
+notebooks/baselines/result.txt
+notebooks/baselines/results
