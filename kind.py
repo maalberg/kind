@@ -101,23 +101,21 @@ class operator(torch.nn.Module, interface):
         else:
             raise Exception("unsupported basis function!")
 
-    def _eval_sinx(self, param, n):
+    def _eval_sinx(self, param):
         amp, ang = torch.split(param, 1, dim=-1)
-        return amp * torch.sin(n * ang)
+        return amp * torch.sin(ang)
 
     def _eval_sin(self, param):
         param = torch.split(param, self.sin_nparam, dim=-1)
-        mult  = torch.arange(len(param)) + 1
-        return torch.cat([self._eval_sinx(p, m) for p, m in zip(param, mult)], dim=-1)
+        return torch.cat([self._eval_sinx(p) for p in param], dim=-1)
 
-    def _eval_cosx(self, param, n):
+    def _eval_cosx(self, param):
         amp, ang = torch.split(param, 1, dim=-1)
-        return amp * torch.cos(n * ang)
+        return amp * torch.cos(ang)
 
     def _eval_cos(self, param):
-        param   = torch.split(param, self.cos_nparam, dim=-1)
-        factor  = torch.arange(len(param)) + 1
-        return torch.cat([self._eval_cosx(p, f) for p, f in zip(param, factor)], dim=-1)
+        param = torch.split(param, self.cos_nparam, dim=-1)
+        return torch.cat([self._eval_cosx(p) for p in param], dim=-1)
 
     def _eval_data(self, param):
         return param
