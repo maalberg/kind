@@ -270,7 +270,7 @@ def save_trans(model, savedir, data):
 
         write_datafile(f'{savedir}/{cfg[1]}', d1)
 
-def save_stat(model, savedir, data):
+def save_stat(model, savedir, data, size_factor:int=100):
 
     dataconfig = [
         # number of timeseries in a file, file name
@@ -289,9 +289,6 @@ def save_stat(model, savedir, data):
 
         # --! initialize a random number generator with a new seed
         rng = np.random.default_rng(seed=this + 1)
-
-        # --! increase requested data by a factor to make sure there is enough stationary data
-        size_factor   = 100
 
         dataset       = create_dataset(cfg[0] * size_factor, model, rng, data)
         dataset_stat  = torch.stack([item for item, stat in dataset if stat], dim=0)
