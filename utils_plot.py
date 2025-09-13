@@ -210,7 +210,7 @@ def plot_mse_extreme(model, datadir, data_nsample, mse, mse_type: str='blend', d
         maxo = torch.max(truth_best)
         mino = torch.min(truth_best)
         plt.subplot(6, 2, 1)
-        plt.title(f'Best {mse_type} MSE')
+        plt.title(f'Best {mse_type} MSE at {jbest}')
         for k in range(model.timeseries_ndim):
             plt.plot(step[:, 0], truth_best[:, k], label='$x_{' + f'{k+1}' + '}$')
             plt.plot(step[:, 0], mean_best[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
@@ -220,7 +220,7 @@ def plot_mse_extreme(model, datadir, data_nsample, mse, mse_type: str='blend', d
         maxo = torch.max(truth_worst)
         mino = torch.min(truth_worst)
         plt.subplot(6, 2, 2)
-        plt.title(f'Worst {mse_type} MSE')
+        plt.title(f'Worst {mse_type} MSE at {jworst}')
         for k in range(model.timeseries_ndim):
             plt.plot(step[:, 0], truth_worst[:, k], label='$x_{' + f'{k+1}' + '}$')
             plt.plot(step[:, 0], mean_worst[:, k], linestyle='dashed', label='$\\mu(\\hat{x_{' + f'{k+1}' + '}})$')
