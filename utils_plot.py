@@ -9,6 +9,14 @@ from matplotlib import pyplot as plt
 import utils_data
 
 
+def MSE(pred, true):
+    return np.mean((pred - true) ** 2)
+
+
+def MAE(pred, true):
+    return np.mean(np.abs(pred - true))
+
+
 def plot_mse(model, datadir, data_nsample):
 
     # --! read test data
@@ -22,10 +30,16 @@ def plot_mse(model, datadir, data_nsample):
     forecast_end       = data.shape[0] - forecast_nsample
     lookback           = data[:lookback_nsample]
 
+    blends     = []
+    stats      = []
+    transs     = []
+    trues      = []
     mse_blend  = []
     mse_stat   = []
     mse_trans  = []
     mean_alpha = []
+    mean_stat_var = []
+    mean_trans_var = []
 
     # --! the lookback window is already full, so we can start the sliding forecasts
     #
@@ -49,19 +63,51 @@ def plot_mse(model, datadir, data_nsample):
             model_i  = traj[:, :lookback_nsample, :]
             model_o  = model._get_mode()._forward(model_i)
 
-            blend    = torch.squeeze(model_o[0], dim=0)
-            stat     = torch.squeeze(model_o[1], dim=0)
-            trans    = torch.squeeze(model_o[3], dim=0)
-            alpha    = torch.squeeze(model_o[9], dim=0)
+            # --! unnormalized input (with units)
+            traj_wu  = scaler.inverse_transform(traj)
+            traj_wu  = torch.squeeze(traj_wu, dim=0)
+            forecast_traj_wu = traj_wu[lookback_nsample:]
+
+            # --! unnormalized outputs (with units)
+            blend_wu  = model_o[0]
+            blend_wu  = scaler.inverse_transform(blend_wu)
+            blend_wu  = torch.squeeze(blend_wu, dim=0)
+            stat_wu   = model_o[1]
+            stat_wu   = scaler.inverse_transform(stat_wu)
+            stat_wu   = torch.squeeze(stat_wu, dim=0)
+            trans_wu  = model_o[3]
+            trans_wu  = scaler.inverse_transform(trans_wu)
+            trans_wu  = torch.squeeze(trans_wu, dim=0)
+
+            forecast_blend_wu = blend_wu[lookback_nsample:]
+            forecast_stat_wu  = stat_wu[lookback_nsample:]
+            forecast_trans_wu = trans_wu[lookback_nsample:]
+
+            blend     = torch.squeeze(model_o[0], dim=0)
+            stat      = torch.squeeze(model_o[1], dim=0)
+            stat_var  = torch.squeeze(model_o[2], dim=0)
+            trans     = torch.squeeze(model_o[3], dim=0)
+            trans_var = torch.squeeze(model_o[4], dim=0)
+            alpha     = torch.squeeze(model_o[9], dim=0)
+
+            stat_var  = torch.exp(stat_var) + 1e-6
+            trans_var = torch.exp(trans_var) + 1e-6
 
             # --! extract predicted forecast region
             forecast_blend = blend[lookback_nsample:]
             forecast_stat  = stat[lookback_nsample:]
             forecast_trans = trans[lookback_nsample:]
             forecast_alpha = alpha[lookback_nsample:]
+            forecast_stat_var = stat_var[lookback_nsample:]
+            forecast_trans_var = trans_var[lookback_nsample:]
 
             # --! extract true forecast region
             truth = traj[0, lookback_nsample:]
+
+            blends.append(forecast_blend_wu)
+            stats.append(forecast_stat_wu)
+            transs.append(forecast_trans_wu)
+            trues.append(forecast_traj_wu)
 
             # --! calculate mean square error
             loss_fn = torch.nn.MSELoss(reduction='mean')
@@ -70,10 +116,39 @@ def plot_mse(model, datadir, data_nsample):
             mse_stat.append(loss_fn(forecast_stat, truth))
             mse_trans.append(loss_fn(forecast_trans, truth))
             mean_alpha.append(torch.mean(forecast_alpha))
+            mean_stat_var.append(torch.mean(forecast_stat_var))
+            mean_trans_var.append(torch.mean(forecast_trans_var))
 
             # --! update lookback with a new measurement
             meas     = data[[j]]
             lookback = torch.cat([lookback[1:], meas], dim=0)
+
+        blends = np.array(blends)
+        trues  = np.array(trues)
+        stats  = np.array(stats)
+        transs = np.array(transs)
+        print('test shape:', blends.shape, trues.shape)
+        blends = blends.reshape(-1, blends.shape[-2], blends.shape[-1])
+        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
+        print('test shape:', blends.shape, trues.shape)
+
+        blend_mse = MSE(blends, trues)
+        blend_mae = MAE(blends, trues)
+        stat_mse  = MSE(stats, trues)
+        stat_mae  = MAE(stats, trues)
+        trans_mse = MSE(transs, trues)
+        trans_mae = MAE(transs, trues)
+        print(f'Blend MSE : {blend_mse:.3f}')
+        print(f'Blend MAE : {blend_mae:.3f}')
+        print(f'Stat MSE : {stat_mse:.3f}')
+        print(f'Stat MAE : {stat_mae:.3f}')
+        print(f'Trans MSE : {trans_mse:.3f}')
+        print(f'Trans MAE : {trans_mae:.3f}')
+
+        mean_stat_var  = np.mean(mean_stat_var)
+        mean_trans_var = np.mean(mean_trans_var)
+        print(f'Stat uncertainty : {mean_stat_var}')
+        print(f'Trans uncertainty : {mean_trans_var}')
 
         # --! gather blending results
         jworst_blend = np.argmax(mse_blend)
