@@ -17,7 +17,7 @@ def MAE(pred, true):
     return np.mean(np.abs(pred - true))
 
 
-def plot_mse(model, datadir, data_nsample):
+def plot_mse(model, datadir, data_nsample, with_units=True):
 
     # --! read test data
     data               = utils_data.read_datafile(f'{datadir}/eval', data_nsample)
@@ -64,19 +64,19 @@ def plot_mse(model, datadir, data_nsample):
             model_o  = model._get_mode()._forward(model_i)
 
             # --! unnormalized input (with units)
-            traj_wu  = scaler.inverse_transform(traj)
+            traj_wu  = scaler.inverse_transform(traj) if with_units else traj
             traj_wu  = torch.squeeze(traj_wu, dim=0)
             forecast_traj_wu = traj_wu[lookback_nsample:]
 
             # --! unnormalized outputs (with units)
             blend_wu  = model_o[0]
-            blend_wu  = scaler.inverse_transform(blend_wu)
+            blend_wu  = scaler.inverse_transform(blend_wu) if with_units else blend_wu
             blend_wu  = torch.squeeze(blend_wu, dim=0)
             stat_wu   = model_o[1]
-            stat_wu   = scaler.inverse_transform(stat_wu)
+            stat_wu   = scaler.inverse_transform(stat_wu) if with_units else stat_wu
             stat_wu   = torch.squeeze(stat_wu, dim=0)
             trans_wu  = model_o[3]
-            trans_wu  = scaler.inverse_transform(trans_wu)
+            trans_wu  = scaler.inverse_transform(trans_wu) if with_units else trans_wu
             trans_wu  = torch.squeeze(trans_wu, dim=0)
 
             forecast_blend_wu = blend_wu[lookback_nsample:]
