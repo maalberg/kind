@@ -816,8 +816,8 @@ class mode_fit(run_mode):
         self._model._fit_phase.enter(param)
 
         # --! prepare test data
-        testdata    = utils_data.read_datafile(f'{self._model._fit_phase.datadir}/valid', self._model._fit_phase.timeseries_nsample)
-        testdataset = torch.utils.data.TensorDataset(testdata)
+        #testdata    = utils_data.read_datafile(f'{self._model._fit_phase.datadir}/valid', self._model._fit_phase.timeseries_nsample)
+        #testdataset = torch.utils.data.TensorDataset(testdata)
 
         # --! specify an optimizer for fit
         optimizer = torch.optim.Adam(

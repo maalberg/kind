@@ -99,9 +99,9 @@ def compute_trend_over_series(ts, slice_len=20):
     return np.mean(trends)
 
 
-def scale_timeseries2(timeseries):
+def scale_timeseries2(timeseries, dim=0):
     scaler = minmax_scaler(feature_range=(-1, 1))
-    return scaler.fit_transform(timeseries, dim=0)
+    return scaler.fit_transform(timeseries, dim=dim)
 
 
 def remove_mean(timeseries, dim: int=0):
