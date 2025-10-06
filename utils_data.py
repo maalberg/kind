@@ -2,14 +2,69 @@
 # --! utilities for data operations
 # --!--------------------------------------------------------------!
 
+from abc import abstractmethod
+from abc import ABC as interface
+
 import torch
 import numpy as np
+
+import pandas as pd
+
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
 from scipy.spatial.distance import cdist
 from statsmodels.tsa.stattools import acf
 
 from matplotlib import pyplot as plt
+
+
+class dataset_factory:
+    def create_dataset(self, args):
+        if args.data_t == 'sim':
+            return dataset_sim(args.data_path, args.data_nsample)
+        else:
+            return
+
+
+class dataset(interface):
+
+    @abstractmethod
+    def load(self, window_nsample):
+        return
+
+    def read_csv(self, data_path, data_nsample):
+
+        # --! read a csv-file with no header
+        dataframe = pd.read_csv(data_path, header=None)
+        data      = torch.from_numpy(dataframe.to_numpy())
+
+        # --! return 3D data structure
+        ndata     = data.shape[0] // data_nsample
+        return torch.reshape(data, (ndata, data_nsample, data.shape[1]))
+
+class dataset_sim(dataset):
+
+    def __init__(self, data_path, data_nsample):
+        super().__init__()
+
+        self.data = self.read_csv(data_path, data_nsample)
+
+    def load(self, window_nsample):
+        data_start = 0
+        data_end   = self.data.shape[1] - window_nsample
+
+        windows = []
+
+        for j in range(data_start, data_end):
+            window_start = j
+            window_end   = window_start + window_nsample
+            window       = self.data[:, window_start:window_end]
+
+            # --! save timeseries framed by current window
+            for timeseries in window:
+                windows.append(timeseries)
+
+        return torch.stack(windows, dim=0)
 
 
 class minmax_scaler:
