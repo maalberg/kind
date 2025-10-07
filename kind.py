@@ -9,14 +9,40 @@ from abc import ABC as interface
 
 from dataclasses import dataclass
 
+import argparse
 import time
 
 import utils_data
 import utils_nn
 
 
+def create_args_parser():
+    """ Creates a command-line parser for KIND arguments.
+    """
+    parser = argparse.ArgumentParser(description='KIND timeseries forecasting')
+
+    # --! data arguments
+    parser.add_argument('--data_t', type=str, required=True, default='sim', help='data type')
+    parser.add_argument('--data_path', type=str, required=True, default='../../data/delay/tesla_sim.csv', help='data file path')
+    parser.add_argument('--data_nsample', type=int, required=True, default=200, help='number of samples in timeseries stored in data')
+    parser.add_argument('--data_scale_min', type=float, required=True, default=-1, help='data minimum value when scaled using min-max')
+    parser.add_argument('--data_scale_max', type=float, required=True, default=1, help='data maximum value when scaled using min-max')
+    parser.add_argument('--data_train_size', type=float, required=True, default=0.75, help='dataset proportion to include in training')
+    parser.add_argument('--data_test_size',
+                        type=float,
+                        required=True,
+                        default=0.5,
+                        help='non-training proportion to include in test, rest is for validation')
+
+    # --! forecasting arguments
+    parser.add_argument('--lookback_nsample', type=int, required=True, default=96, help='number of samples in a lookback window')
+    parser.add_argument('--forecast_nsample', type=int, required=True, default=48, help='number of samples in a forecast window')
+
+    return parser
+
+
 class operator(torch.nn.Module, interface):
-    """Models dynamics of timeseries."""
+    """Models timeseries dynamics."""
 
     sin_nparam  = 2
     cos_nparam  = 2
@@ -695,7 +721,7 @@ class operator_transient(operator):
 
 
 class run_mode(interface):
-    """Represents the current running mode of a model, i.e. fit or evaluate."""
+    """Represents current running mode of a model, i.e. fit or evaluate."""
 
     def __init__(self, model):
         super().__init__()
@@ -718,13 +744,14 @@ class run_mode(interface):
 
     @abstractmethod
     def forward(self, timeseries):
-        """Forwards given ``timeseries`` to the current mode algorithm."""
+        """Executes a forward pass on given ``timeseries`` according to current mode."""
         return
 
-    def _forward(self, timeseries):
+    def _forward_scaled(self, timeseries):
+        """Executes a forward pass on scaled ``timeseries``."""
 
         # --! execute both operators on given time series
-        timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pre, _, _ = self._model.operator_stat(timeseries)
+        timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pre, _, _     = self._model.operator_stat(timeseries)
         timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pre, _, _ = self._model.operator_trans(timeseries)
 
         # --! derive alpha
@@ -777,7 +804,7 @@ class mode_eval(run_mode):
         scaler = utils_data.minmax_scaler(feature_range=(-1, 1))
         timeseries = scaler.fit_transform(timeseries)
 
-        o = self._forward(timeseries)
+        o = self._forward_scaled(timeseries)
 
         # --! extract to-be-unscaled timeseries from the forwarded result
         timeseries_pre       = o[0]
@@ -879,11 +906,11 @@ class mode_fit(run_mode):
         return o
 
     def forward(self, timeseries):
-        """Predicts given ``timeseries`` in fit mode.
+        """Executes a forward pass on given ``timeseries`` in fit mode.
 
         The ``timeseries`` are expected to be scaled to range from -1 to 1 with mean removed.
         """
-        return self._forward(timeseries)
+        return self._forward_scaled(timeseries)
 
 
 class fit_phase(interface):
@@ -1168,11 +1195,11 @@ class model_config:
 
 
 class model(torch.nn.Module):
-    """Models Kalman-inpired neural decomposition, or KIND.
+    """ Models Kalman-inpired neural decomposition, or KIND.
 
     This model captures the evolution of timeseries by first decomposing them into stationary and
-    transient components, predicting these components into the future and
-    finally blending the predictions in a Kalman-inspired manner.
+    transient components, forecasting these components into the future and
+    finally blending the forecasts in a Kalman-inspired manner.
     """
 
     def __init__(self, config):

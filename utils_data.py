@@ -20,72 +20,124 @@ from matplotlib import pyplot as plt
 
 class dataset_factory:
     def create_dataset(self, args):
+
+        # --! parse train/valid/test split sizes
+        nontrain_size = 1.0 - args.data_train_size
+        test_size     = nontrain_size * args.data_test_size
+        valid_size    = nontrain_size - test_size
+
         if args.data_t == 'sim':
-            return dataset_sim(args.data_path, args.data_nsample)
+            return dataset_sim(
+                args.data_path,
+                args.data_nsample,
+                (args.data_scale_min, args.data_scale_max),
+                (args.data_train_size, valid_size, test_size)
+            )
         else:
             return
 
 
 class dataset(interface):
 
+    # --! interface --!
+
     @abstractmethod
-    def load(self, window_nsample):
+    def load(self, flag='train', window_nsample=144):
+        """Loads data of type ``flag`` and sized according to ``window_nsample``."""
         return
 
-    def read_csv(self, data_path, data_nsample):
+    # --! common methods --!
+
+    def read_csv(self, data_path):
 
         # --! read a csv-file with no header
         dataframe = pd.read_csv(data_path, header=None)
-        data      = torch.from_numpy(dataframe.to_numpy())
+        return torch.from_numpy(dataframe.to_numpy())
 
-        # --! return 3D data structure
-        ndata     = data.shape[0] // data_nsample
-        return torch.reshape(data, (ndata, data_nsample, data.shape[1]))
+    def demean(self, data, dim=0):
+        return data - torch.mean(data, dim, keepdim=True)
+
+    def scale(self, data, dim=0, minmax=(-1, 1)):
+        scaler = minmax_scaler(feature_range=minmax)
+        return scaler.fit_transform(data, dim)
+
 
 class dataset_sim(dataset):
 
-    def __init__(self, data_path, data_nsample):
+    def __init__(self, data_path, data_nsample, data_scale_minmax, split_size):
         super().__init__()
 
-        self.data = self.read_csv(data_path, data_nsample)
+        # --! read data from a csv file
+        data = self.read_csv(data_path)
 
-    def load(self, window_nsample):
-        data_start = 0
-        data_end   = self.data.shape[1] - window_nsample
+        # --! convert read data to a 3D torch tensor
+        ndata     = data.shape[0] // data_nsample
+        self.data = torch.reshape(data, (ndata, data_nsample, data.shape[1]))
+
+        # --! derive sample numbers for train-validation-test splits
+        self.split_nsample = (
+            int(self.data.shape[1] * self.split_size[0]), # < train
+            int(self.data.shape[1] * self.split_size[1]), # < validation
+            int(self.data.shape[1] * self.split_size[2])) # < test
+
+        self.scale_minmax = data_scale_minmax
+
+    def load(self, flag='train', window_nsample=144):
+
+        # --! derive data borders according to the data flag
+        assert flag in ['train', 'valid', 'test']
+        if flag=='train':
+            data_start = 0
+            data_end   = self.split_nsample[0] - window_nsample
+        elif flag=='valid':
+            data_start = self.split_nsample[0]
+            data_end   = self.split_nsample[0] + self.split_nsample[1] - window_nsample
+        else:
+            data_start = self.split_nsample[0] + self.split_nsample[1]
+            data_end   = self.split_nsample[0] + self.split_nsample[1] + self.split_nsample[2] - window_nsample
 
         windows = []
 
+        # --! extract data windows from current data split in a rolling window manner
         for j in range(data_start, data_end):
             window_start = j
             window_end   = window_start + window_nsample
             window       = self.data[:, window_start:window_end]
 
-            # --! save timeseries framed by current window
+            # --! store timeseries framed by current window
             for timeseries in window:
-                windows.append(timeseries)
+                windows.append(self.scale(self.demean(timeseries, dim=0), dim=0, minmax=self.scale_minmax))
 
         return torch.stack(windows, dim=0)
 
 
 class minmax_scaler:
+    """ Defines a differentiable min-max scaler class suitable to be used during torch-based training.
+    """
     def __init__(self, feature_range=(-1, 1)):
         self.min = None
         self.max = None
-        self.scale_min, self.scale_max = feature_range
+        self.min_scaled, self.max_scaled = feature_range
 
-    def fit_transform(self, timeseries, dim=1):
+    def fit_transform(self, data, dim=1):
 
-        # --! remember min and max values of given timeseries
-        self.min = timeseries.min(dim=dim, keepdim=True)[0]
-        self.max = timeseries.max(dim=dim, keepdim=True)[0]
+        # --! remember min and max values of given data
+        self.min = data.min(dim, keepdim=True)[0]
+        self.max = data.max(dim, keepdim=True)[0]
 
-        # --! transform given timeseries according to scaling range
-        scale = (self.scale_max - self.scale_min) / (self.max - self.min + 1e-8)
-        return self.scale_min + (timeseries - self.min) * scale
+        # --! transform given data according to scaling range
+        scale = (self.max_scaled - self.min_scaled) / (self.max - self.min + 1e-8)
+        return self.min_scaled + (data - self.min) * scale
 
-    def inverse_transform(self, timeseries):
-        scale = (self.max - self.min + 1e-8) / (self.scale_max - self.scale_min)
-        return self.min + (timeseries - self.scale_min) * scale
+    def inverse_transform(self, data):
+        scale = (self.max - self.min + 1e-8) / (self.max_scaled - self.min_scaled)
+        return self.min + (data - self.min_scaled) * scale
+
+
+
+
+
+
 
 
 def forecastability(x, n_fft=None):
