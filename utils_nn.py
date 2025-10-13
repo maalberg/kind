@@ -3,6 +3,55 @@
 # --!--------------------------------------------------------------!
 
 import torch
+import numpy as np
+
+class early_stopping:
+    """ Manages early stopping during neural network training. """
+    def __init__(self, patience=7, delta=0, verbose=True, checkpoint_path=None):
+        self.patience       = patience
+        self.delta          = delta
+        self.verbose        = verbose
+        self.counter        = 0
+        self.best_score     = None
+        self.early_stop     = False
+        self.valid_loss_min = np.inf
+        self.path           = checkpoint_path
+
+    def __call__(self, model, valid_loss):
+        # --! we monitor score as a negative value which goes toward zero as it improves
+        score = -valid_loss
+
+        if self.best_score is None:
+            # --! first iteration - initialize everything
+            self.best_score = score
+            self.save_checkpoint(model, valid_loss)
+
+        elif score < self.best_score + self.delta:
+            # --! training has not improved a model, so start the early stopping counter
+            self.counter += 1
+            if self.verbose:
+                print(f'\tearly stopping counter: {self.counter} out of {self.patience}')
+
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+        else:
+            # --! training has improved a model, so update current status
+            self.best_score = score
+            self.save_checkpoint(model, valid_loss)
+            self.counter = 0
+
+        return self.early_stop
+
+    def save_checkpoint(self, model, valid_loss):
+        if self.path is None:
+            return
+
+        if self.verbose:
+            print(f'\tvalidation loss decreased ({self.valid_loss_min:.6f} -> {valid_loss:.6f}), saving model ...')
+
+        torch.save(model.state_dict(), self.path + '/' + 'checkpoint.pth')
+        self.valid_loss_min = valid_loss
 
 
 def freeze_module(module):

@@ -2,23 +2,23 @@
 # --! Implementation of Kalman-inspired neural decomposition, or KIND
 # --!-------------------------------------------------------------------!
 
-import torch
-
 from abc import abstractmethod
 from abc import ABC as interface
 
-from dataclasses import dataclass
-
+import torch
+import numpy as np
 import argparse
 import time
+import json
 
 import utils_data
 import utils_nn
 
+from utils_data import conv_str2ints, minmax_scaler
+
 
 def create_args_parser():
-    """ Creates a command-line parser for KIND arguments.
-    """
+    """ Creates a command-line parser for KIND arguments. """
     parser = argparse.ArgumentParser(description='KIND timeseries forecasting')
 
     # --! data arguments
@@ -27,19 +27,559 @@ def create_args_parser():
     parser.add_argument('--data_nsample', type=int, required=True, default=200, help='number of samples in timeseries stored in data')
     parser.add_argument('--data_scale_min', type=float, required=True, default=-1, help='data minimum value when scaled using min-max')
     parser.add_argument('--data_scale_max', type=float, required=True, default=1, help='data maximum value when scaled using min-max')
-    parser.add_argument('--data_train_size', type=float, required=True, default=0.75, help='dataset proportion to include in training')
-    parser.add_argument('--data_test_size',
-                        type=float,
-                        required=True,
-                        default=0.5,
-                        help='non-training proportion to include in test, rest is for validation')
+    parser.add_argument('--data_train_size', type=float, required=True, default=0.75, help='dataset part to include in training')
+    parser.add_argument('--data_test_size', type=float, required=True, default=0.5, help='non-train part to include in test, rest is validation')
 
     # --! forecasting arguments
+    parser.add_argument('--feature_dim', type=conv_str2ints, required=True, default=0, help='list of feature dimensions in data')
+    parser.add_argument('--target_dim', type=conv_str2ints, required=True, default=0, help='list of target dimensions in data')
     parser.add_argument('--lookback_nsample', type=int, required=True, default=96, help='number of samples in a lookback window')
     parser.add_argument('--forecast_nsample', type=int, required=True, default=48, help='number of samples in a forecast window')
 
+    # --! training
+    parser.add_argument('--batch_size', type=int, required=True, default=128, help='batch size')
+    parser.add_argument('--learning_rate', type=float, required=True, default=0.001, help='learning rate')
+    parser.add_argument('--weight_decay', type=float, required=True, default=0.0001, help='weight decay to regularize training')
+    parser.add_argument('--nepoch', type=int, required=True, default=10, help='number of training epochs')
+    parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
+    parser.add_argument('--checkpoints', type=str, default='../../models/', help='location of model training checkpoints')
+
+    # --! KIND
+    parser.add_argument('--seg_nsample_stat', type=int, required=True, default=24, help='number of samples in a stationary data segment')
+    parser.add_argument('--seg_nsample_trans', type=int, required=True, default=12, help='number of samples in a transient data segment')
+    parser.add_argument('--fun_stat', type=json.loads, required=True, default='{"data": 8}', help='embedded functions for stationary operator')
+    parser.add_argument('--fun_trans', type=json.loads, required=True, default='{"data": 8}', help='embedded functions for transient operator')
+
     return parser
 
+
+class model(torch.nn.Module):
+    """ Models Kalman-inpired neural decomposition, or KIND.
+
+    This model captures the evolution of timeseries by first decomposing them into stationary and
+    transient components, forecasting these components into the future and
+    finally blending the forecasts in a Kalman-inspired manner.
+    """
+
+    def __init__(self, args):
+        super().__init__()
+
+        self.args = args
+
+        # --! declare KIND operators
+        self.stationary = operator_stationary(args)
+        self.transient = operator_transient(args)
+
+        # --! specify states, or modes, of this model that will define its behavior
+        self._mode_fit = model_fit(self)
+        self._mode_eval = model_eval(self)
+        self._mode = self._mode_fit
+
+    def fit_next(self):
+        """ Advances this model to next fit state. Returns True if the model has been advanced, False if there is no next state. """
+        return self._get_mode().fit_next()
+
+    def fit(self, dataset):
+        """ Fits this KIND model to given ``dataset`` according to the model's current mode and fit state. """
+        return self._get_mode().fit(dataset)
+
+    def forward(self, timeseries):
+        """ Uses given ``timeseries`` to execute a forward pass of this model according to current mode. """
+        return self._get_mode().forward(timeseries)
+
+    def train(self, mode=True):
+        """ Switches this model mode according to ``mode``: True - go to fit, False - go to evaluation mode. """
+
+        if mode is True:
+            self._get_mode().train()
+        else:
+            self._get_mode().eval()
+
+        # --! according to the interface of torch.nn.Module, this method returns self
+        return self
+
+    def eval(self):
+        """ Sets this model into evaluation mode. """
+        return self.train(mode=False) # < delegate execution to train method
+
+    def _get_mode_fit(self):
+        return self._mode_fit
+
+    def _get_mode_eval(self):
+        return self._mode_eval
+
+    def _get_mode(self):
+        return self._mode
+
+    def _set_mode(self, mode):
+        self._mode = mode
+
+    def _train_module(self, mode=True):
+        """ Calls the super class of this PyTorch module to change the behavior of particular modules. """
+        super().train(mode)
+
+class model_mode(interface):
+    """ Represents current mode of a KIND model, e.g. fit or evaluate. """
+
+    def __init__(self, model):
+        super().__init__()
+
+        # --! keep reference to a KIND model
+        self.model = model
+
+    @abstractmethod
+    def train(self):
+        """ Sets this model into training mode. """
+        return
+
+    @abstractmethod
+    def eval(self):
+        """ Sets this model into evaluation mode. """
+        return
+
+    @abstractmethod
+    def fit_next(self):
+        """ Advances KIND model to next fit state. Returns True if the model has been advanced, False if there is no next state. """
+        return
+
+    @abstractmethod
+    def fit(self, dataset):
+        """ Fits this KIND model to given ``dataset`` according to the model's current mode and fit state. """
+        return
+
+    @abstractmethod
+    def forward(self, timeseries):
+        """ Executes a forward pass on given ``timeseries`` according to current mode of this KIND model. """
+        return
+
+    def _forward_scaled(self, timeseries):
+        """ Uses scaled ``timeseries`` to execute a forward pass of this KIND model. """
+
+        # --! execute both operators on given time series
+        timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pre, _, _     = self.model.stationary(timeseries)
+        timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pre, _, _ = self.model.transient(timeseries)
+
+        # --! derive alpha
+        timeseries_stat_var  = torch.exp(timeseries_stat_logvar) + 1e-6
+        timeseries_trans_var = torch.exp(timeseries_trans_logvar) + 1e-6
+        alpha = timeseries_trans_var / (timeseries_trans_var + timeseries_stat_var)
+
+        # --! blend the two types of time series using the derived alpha to get the final prediction
+        timeseries_pre = alpha * timeseries_stat + (1 - alpha) * timeseries_trans
+
+        output = (
+            timeseries_pre,
+            timeseries_stat, timeseries_stat_logvar,
+            timeseries_trans, timeseries_trans_logvar,
+            fun_stat, fun_stat_pre,
+            fun_trans, fun_trans_pre,
+            alpha
+        )
+
+        return output
+
+
+class model_eval(model_mode):
+    """ Represents an evaluation mode of a KIND model. """
+
+    def __init__(self, model):
+        super().__init__(model)
+
+    def train(self):
+        """ Sets this KIND model into fit mode. """
+        self.model._set_mode(self.model._get_mode_fit())
+        self.model._train_module(mode=True)
+
+    def eval(self):
+        """ Returns immediately as KIND model is already in evaluation mode. """
+        return
+    
+    def fit_next(self):
+        return False
+
+    def fit(self, dataset):
+        """ Returns immediately as KIND model is currently in evaluation mode. """
+        return
+
+    def forward(self, timeseries):
+        """ Uses unnormalized ``timeseries`` to execute a forward pass of KIND model in evaluation mode. """
+
+        # --! combine feature and target dimension indeces into a unique-valued set
+        dim = self.model.args.feature_dim + self.model.args.target_dim
+        dim = set(dim)
+
+        # --! collect means of data dimensions into dictionary, where dimension indeces serve as keys
+        mean = dict([(k, torch.mean(timeseries[:, :, [k]], dim=1, keepdim=True)) for k in dim])
+
+        # --! create scalers for data dimensions as a dictionary, where dimension indeces serve as keys
+        scaler_range = (self.model.args.data_scale_min, self.model.args.data_scale_max)
+        scaler = dict([(k, minmax_scaler(scaler_range)) for k in dim])
+
+        # --! scale timeseries
+        timeseries = torch.cat([timeseries[:, :, [k]] - mean[k] for k in dim], dim=-1)
+        timeseries = torch.cat([scaler[k].fit_transform(timeseries[:, :, [k]], dim=1) for k in dim], dim=-1)
+
+        # --! having scaled given timeseries, call the scaled version of KIND forward method
+        model_output = self._forward_scaled(timeseries)
+
+        # --! extract to-be-unscaled timeseries from the forwarded result
+        timeseries_pred = model_output[0]
+        timeseries_stat = model_output[1]
+        timeseries_trans = model_output[3]
+
+        # --! unscale predicted timeseries
+        #
+        # --! since the indeces of target dimensions must be present in above dictionaries,
+        # --! we use these indeces to directly access the dictionaries
+        timeseries_pred = torch.cat([scaler[k].inverse_transform(timeseries_pred[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
+        timeseries_pred = torch.cat([timeseries_pred[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
+        timeseries_stat = torch.cat([scaler[k].inverse_transform(timeseries_stat[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
+        timeseries_stat = torch.cat([timeseries_stat[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
+        timeseries_trans = torch.cat([scaler[k].inverse_transform(timeseries_trans[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
+        timeseries_trans = torch.cat([timeseries_trans[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
+
+        # --! put unscaled timeseries back to the result tuple and return the tuple
+        model_output    = list(model_output)
+        model_output[0] = timeseries_pred
+        model_output[1] = timeseries_stat
+        model_output[3] = timeseries_trans
+
+        return tuple(model_output)
+
+
+class model_fit(model_mode):
+    """ Represents a fit mode of a KIND model. """
+
+    def __init__(self, model):
+        super().__init__(model)
+
+        # --! create states of this mode
+        self._state_stationary_mean          = fit_stationary_mean(self)
+        self._state_stationary_uncertainty   = fit_stationary_uncertainty(self)
+        self._state_transient_mean           = fit_transient_mean(self)
+        self._state_transient_uncertainty    = fit_transient_uncertainty(self)
+        self._state                          = self._state_stationary_mean
+
+    def train(self):
+        """ Returns immediately as this KIND model is already in fit mode. """
+        return
+
+    def eval(self):
+        """ Sets this KIND model into evaluation mode. """
+        self.model._set_mode(self.model._get_mode_eval())
+        self.model._train_module(mode=False)
+
+    def fit_next(self):
+        return self.get_state().next()
+
+    def fit(self, dataset):
+        """ Fits this KIND model to given ``dataset`` according to the model's current mode and fit state.
+
+        The implementation of this training algorithm resembles the Template pattern, because the method
+        defines a structure for training and then calls state classes
+        to carry out specific tasks that may vary.
+        """
+
+        # --! first, make any necessary model initializations before training
+        self.get_state().init()
+
+        args = self.model.args
+
+        # --! make sure to select an optimizer after initializing this model
+        model_optim = self.select_optimizer()
+        train_loader = dataset.load(flag='train')
+        valid_loader = dataset.load(flag='valid')
+        test_loader = dataset.load(flag='test')
+        early_stopping = utils_nn.early_stopping(patience=args.patience, checkpoint_path=args.checkpoints)
+
+        # --! start training
+        for epoch in range(args.nepoch):
+            train_loss = []
+
+            for back, fore in train_loader:
+
+                # --! since we compute a full reconstruction loss at the moment, concatenate current
+                # --! lookback and forecast windows to get the full timeseries
+                # --! to serve as the truth
+                truth = torch.cat([back, fore], dim=1)
+
+                # --! extract target dimensions
+                truth = truth[:, :, self.model.args.target_dim]
+
+                model_optim.zero_grad()
+
+                # --! forward pass
+                loss = self.get_state().compute_loss(truth, self.get_state().forward(back))
+                train_loss.append(loss.item())
+
+                # --! backward pass
+                loss.backward()
+
+                # --! finalize this training iteration
+                model_optim.step()
+
+            train_loss = np.average(train_loss)
+            valid_loss = self.validate(valid_loader)
+            test_loss = self.validate(test_loader)
+
+            print(f'\tepoch {epoch+1} losses: train={train_loss:.6f}, valid={valid_loss:.6f}, test={test_loss:.6f}')
+
+            # --! use validation loss to check early stopping
+            if early_stopping(self.model, valid_loss):
+                print("\tearly stopping ...")
+                break
+
+            # --! adjust learning rate
+
+        best_model_path = args.checkpoints + '/' + 'checkpoint.pth'
+        self.model.load_state_dict(torch.load(best_model_path, weights_only=True))
+        return
+
+    def forward(self, timeseries):
+        """ Executes a forward pass on scaled ``timeseries`` in fit mode. """
+        return self._forward_scaled(timeseries)
+
+    def get_state_stationary_mean(self):
+        return self._state_stationary_mean
+
+    def get_state_stationary_uncertainty(self):
+        return self._state_stationary_uncertainty
+
+    def get_state_transient_mean(self):
+        return self._state_transient_mean
+
+    def get_transient_uncertainty(self):
+        return self._state_transient_uncertainty
+
+    def get_state(self):
+        return self._state
+
+    def set_state(self, state):
+        self._state = state
+
+    def validate(self, data_loader):
+
+        total_loss = []
+
+        # --! set this model into evaluation mode
+        self.model.eval()
+
+        with torch.no_grad():
+            for back, fore in data_loader:
+
+                # --! since we compute a full reconstruction loss at the moment, concatenate current
+                # --! lookback and forecast windows to get the full timeseries
+                # --! to serve as the truth
+                truth = torch.cat([back, fore], dim=1)
+
+                # --! extract target dimensions
+                truth = truth[:, :, self.model.args.target_dim]
+
+                loss = self.get_state().compute_loss(truth, self.get_state().forward(back))
+                total_loss.append(loss)
+
+        # --! reset this model back to training mode
+        self.model.train()
+
+        return np.average(total_loss)
+
+    def select_optimizer(self):
+        return torch.optim.Adam(
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=self.model.args.learning_rate,
+            weight_decay=self.model.args.weight_decay)
+
+
+class fit_state(interface):
+    """ Manages a state of a KIND model fit mode, e.g. when fitting a stationary mean, or transient uncertainty. """
+
+    def __init__(self, mode):
+        super().__init__()
+
+        # --! reference to a fit mode of a KIND model
+        self.mode = mode
+
+    @abstractmethod
+    def init(self):
+        """ Initializes this KIND model before training. """
+        return
+
+    @abstractmethod
+    def forward(self, timeseries):
+        """ Executes a forward pass of a KIND model according to this fit state. """
+        return
+
+    @abstractmethod
+    def compute_loss(self, true, pred):
+        """ Computes loss from ``true`` and ``pred``icted timeseries according to this fit state. """
+        return
+
+    @abstractmethod
+    def next(self) -> bool:
+        """ Transitions to next state, or immediately returns False if there is no next state. """
+        return
+
+    def apply_criterion_mean(self, timeseries, timeseries_pred):
+        criterion = torch.nn.MSELoss(reduction='mean')
+        return criterion(timeseries_pred, timeseries)
+
+    def apply_criterion_uncertain(self, timeseries, timeseries_pred_mean, timeseries_pred_uncertain):
+        uncertainty_log = torch.clamp(timeseries_pred_uncertain, min=-5, max=5)
+        uncertainty = torch.exp(uncertainty_log) + 1e-6
+
+        criterion = torch.nn.GaussianNLLLoss()
+        return criterion(timeseries_pred_mean, timeseries, uncertainty)
+
+
+class fit_stationary_mean(fit_state):
+
+    def __init__(self, mode):
+        super().__init__(mode)
+
+    def init(self):
+
+        print('>>> train stationary mean >>>')
+        model = self.mode.model
+
+        model.transient.freeze_mean()
+        model.transient.freeze_var()
+
+        model.stationary.unfreeze()
+        model.stationary.freeze_var()
+
+    def forward(self, timeseries):
+        return self.mode.model(timeseries)
+
+    def compute_loss(self, true, pred):
+
+        timeseries = true
+        timeseries_pred = pred[1] # < stationary prediction
+
+        fun = pred[5]
+        fun_pred = pred[6]
+
+        loss_recon = self.apply_criterion_mean(timeseries, timeseries_pred)
+        loss_linear = self.apply_criterion_mean(fun, fun_pred)
+        loss = loss_recon + loss_linear
+
+        return loss
+
+    def next(self):
+        self.mode.set_state(self.mode.get_state_stationary_uncertainty())
+        return True
+
+
+class fit_stationary_uncertainty(fit_state):
+
+    def __init__(self, mode):
+        super().__init__(mode)
+
+    def init(self):
+
+        model = self.mode.model
+
+        model.transient.freeze_mean()
+        model.transient.freeze_var()
+
+        model.stationary.unfreeze()
+        model.stationary.freeze_mean()
+
+    def forward(self, timeseries):
+        return self.mode.model.stationary(timeseries)
+
+    def compute_loss(self, true, pred):
+
+        timeseries = true
+        timeseries_pred_mean = pred[0]
+        timeseries_pred_uncertain = pred[1]
+
+        dfun = pred[4]
+        dfun_pred = pred[5]
+
+        loss_linear = self.apply_criterion_mean(dfun, dfun_pred)
+        loss_recon  = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
+        loss        = loss_recon + loss_linear
+
+        return loss
+
+    def next(self):
+        self.mode.set_state(self.mode.get_state_transient_mean())
+        return True
+
+
+class fit_transient_mean(fit_state):
+
+    def __init__(self, fit):
+        super().__init__(fit)
+
+    def init(self):
+
+        model = self.mode.model
+
+        model.transient.unfreeze()
+        model.transient.freeze_var()
+
+        model.stationary.freeze_mean()
+        model.stationary.freeze_var()
+
+    def forward(self, timeseries):
+        return self.mode.model.transient(timeseries)
+
+    def compute_loss(self, true, pred):
+
+        timeseries = true
+        timeseries_pred_mean = pred[0]
+
+        fun = pred[2]
+        fun_pred = pred[3]
+
+        loss_recon = self.apply_criterion_mean(timeseries, timeseries_pred_mean)
+        loss_linear = self.apply_criterion_mean(fun, fun_pred)
+        loss = loss_recon + loss_linear
+
+        return loss
+
+    def next(self):
+        self.mode.set_state(self.mode.get_state_transient_uncertainty())
+        return True
+
+
+class fit_transient_uncertainty(fit_state):
+
+    def __init__(self, mode):
+        super().__init__(mode)
+
+    def init(self):
+
+        model = self.mode.model
+
+        model.transient.unfreeze()
+        model.transient.freeze_mean()
+
+        model.stationary.freeze_mean()
+        model.stationary.freeze_var()
+
+    def forward(self, timeseries):
+        return self.mode.model.transient(timeseries)
+
+    def compute_loss(self, true, pred):
+
+        timeseries = true
+        timeseries_pred_mean = pred[0]
+        timeseries_pred_uncertain = pred[1]
+
+        dfun = pred[4]
+        dfun_pred = pred[5]
+
+        loss_linear = self.apply_criterion_mean(dfun_pred, dfun)
+        loss_recon  = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
+        loss        = loss_linear + loss_recon
+
+        return loss
+
+    def next(self):
+        return False
+    
 
 class operator(torch.nn.Module, interface):
     """Models timeseries dynamics."""
@@ -50,14 +590,14 @@ class operator(torch.nn.Module, interface):
     poly_nparam = 1
     exp_nparam  = 1
 
-    def __init__(self, config):
+    def __init__(self, args):
         super().__init__()
 
         # --! store mutual configuration inside this base class
-        self.timeseries_ndim       = config.timeseries_ndim
-        self.timestep              = config.timestep
-        self.lookback_nsample      = config.lookback_nsample
-        self.forecast_nsample      = config.forecast_nsample
+        self.nfeature = len(args.feature_dim)
+        self.ntarget = len(args.target_dim)
+        self.lookback_nsample = args.lookback_nsample
+        self.forecast_nsample = args.forecast_nsample
 
     @abstractmethod
     def embed(self, timeseries):
@@ -158,21 +698,21 @@ class operator(torch.nn.Module, interface):
 class operator_stationary(operator):
     """Models dynamics of stationary timeseries in a DMD-like manner."""
 
-    def __init__(self, config):
+    def __init__(self, args):
 
         # --! initialize common operator parameters
-        super().__init__(config)
+        super().__init__(args)
 
         # --! this here is a convenient place to get the total number of functions, because
         # --! later the function configuration becomes respecified
         # --! to facilitate other things
-        nfun = sum(config.fun_stat.values())
+        nfun = sum(args.fun_stat.values())
 
         # --! initialize stationary-specific parameters
         #
         # --! note that here the function configuration becomes respecified
-        self.fun            = self._respec_fun(config.fun_stat)
-        self.param_kernsize = config.param_kernsize_stat
+        self.fun            = self._respec_fun(args.fun_stat)
+        self.param_kernsize = args.seg_nsample_stat
 
         if self.forecast_nsample % self.param_kernsize:
             raise Exception('the number of forecast samples must be a multiple of a kernel size!')
@@ -188,16 +728,16 @@ class operator_stationary(operator):
         # --! more precisely, input timeseries are partitioned into slices, and the encoder
         # --! encodes slice-specific kernels for every function parameter
         # --! in the embedded (latent) space
-        fun_enc_ni   = self.param_kernsize * self.timeseries_ndim
-        fun_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
+        fun_enc_ni   = self.param_kernsize * self.nfeature
+        fun_enc_no   = nparam * self.param_kernsize * self.nfeature
         self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, fun_enc_no], actfun_hid='relu')
 
-        if self.timeseries_ndim > 1:
+        if self.nfeature > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
             # --! basis functions, such that only the number of these basis functions
             # --! influences the order of the DMD matrix, whereas the number of data
             # --! dimensions has no effect on the order
-            fun_prune_ni = nfun * self.timeseries_ndim
+            fun_prune_ni = nfun * self.nfeature
             fun_prune_no = nfun
             self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
@@ -219,7 +759,7 @@ class operator_stationary(operator):
 
         # --! create prediction decoders to decode predicted embeddings back to timeseries and uncertainty
         pre_dec_ni        = nfun
-        pre_dec_no        = self.param_kernsize * self.timeseries_ndim
+        pre_dec_no        = self.param_kernsize * self.ntarget
         self.pre_mean_dec = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
         self.pre_var_dec  = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
 
@@ -233,8 +773,8 @@ class operator_stationary(operator):
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
-        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.timeseries_ndim)
-        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.timeseries_ndim)
+        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
+        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
 
         # --! based on inputs, encode parameter kernels (filters)
         kern = self.fun_enc(i)
@@ -251,12 +791,12 @@ class operator_stationary(operator):
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize * self.timeseries_ndim)
+            self.param_kernsize * self.nfeature)
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize, self.timeseries_ndim)
-        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.timeseries_ndim)
+            self.param_kernsize, self.nfeature)
+        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
 
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
@@ -273,7 +813,7 @@ class operator_stationary(operator):
         fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(fun) if self.timeseries_ndim > 1 else fun
+        return self.fun_prune(fun) if self.nfeature > 1 else fun
 
     def predict_mean(self, functions):
 
@@ -365,7 +905,7 @@ class operator_stationary(operator):
         dfun         = fun_pre - fun
         dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
         dfun         = dfun - dfun_mean
-        scaler       = utils_data.minmax_scaler(feature_range=(-1, 1))
+        scaler       = minmax_scaler(feature_range=(-1, 1))
         dfun         = scaler.fit_transform(dfun)
 
         # --! predict the evolution of a function error starting from the first error value upto
@@ -384,17 +924,17 @@ class operator_stationary(operator):
         # --! so we reshape the decoded results back to their
         # --! original shape [B, T, ndim]
         timeseries_pre_mean  = self.pre_mean_dec(torch.cat([fun_pre, fun_pre_forecast], dim=1))
-        timeseries_pre_mean  = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.timeseries_ndim)
+        timeseries_pre_mean  = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.ntarget)
 
-        # --! decode predicted and denormalized function errors to model uncertainty (variance)
+        # --! decode predicted and denormalized function errors to model uncertainty
         timeseries_pre_var   = self.pre_var_dec(dfun_pre_unsca)
-        timeseries_pre_var   = timeseries_pre_var.reshape(timeseries_pre_var.shape[0], -1, self.timeseries_ndim)
+        timeseries_pre_var   = timeseries_pre_var.reshape(timeseries_pre_var.shape[0], -1, self.ntarget)
 
         return timeseries_pre_mean, timeseries_pre_var, fun, fun_pre, dfun, dfun_pre
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.fun_enc)
-        if self.timeseries_ndim > 1:
+        if self.nfeature > 1:
             utils_nn.freeze_module(self.fun_prune)
         utils_nn.freeze_module(self.mod_mean)
         utils_nn.freeze_module(self.pre_mean_dec)
@@ -405,7 +945,7 @@ class operator_stationary(operator):
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
-        if self.timeseries_ndim > 1:
+        if self.nfeature > 1:
             utils_nn.unfreeze_module(self.fun_prune)
         utils_nn.unfreeze_module(self.mod_mean)
         utils_nn.unfreeze_module(self.mod_var_gen)
@@ -416,23 +956,21 @@ class operator_stationary(operator):
 class operator_transient(operator):
     """Models dynamics of transient timeseries using a Transformer-based attention mechanism."""
 
-    def __init__(self, config):
+    def __init__(self, args):
 
         # --! initialize common operator parameters
-        super().__init__(config)
+        super().__init__(args)
 
         # --! this here is a convenient place to get the total number of functions, because
         # --! later the function configuration becomes respecified
         # --! to facilitate other things
-        nfun = sum(config.fun_trans.values())
+        nfun = sum(args.fun_trans.values())
 
         # --! initialize transient-specific parameters
         #
         # --! note that here the function configuration becomes respecified
-        self.fun            = self._respec_fun(config.fun_trans)
-        self.param_kernsize = config.param_kernsize_trans
-        self.mean_att_used  = config.mean_att_used
-        self.var_att_used   = config.var_att_used
+        self.fun            = self._respec_fun(args.fun_trans)
+        self.param_kernsize = args.seg_nsample_trans
 
         if self.forecast_nsample % self.param_kernsize:
             raise Exception('the number of forecast samples must be a multiple of a kernel size!')
@@ -448,32 +986,31 @@ class operator_transient(operator):
         # --! more precisely, input timeseries are partitioned into slices, and the encoder
         # --! encodes slice-specific kernels for every function parameter
         # --! in the embedded (latent) space
-        fun_enc_ni   = self.param_kernsize * self.timeseries_ndim
-        fun_enc_no   = nparam * self.param_kernsize * self.timeseries_ndim
+        fun_enc_ni   = self.param_kernsize * self.nfeature
+        fun_enc_no   = nparam * self.param_kernsize * self.nfeature
         self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, fun_enc_no], actfun_hid='relu')
 
-        if self.timeseries_ndim > 1:
+        if self.nfeature > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
             # --! basis functions, such that only the number of these basis functions
             # --! influences the order of linear matrices and the number of data
             # --! dimensions has no effect on that order
-            fun_prune_ni = nfun * self.timeseries_ndim
+            fun_prune_ni = nfun * self.nfeature
             fun_prune_no = nfun
             self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
-        if self.mean_att_used:
-            # --! encoder network which learns to attend over slices of embedded function values
-            mod_mean_att_enc_ni = nfun
+        # --! encoder network which learns to attend over slices of embedded function values
+        mod_mean_att_enc_ni = nfun
 
-            # --! the attention encoder is implemented in terms of a Transformer encoder network
-            self.mod_mean_att_enc = torch.nn.TransformerEncoder(
-                torch.nn.TransformerEncoderLayer(
-                    d_model=mod_mean_att_enc_ni,
-                    nhead=1,
-                    dim_feedforward=64,
-                    batch_first=True),
-                num_layers=2,
-                enable_nested_tensor=False)
+        # --! the attention encoder is implemented in terms of a Transformer encoder network
+        self.mod_mean_att_enc = torch.nn.TransformerEncoder(
+            torch.nn.TransformerEncoderLayer(
+                d_model=mod_mean_att_enc_ni,
+                nhead=1,
+                dim_feedforward=64,
+                batch_first=True),
+            num_layers=2,
+            enable_nested_tensor=False)
 
         # --! an additional generator to create linear time-varying matrices from
         # --! encoded attention; these matrices enable piecewise-linear
@@ -486,20 +1023,6 @@ class operator_transient(operator):
         mod_mean_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
         self.mod_mean_gen = utils_nn.fcnn(feat=[mod_mean_gen_ni, 64, 64, mod_mean_gen_no], actfun_hid='relu')
 
-        if self.var_att_used:
-            # --! encoder network which learns to attend over slices of embedded function errors
-            mod_var_att_enc_ni = nfun
-
-            # --! the attention encoder is implemented in terms of a Transformer encoder network
-            self.mod_var_att_enc = torch.nn.TransformerEncoder(
-                torch.nn.TransformerEncoderLayer(
-                    d_model=mod_var_att_enc_ni,
-                    nhead=1,
-                    dim_feedforward=64,
-                    batch_first=True),
-                num_layers=2,
-                enable_nested_tensor=False)
-
         # --! create a generator that produces models capturing the evolution of variance (uncertainty)
         #
         # --! the generator takes a flattened sequence of function values and returns
@@ -510,7 +1033,7 @@ class operator_transient(operator):
 
         # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
         pre_dec_ni        = nfun
-        pre_dec_no        = self.param_kernsize * self.timeseries_ndim
+        pre_dec_no        = self.param_kernsize * self.ntarget
         self.pre_mean_dec = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
         self.pre_var_dec  = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
 
@@ -524,8 +1047,8 @@ class operator_transient(operator):
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
-        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.timeseries_ndim)
-        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.timeseries_ndim)
+        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
+        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
 
         # --! based on inputs, encode parameter kernels (filters)
         kern = self.fun_enc(i)
@@ -542,12 +1065,12 @@ class operator_transient(operator):
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize * self.timeseries_ndim)
+            self.param_kernsize * self.nfeature)
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize, self.timeseries_ndim)
-        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.timeseries_ndim)
+            self.param_kernsize, self.nfeature)
+        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
 
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
@@ -566,7 +1089,7 @@ class operator_transient(operator):
         fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(fun) if self.timeseries_ndim > 1 else fun
+        return self.fun_prune(fun) if self.nfeature > 1 else fun
 
     def predict_mean(self, functions):
 
@@ -574,14 +1097,13 @@ class operator_transient(operator):
         fun_nsample = functions.shape[1]
         nfun        = functions.shape[2]
 
-        if self.mean_att_used:
-            # --! encode attention over the sequence of function values
-            #
-            # --! functions, which are shaped as [B, T / kernzise, nfun] are encoded into attention with the same shape
-            #
-            # --! attention is produced for each sequence step (rows of attention matrix); this information can be
-            # --! used to derive linear time-varying matrices that locally adapt to changes in dynamics
-            functions = self.mod_mean_att_enc(functions)
+        # --! encode attention over the sequence of function values
+        #
+        # --! functions, which are shaped as [B, T / kernzise, nfun] are encoded into attention with the same shape
+        #
+        # --! attention is produced for each sequence step (rows of attention matrix); this information can be
+        # --! used to derive linear time-varying matrices that locally adapt to changes in dynamics
+        functions = self.mod_mean_att_enc(functions)
 
         # --! note that we omit matrix transpose here, relying on training to figure it out
         #
@@ -622,9 +1144,6 @@ class operator_transient(operator):
         err_nsample = errors.shape[1]
         nfun        = errors.shape[2]
 
-        if self.var_att_used:
-            errors = self.mod_var_att_enc(errors)
-
         # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
         # --! capture the evolution of error values
         i           = torch.flatten(errors, start_dim=1)
@@ -664,7 +1183,7 @@ class operator_transient(operator):
         dfun         = fun_pre - fun
         dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
         dfun         = dfun - dfun_mean
-        scaler       = utils_data.minmax_scaler(feature_range=(-1, 1))
+        scaler       = minmax_scaler(feature_range=(-1, 1))
         dfun         = scaler.fit_transform(dfun)
 
         # --! predict the evolution of a function error starting from the first error value upto
@@ -683,603 +1202,33 @@ class operator_transient(operator):
         # --! so we reshape the decoded results back to their
         # --! original shape [B, T, ndim]
         timeseries_pre_mean = self.pre_mean_dec(torch.cat([fun_pre, fun_pre_forecast], dim=1))
-        timeseries_pre_mean = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.timeseries_ndim)
+        timeseries_pre_mean = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.ntarget)
 
         # --! decode predicted and denormalized function errors to model uncertainty (variance)
         timeseries_pre_var  = self.pre_var_dec(dfun_pre_unsca)
-        timeseries_pre_var  = timeseries_pre_var.reshape(timeseries_pre_var.shape[0], -1, self.timeseries_ndim)
+        timeseries_pre_var  = timeseries_pre_var.reshape(timeseries_pre_var.shape[0], -1, self.ntarget)
 
         return timeseries_pre_mean, timeseries_pre_var, fun, fun_pre, dfun, dfun_pre
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.fun_enc)
-        if self.timeseries_ndim > 1:
+        if self.nfeature > 1:
             utils_nn.freeze_module(self.fun_prune)
-        if self.mean_att_used:
-            utils_nn.freeze_module(self.mod_mean_att_enc)
+        utils_nn.freeze_module(self.mod_mean_att_enc)
         utils_nn.freeze_module(self.mod_mean_gen)
         utils_nn.freeze_module(self.pre_mean_dec)
 
     def freeze_var(self):
-        if self.var_att_used:
-            utils_nn.freeze_module(self.mod_var_att_enc)
         utils_nn.freeze_module(self.mod_var_gen)
         utils_nn.freeze_module(self.pre_var_dec)
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
-        if self.timeseries_ndim > 1:
+        if self.nfeature > 1:
             utils_nn.unfreeze_module(self.fun_prune)
-        if self.mean_att_used:
-            utils_nn.unfreeze_module(self.mod_mean_att_enc)
-        if self.var_att_used:
-            utils_nn.unfreeze_module(self.mod_var_att_enc)
+        utils_nn.unfreeze_module(self.mod_mean_att_enc)
         utils_nn.unfreeze_module(self.mod_mean_gen)
         utils_nn.unfreeze_module(self.mod_var_gen)
         utils_nn.unfreeze_module(self.pre_mean_dec)
         utils_nn.unfreeze_module(self.pre_var_dec)
-
-
-class run_mode(interface):
-    """Represents current running mode of a model, i.e. fit or evaluate."""
-
-    def __init__(self, model):
-        super().__init__()
-
-        # --! reference to a model that we run
-        self._model = model
-
-    @abstractmethod
-    def fit_next(self):
-        """
-        Advances a model to the next fit phase, provided the next phase is avalable.
-        Returns True if the model has been successfully advanced.
-        """
-        return
-
-    @abstractmethod
-    def fit(self, param):
-        """Fits a model parameterized by ``param``."""
-        return
-
-    @abstractmethod
-    def forward(self, timeseries):
-        """Executes a forward pass on given ``timeseries`` according to current mode."""
-        return
-
-    def _forward_scaled(self, timeseries):
-        """Executes a forward pass on scaled ``timeseries``."""
-
-        # --! execute both operators on given time series
-        timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pre, _, _     = self._model.operator_stat(timeseries)
-        timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pre, _, _ = self._model.operator_trans(timeseries)
-
-        # --! derive alpha
-        timeseries_stat_var  = torch.exp(timeseries_stat_logvar) + 1e-6
-        timeseries_trans_var = torch.exp(timeseries_trans_logvar) + 1e-6
-        alpha = timeseries_trans_var / (timeseries_trans_var + timeseries_stat_var)
-
-        # --! blend the two types of time series using the derived alpha to get the final prediction
-        timeseries_pre = alpha * timeseries_stat + (1 - alpha) * timeseries_trans
-
-        o = (
-            timeseries_pre,
-            timeseries_stat, timeseries_stat_logvar,
-            timeseries_trans, timeseries_trans_logvar,
-            fun_stat, fun_stat_pre,
-            fun_trans, fun_trans_pre,
-            alpha
-        )
-
-        return o
-
-
-class mode_eval(run_mode):
-    """Represents the evaluation mode of a model."""
-
-    def __init__(self, model):
-        super().__init__(model)
-
-    def fit_next(self):
-        print('wrn >> model is in evaluation mode')
-        return False
-
-    def fit(self, param):
-        print('wrn >> model is in evaluation mode')
-        return None
-
-    def forward(self, timeseries):
-        """Forecasts given ``timeseries`` in evaluation mode.
-
-        The ``timeseries`` are expected to represent an unnormalized lookback window. The window is
-        then normalized and forecasted by a number of steps configured in
-        model parameter ``forecast_nsample``.
-        """
-
-        # --! remove mean
-        mean = torch.mean(timeseries, dim=1, keepdim=True)
-        timeseries = timeseries - mean
-
-        # --! scale data using minmax to a range from -1 to 1
-        scaler = utils_data.minmax_scaler(feature_range=(-1, 1))
-        timeseries = scaler.fit_transform(timeseries)
-
-        o = self._forward_scaled(timeseries)
-
-        # --! extract to-be-unscaled timeseries from the forwarded result
-        timeseries_pre       = o[0]
-        timeseries_stat      = o[1]
-        timeseries_trans     = o[3]
-
-        # --! unscale resulting timeseries
-        timeseries_pre       = scaler.inverse_transform(timeseries_pre)
-        timeseries_pre       = timeseries_pre + mean
-        timeseries_stat      = scaler.inverse_transform(timeseries_stat)
-        timeseries_stat      = timeseries_stat + mean
-        timeseries_trans     = scaler.inverse_transform(timeseries_trans)
-        timeseries_trans     = timeseries_trans + mean
-
-        # --! put unscaled timeseries back to the result tuple and return the tuple
-        o    = list(o)
-        o[0] = timeseries_pre
-        o[1] = timeseries_stat
-        o[3] = timeseries_trans
-
-        return tuple(o)
-
-
-class mode_fit(run_mode):
-    """Represents the fit mode of a model."""
-
-    def __init__(self, model):
-        super().__init__(model)
-
-    def fit_next(self):
-        return self._model._fit_phase.next()
-
-    def fit(self, param):
-
-        # --! first of all, enter the current fit phase to initialize required parameters
-        self._model._fit_phase.enter(param)
-
-        # --! prepare test data
-        #testdata    = utils_data.read_datafile(f'{self._model._fit_phase.datadir}/valid', self._model._fit_phase.timeseries_nsample)
-        #testdataset = torch.utils.data.TensorDataset(testdata)
-
-        # --! specify an optimizer for fit
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, self._model.parameters()),
-            lr=self._model._fit_phase.learnrate,
-            weight_decay=self._model._fit_phase.weightdecay)
-
-        trainloss_predict    = []
-        trainloss_sta_lin    = []
-        trainloss_dyn_lin    = []
-
-        t = []
-
-        # --! training duration
-        if self._model._fit_phase.isverbose: print(f"inf >> number of data files for training is {self._model._fit_phase.train_nfile}")
-
-        for ifile in range(self._model._fit_phase.train_nfile):
-            if self._model._fit_phase.isverbose: print(f"inf >> processing training file number {ifile + 1}")
-
-            # --! prepare training data
-            traindata    = utils_data.read_datafile(
-                f'{self._model._fit_phase.datadir}/train{ifile + 1}',
-                self._model._fit_phase.timeseries_nsample)
-            traindataset = torch.utils.data.TensorDataset(traindata)
-            traindatafun = torch.utils.data.DataLoader(traindataset, batch_size=self._model._fit_phase.batsize, shuffle=True)
-
-            # --! train
-            for epoch in range(self._model._fit_phase.nepoch):
-                for data in traindatafun:
-                    # --! take all channels of these time series for training
-                    timeseries = data[0]
-
-                    # --! reset optimizer gradients
-                    optimizer.zero_grad()
-
-                    # --! fit a model to training time series
-                    t_start = time.time()
-
-                    loss, loss_predict, loss_lin_g, loss_lin_l = self._model._fit_phase.compute_loss(timeseries)
-                    loss.backward()
-
-                    t_end     = time.time()
-                    t_elapsed = t_end - t_start
-                    t.append(t_elapsed)
-
-                    # --! update optimizer gradients
-                    optimizer.step()
-
-                    with torch.no_grad():
-                        trainloss_predict.append(loss_predict)
-                        trainloss_sta_lin.append(loss_lin_g)
-                        trainloss_dyn_lin.append(loss_lin_l)
-
-        self._model._fit_phase.exit(t)
-        o = (
-            trainloss_predict,
-            trainloss_sta_lin, trainloss_dyn_lin
-        )
-        return o
-
-    def forward(self, timeseries):
-        """Executes a forward pass on given ``timeseries`` in fit mode.
-
-        The ``timeseries`` are expected to be scaled to range from -1 to 1 with mean removed.
-        """
-        return self._forward_scaled(timeseries)
-
-
-class fit_phase(interface):
-    """Manages a certain phase of a model fit, e.g. fit a stationary mean, or fit a transient variance."""
-
-    def __init__(self, model):
-        super().__init__()
-
-        # --! reference to model that we fit
-        self._model = model
-
-        # --! create placeholders for phase parameters
-        self.timeseries_nsample    = None
-        self.train_nfile           = None
-        self.nepoch                = None
-        self.batsize               = None
-        self.alphafun              = None
-        self.learnrate             = None
-        self.weightdecay           = None
-        self.isverbose             = None
-
-        self.datadir               = None
-
-    @abstractmethod
-    def enter(self, param):
-        """Enters this phase and parameterizes it using ``param``."""
-
-        # --! initialize phase parameters
-        self.timeseries_nsample    = param['timeseries_nsample']
-        self.train_nfile           = param['train_nfile']
-        self.nepoch                = param['nepoch']
-        self.batsize               = param['batsize']
-        self.learnrate             = param['learnrate']
-        self.weightdecay           = param['weightdecay']
-        self.isverbose             = param['isverbose']
-
-    @abstractmethod
-    def exit(self, t):
-        times  = torch.mean(torch.tensor(t))
-        stimes = f'{times:.1e}'
-
-        data_table = [
-            ( 'batch size',   'time per iteration [s]'),
-            ( '----------',   '----------------------'),
-            ( self.batsize,                     stimes),
-        ]
-
-        # --! print results
-        print('')
-        print('inf >> fit details:')
-        print('')
-        for row in data_table:
-            print(f'{row[0]:>12} {row[1]:>24}')
-        print('')
-    
-    @abstractmethod
-    def compute_loss(self, timeseries):
-        """Use given ``timeseries`` to compute the loss of this fit phase."""
-        return
-
-    @abstractmethod
-    def next(self) -> bool:
-        """
-        Transitions to the next phase, provided it is available.
-        Returns True if the transition takes place,
-        returns False otherwise.
-        """
-        return
-
-    def _compute_varloss(self, timeseries, timeseries_predict_mean, timeseries_predict_var):
-        logvar = torch.clamp(timeseries_predict_var, min=-5, max=5)
-        var    = torch.exp(logvar) + 1e-6
-
-        loss_fun = torch.nn.GaussianNLLLoss()
-        return loss_fun(timeseries_predict_mean, timeseries, var)
-
-    def _compute_meanloss(self, timeseries, timeseries_pred):
-
-        loss_fn = torch.nn.MSELoss(reduction='mean')
-        return loss_fn(timeseries_pred, timeseries)
-
-
-class phase_stationary_mean(fit_phase):
-
-    def __init__(self, model):
-        super().__init__(model)
-
-    def enter(self, param):
-        print("inf >> fit: entering stationary mean phase")
-
-        super().enter(param)
-
-        self._model.operator_trans.freeze_mean()
-        self._model.operator_trans.freeze_var()
-
-        self._model.operator_stat.unfreeze()
-        self._model.operator_stat.freeze_var()
-
-        self.datadir = param['stadatadir']
-
-    def exit(self, t):
-        print(f'inf >> exiting stationary mean phase')
-        super().exit(t)
-
-    def compute_loss(self, timeseries):
-
-        lookback = timeseries[:, :self._model.lookback_nsample]
-        timeseries_pre_mean, _, fun, fun_pre, _, _ = self._model.operator_stat(lookback)
-
-        loss_recon  = self._compute_meanloss(timeseries, timeseries_pre_mean)
-        loss_linear = self._compute_meanloss(fun, fun_pre)
-
-        loss = loss_recon + loss_linear
-
-        return loss, loss_recon, loss_linear, 0.
-
-    def next(self):
-        self._model._set_phase(self._model._get_phase_stat_var())
-        return True
-
-
-class phase_stationary_var(fit_phase):
-
-    def __init__(self, model):
-        super().__init__(model)
-
-    def enter(self, param):
-        print("inf >> fit: entering stationary variance phase")
-
-        super().enter(param)
-
-        self._model.operator_trans.freeze_mean()
-        self._model.operator_trans.freeze_var()
-
-        self._model.operator_stat.unfreeze()
-        self._model.operator_stat.freeze_mean()
-
-        self.datadir = param['mixdatadir']
-
-    def exit(self, t):
-        print(f'inf >> exiting stationary variance phase')
-        super().exit(t)
-
-    def compute_loss(self, timeseries):
-
-        lookback = timeseries[:, :self._model.lookback_nsample]
-        timeseries_pre_mean, timeseries_pre_var, _, _, dfun, dfun_pre = self._model.operator_stat(lookback)
-
-        loss_linear = self._compute_meanloss(dfun, dfun_pre)
-        loss_recon  = self._compute_varloss(timeseries, timeseries_pre_mean, timeseries_pre_var)
-
-        loss = loss_recon + loss_linear
-
-        return loss, loss_recon, loss_linear, 0.
-
-    def next(self):
-        self._model._set_phase(self._model._get_phase_trans_mean())
-        return True
-
-
-class phase_transient_mean(fit_phase):
-
-    def __init__(self, model):
-        super().__init__(model)
-
-    def enter(self, param):
-        print("inf >> fit: entering transient mean phase")
-
-        super().enter(param)
-
-        self._model.operator_trans.unfreeze()
-        self._model.operator_trans.freeze_var()
-
-        self._model.operator_stat.freeze_mean()
-        self._model.operator_stat.freeze_var()
-
-        self.datadir = param['transdatadir']
-
-    def exit(self, t):
-        print(f'inf >> exiting transient mean phase')
-        super().exit(t)
-
-    def compute_loss(self, timeseries):
-
-        lookback = timeseries[:, :self._model.lookback_nsample]
-        timeseries_pre_mean, _, fun, fun_pre, _, _ = self._model.operator_trans(lookback)
-
-        loss_recon  = self._compute_meanloss(timeseries, timeseries_pre_mean)
-        loss_linear = self._compute_meanloss(fun, fun_pre)
-
-        loss = loss_recon + loss_linear
-
-        return loss, loss_recon, 0., loss_linear
-
-    def next(self):
-        self._model._set_phase(self._model._get_phase_trans_var())
-        return True
-
-
-class phase_transient_var(fit_phase):
-
-    def __init__(self, model):
-        super().__init__(model)
-
-    def enter(self, param):
-        print("inf >> fit: entering transient variance phase")
-
-        super().enter(param)
-
-        self._model.operator_trans.unfreeze()
-        self._model.operator_trans.freeze_mean()
-
-        self._model.operator_stat.freeze_mean()
-        self._model.operator_stat.freeze_var()
-
-        self.datadir = param['mixdatadir']
-
-    def exit(self, t):
-        print(f'inf >> exiting transient variance phase')
-        super().exit(t)
-
-    def compute_loss(self, timeseries):
-
-        lookback = timeseries[:, :self._model.lookback_nsample]
-        timeseries_pre_mean, timeseries_pre_var, _, _, dfun, dfun_pre = self._model.operator_trans(lookback)
-
-        loss_linear = self._compute_meanloss(dfun, dfun_pre)
-        loss_recon  = self._compute_varloss(timeseries, timeseries_pre_mean, timeseries_pre_var)
-        loss        = loss_linear + loss_recon
-
-        return loss, loss_recon, loss_linear, 0.
-
-    def next(self):
-        return False
-
-
-@dataclass
-class model_config:
-    """
-    Stores KIND model configuration.
-    """
-
-    # --! number of dimensions in time series
-    timeseries_ndim: int
- 
-    # --! timestep that was used to sample timeseries
-    timestep: float
-
-    # --! number of time series samples in a lookback window
-    lookback_nsample: int
-
-    # --! number of time series samples in a forecast window
-    forecast_nsample: int
-
-    # --! basis functions used to build lifted embeddings for stationary and transient operators
-    #
-    # --! these dictionaries are structured as
-    #
-    # --!  *  key:   function name [str]
-    # --!  *  value: number of functions of this type [int]
-    fun_stat: dict
-    fun_trans: dict
-
-    # --! size of dynamic parameter filters encoded by an encoder from timeseries data
-    #
-    # --! Timeseries are partioned into slices that are encoded by an encoder to
-    # --! produce, so to say, dynamic kernels, or filters. These kernels
-    # --! help extract specific features, i.e. nonlinear function
-    # --! parameters from the raw timeseries. In constrast to
-    # --! static kernels in convolutional neural networks,
-    # --! the kernels here are dynamic, because they
-    # --! are produced from the timeseries every time.
-    #
-    # --! there are two sizes: one dedicated to a stationary operator,
-    # --! the other - to a transient one.
-    param_kernsize_stat: int
-    param_kernsize_trans : int
-
-    # --! flags that enable attention in transient prediction routines
-    mean_att_used: bool
-    var_att_used: bool
-
-
-class model(torch.nn.Module):
-    """ Models Kalman-inpired neural decomposition, or KIND.
-
-    This model captures the evolution of timeseries by first decomposing them into stationary and
-    transient components, forecasting these components into the future and
-    finally blending the forecasts in a Kalman-inspired manner.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-
-        self.timeseries_ndim       = config.timeseries_ndim
-        self.timestep              = config.timestep
-        self.lookback_nsample      = config.lookback_nsample
-        self.forecast_nsample      = config.forecast_nsample
-
-        self.operator_stat = operator_stationary(config)
-        self.operator_trans = operator_transient(config)
-
-        self.maxerr_stat = None
-
-        self._fit_phase_stat_mean  = phase_stationary_mean(self)
-        self._fit_phase_stat_var   = phase_stationary_var(self)
-        self._fit_phase_trans_mean = phase_transient_mean(self)
-        self._fit_phase_trans_var  = phase_transient_var(self)
-        self._fit_phase            = self._fit_phase_stat_mean
-
-        self._mode_fit  = mode_fit(self)
-        self._mode_eval = mode_eval(self)
-        self._mode      = self._mode_fit
-
-    def fit_next(self):
-        return self._get_mode().fit_next()
-
-    def fit(self, param):
-        return self._get_mode().fit(param)
-
-    def forward(self, timeseries):
-        return self._get_mode().forward(timeseries)
-
-    def train(self, mode: bool = True):
-        """If ``mode`` is True, switches this model into fit mode.
-        Otherwise, if ``mode`` is False, switches this model into evaluation mode.
-        """
-
-        if mode is True:
-            self._set_mode(self._get_mode_fit())
-        else:
-            self._set_mode(self._get_mode_eval())
-
-        # --! call the superclass to finish the mode switch
-        return super().train(mode)
-
-    def eval(self):
-        """Sets the model in evaluation mode."""
-
-        # --! the superclass is called from the train method, so just delegate execution
-        return self.train(False)
-
-    def _get_mode_fit(self):
-        return self._mode_fit
-
-    def _get_mode_eval(self):
-        return self._mode_eval
-
-    def _get_mode(self):
-        return self._mode
-
-    def _set_mode(self, mode):
-        self._mode = mode
-
-    def _get_phase_stat_mean(self):
-        return self._fit_phase_stat_mean
-
-    def _get_phase_stat_var(self):
-        return self._fit_phase_stat_var
-
-    def _get_phase_trans_mean(self):
-        return self._fit_phase_trans_mean
-
-    def _get_phase_trans_var(self):
-        return self._fit_phase_trans_var
-
-    def _get_phase(self):
-        return self._fit_phase
-
-    def _set_phase(self, phase):
-        self._fit_phase = phase
 

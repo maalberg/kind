@@ -7,8 +7,8 @@ from abc import ABC as interface
 
 import torch
 import numpy as np
-
 import pandas as pd
+from   sklearn.model_selection import train_test_split
 
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
@@ -21,37 +21,25 @@ from matplotlib import pyplot as plt
 class dataset_factory:
     def create_dataset(self, args):
 
-        # --! parse train/valid/test split sizes
-        nontrain_size = 1.0 - args.data_train_size
-        test_size     = nontrain_size * args.data_test_size
-        valid_size    = nontrain_size - test_size
-
         if args.data_t == 'sim':
             return dataset_sim(
-                args.data_path,
-                args.data_nsample,
-                (args.data_scale_min, args.data_scale_max),
-                (args.data_train_size, valid_size, test_size)
-            )
+                args.data_path, args.data_nsample, (args.data_scale_min, args.data_scale_max), (args.data_train_size, args.data_test_size),
+                args.batch_size, (args.lookback_nsample, args.forecast_nsample))
         else:
             return
 
 
 class dataset(interface):
 
-    # --! interface --!
-
     @abstractmethod
-    def load(self, flag='train', window_nsample=144):
-        """Loads data of type ``flag`` and sized according to ``window_nsample``."""
+    def load(self, flag='train'):
+        """ Loads data of type ``flag``. """
         return
-
-    # --! common methods --!
 
     def read_csv(self, data_path):
 
         # --! read a csv-file with no header
-        dataframe = pd.read_csv(data_path, header=None)
+        dataframe = pd.read_csv(data_path, header=None, dtype=np.float32)
         return torch.from_numpy(dataframe.to_numpy())
 
     def demean(self, data, dim=0):
@@ -64,51 +52,66 @@ class dataset(interface):
 
 class dataset_sim(dataset):
 
-    def __init__(self, data_path, data_nsample, data_scale_minmax, split_size):
+    def __init__(self,
+                 data_path, data_nsample, data_scale_minmax, data_split_size,
+                 batch_size, window_nsample):
         super().__init__()
 
         # --! read data from a csv file
         data = self.read_csv(data_path)
 
+        # --! as simulation data are expected as a number of individual n-dimensional trajectories,
         # --! convert read data to a 3D torch tensor
-        ndata     = data.shape[0] // data_nsample
-        self.data = torch.reshape(data, (ndata, data_nsample, data.shape[1]))
+        ndata = data.shape[0] // data_nsample
+        data = torch.reshape(data, (ndata, data_nsample, data.shape[1]))
 
-        # --! derive sample numbers for train-validation-test splits
-        self.split_nsample = (
-            int(self.data.shape[1] * self.split_size[0]), # < train
-            int(self.data.shape[1] * self.split_size[1]), # < validation
-            int(self.data.shape[1] * self.split_size[2])) # < test
+        # --! split data into train, valid and test partitions
+        self.train_data, valid_test_data = train_test_split(data, train_size=data_split_size[0])
+        self.valid_data, self.test_data = train_test_split(valid_test_data, test_size=data_split_size[1])
 
         self.scale_minmax = data_scale_minmax
+        self.batch_size = batch_size
+        self.window_nsample = window_nsample
 
-    def load(self, flag='train', window_nsample=144):
+    def load(self, flag='train'):
+
+        # --! data window size is the sum of lookback and forecast samples
+        window_nsample = self.window_nsample[0] + self.window_nsample[1]
 
         # --! derive data borders according to the data flag
         assert flag in ['train', 'valid', 'test']
         if flag=='train':
-            data_start = 0
-            data_end   = self.split_nsample[0] - window_nsample
+            data = self.train_data
         elif flag=='valid':
-            data_start = self.split_nsample[0]
-            data_end   = self.split_nsample[0] + self.split_nsample[1] - window_nsample
+            data = self.valid_data
         else:
-            data_start = self.split_nsample[0] + self.split_nsample[1]
-            data_end   = self.split_nsample[0] + self.split_nsample[1] + self.split_nsample[2] - window_nsample
+            data = self.test_data
+
+        data_start = 0
+        data_end = data.shape[1] - window_nsample
 
         windows = []
 
-        # --! extract data windows from current data split in a rolling window manner
-        for j in range(data_start, data_end):
-            window_start = j
-            window_end   = window_start + window_nsample
-            window       = self.data[:, window_start:window_end]
+        # --! extract data windows in a rolling window manner
+        for d in data:
+            for j in range(data_start, data_end):
+                window_start = j
+                window_end   = window_start + window_nsample
+                window       = d[window_start:window_end]
 
-            # --! store timeseries framed by current window
-            for timeseries in window:
-                windows.append(self.scale(self.demean(timeseries, dim=0), dim=0, minmax=self.scale_minmax))
+                # --! when training, remove mean and scale a data window before saving as a data item
+                if flag=='train':
+                    window = self.scale(self.demean(window, dim=0), dim=0, minmax=self.scale_minmax)
+                windows.append(window)
 
-        return torch.stack(windows, dim=0)
+        # --! create a dataset by first stacking all windows together and then splitting
+        # --! the windows into lookback and forecast parts
+        windows = torch.stack(windows, dim=0)
+        back, fore = torch.split(windows, list(self.window_nsample), dim=1)
+
+        # --! since our dataset is already a tensor, then wrap it in a tensor dataset
+        dataset = torch.utils.data.TensorDataset(back, fore)
+        return torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
 
 class minmax_scaler:
@@ -132,6 +135,11 @@ class minmax_scaler:
     def inverse_transform(self, data):
         scale = (self.max - self.min + 1e-8) / (self.max_scaled - self.min_scaled)
         return self.min + (data - self.min_scaled) * scale
+
+
+def conv_str2ints(string):
+    """ Converts a given comma-separated ``string`` of integers into a list of integers. """
+    return [int(item) for item in string.split(',')]
 
 
 
