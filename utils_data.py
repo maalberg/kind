@@ -36,6 +36,11 @@ class dataset(interface):
         """ Loads data of type ``flag``. """
         return
 
+    @abstractmethod
+    def plot(self, flag='train'):
+        """ Plots data of type ``flag``. """
+        return
+
     def read_csv(self, data_path):
 
         # --! read a csv-file with no header
@@ -57,6 +62,10 @@ class dataset_sim(dataset):
                  batch_size, window_nsample):
         super().__init__()
 
+        self.scale_minmax = data_scale_minmax
+        self.batch_size = batch_size
+        self.window_nsample = window_nsample
+
         # --! read data from a csv file
         data = self.read_csv(data_path)
 
@@ -65,20 +74,31 @@ class dataset_sim(dataset):
         ndata = data.shape[0] // data_nsample
         data = torch.reshape(data, (ndata, data_nsample, data.shape[1]))
 
-        # --! split data into train, valid and test partitions
-        self.train_data, valid_test_data = train_test_split(data, train_size=data_split_size[0])
-        self.valid_data, self.test_data = train_test_split(valid_test_data, test_size=data_split_size[1])
+        # --! prepare to extract data windows
+        window_nsample = self.window_nsample[0] + self.window_nsample[1]
+        data_start = 0
+        data_end = data.shape[1] - window_nsample
+        windows = []
 
-        self.scale_minmax = data_scale_minmax
-        self.batch_size = batch_size
-        self.window_nsample = window_nsample
+        # --! extract data windows in a rolling window manner
+        for d in data:
+            for j in range(data_start, data_end):
+                window_start = j
+                window_end = window_start + window_nsample
+                window = d[window_start:window_end]
+
+                windows.append(window)
+        windows = torch.stack(windows, dim=0)
+
+        # --! split data into train, valid and test partitions
+        self.train_data, valid_test_data = train_test_split(windows, train_size=data_split_size[0], shuffle=True)
+        self.valid_data, self.test_data = train_test_split(valid_test_data, test_size=data_split_size[1], shuffle=True)
+
+        # --! normalize training data
+        self.train_data = torch.stack(
+            [self.scale(self.demean(data, dim=0), dim=0, minmax=self.scale_minmax) for data in self.train_data], dim=0)
 
     def load(self, flag='train'):
-
-        # --! data window size is the sum of lookback and forecast samples
-        window_nsample = self.window_nsample[0] + self.window_nsample[1]
-
-        # --! derive data borders according to the data flag
         assert flag in ['train', 'valid', 'test']
         if flag=='train':
             data = self.train_data
@@ -87,36 +107,29 @@ class dataset_sim(dataset):
         else:
             data = self.test_data
 
-        data_start = 0
-        data_end = data.shape[1] - window_nsample
-
-        windows = []
-
-        # --! extract data windows in a rolling window manner
-        for d in data:
-            for j in range(data_start, data_end):
-                window_start = j
-                window_end   = window_start + window_nsample
-                window       = d[window_start:window_end]
-
-                # --! when training, remove mean and scale a data window before saving as a data item
-                if flag=='train':
-                    window = self.scale(self.demean(window, dim=0), dim=0, minmax=self.scale_minmax)
-                windows.append(window)
-
-        # --! create a dataset by first stacking all windows together and then splitting
-        # --! the windows into lookback and forecast parts
-        windows = torch.stack(windows, dim=0)
-        back, fore = torch.split(windows, list(self.window_nsample), dim=1)
+        # --! create a dataset by splitting the windows into lookback and forecast parts
+        back, fore = torch.split(data, list(self.window_nsample), dim=1)
 
         # --! since our dataset is already a tensor, then wrap it in a tensor dataset
         dataset = torch.utils.data.TensorDataset(back, fore)
         return torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
+    def plot(self, flag='train'):
+        assert flag in ['train', 'valid', 'test']
+        if flag=='train':
+            data = self.train_data
+        elif flag=='valid':
+            data = self.valid_data
+        else:
+            data = self.test_data
+
+        plt.figure(figsize=(6,3))
+        plt.plot(data[0])
+        plt.show()
+
 
 class minmax_scaler:
-    """ Defines a differentiable min-max scaler class suitable to be used during torch-based training.
-    """
+    """ Defines a differentiable min-max scaler class suitable to be used during torch-based training. """
     def __init__(self, feature_range=(-1, 1)):
         self.min = None
         self.max = None
