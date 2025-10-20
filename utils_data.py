@@ -5,10 +5,12 @@
 from abc import abstractmethod
 from abc import ABC as interface
 
+import os
 import torch
 import numpy as np
 import pandas as pd
-from   sklearn.model_selection import train_test_split
+
+from sklearn.model_selection import train_test_split
 
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
@@ -21,9 +23,12 @@ from matplotlib import pyplot as plt
 class dataset_factory:
     def create_dataset(self, args):
 
-        if args.data_t == 'sim':
+        if args.data_name == 'SRF gun simulation':
             return dataset_sim(
-                args.data_path, args.data_nsample, (args.data_scale_min, args.data_scale_max), (args.data_train_size, args.data_test_size),
+                args.data_dir, args.data_file, args.data_ext,
+                args.data_nsample,
+                (args.data_scale_min, args.data_scale_max),
+                (args.data_train_size, args.data_test_size),
                 args.batch_size, (args.lookback_nsample, args.forecast_nsample))
         else:
             return
@@ -31,15 +36,56 @@ class dataset_factory:
 
 class dataset(interface):
 
+    def __init__(self, data_dir, data_file, data_ext, data_nsample):
+        self.data_dir = data_dir
+        self.data_file = data_file
+        self.data_ext = data_ext
+        self.data_nsample = data_nsample
+
     @abstractmethod
-    def load(self, flag='train'):
-        """ Loads data of type ``flag``. """
+    def load_stat(self):
+        """ Loads stationary data. """
         return
 
     @abstractmethod
-    def plot(self, flag='train'):
-        """ Plots data of type ``flag``. """
+    def load_trans(self):
+        """ Loads transient data. """
         return
+
+    @abstractmethod
+    def load_mixed(self):
+        """ Loads mixed data (stationary and transient). """
+        return
+
+    @abstractmethod
+    def make_path(self, data_type='stat'):
+        return
+
+    def extract_windows(self, data_type='stat'):
+        assert data_type in ['stat', 'trans', 'mixed']
+
+        # --! read data from a csv file
+        data = self.read_csv(self.make_path(data_type))
+
+        # --! convert read data to a 3D torch tensor
+        ndata = data.shape[0] // self.data_nsample
+        data = torch.reshape(data, (ndata, self.data_nsample, data.shape[1]))
+
+        # --! prepare to extract data windows
+        window_nsample = self.window_nsample[0] + self.window_nsample[1]
+        data_start = 0
+        data_end = data.shape[1] - window_nsample
+        windows = []
+
+        # --! extract data windows in a rolling window manner
+        for d in data:
+            for j in range(data_start, data_end):
+                window_start = j
+                window_end = window_start + window_nsample
+                window = d[window_start:window_end]
+
+                windows.append(window)
+        return torch.stack(windows, dim=0)
 
     def read_csv(self, data_path):
 
@@ -58,74 +104,55 @@ class dataset(interface):
 class dataset_sim(dataset):
 
     def __init__(self,
-                 data_path, data_nsample, data_scale_minmax, data_split_size,
+                 data_dir, data_file, data_ext,
+                 data_nsample,
+                 data_scale_minmax, data_split_size,
                  batch_size, window_nsample):
-        super().__init__()
+        super().__init__(data_dir, data_file, data_ext, data_nsample)
 
         self.scale_minmax = data_scale_minmax
+        self.split_size = data_split_size
         self.batch_size = batch_size
         self.window_nsample = window_nsample
 
-        # --! read data from a csv file
-        data = self.read_csv(data_path)
+    def make_path(self, data_type='stat'):
+        data_file = self.data_file + '_' + data_type + self.data_ext
+        return os.path.join(self.data_dir, data_file)
 
-        # --! as simulation data are expected as a number of individual n-dimensional trajectories,
-        # --! convert read data to a 3D torch tensor
-        ndata = data.shape[0] // data_nsample
-        data = torch.reshape(data, (ndata, data_nsample, data.shape[1]))
+    def load_stat(self):
 
-        # --! prepare to extract data windows
-        window_nsample = self.window_nsample[0] + self.window_nsample[1]
-        data_start = 0
-        data_end = data.shape[1] - window_nsample
-        windows = []
-
-        # --! extract data windows in a rolling window manner
-        for d in data:
-            for j in range(data_start, data_end):
-                window_start = j
-                window_end = window_start + window_nsample
-                window = d[window_start:window_end]
-
-                windows.append(window)
-        windows = torch.stack(windows, dim=0)
+        windows = self.extract_windows(data_type='stat')
 
         # --! split data into train, valid and test partitions
-        self.train_data, valid_test_data = train_test_split(windows, train_size=data_split_size[0], shuffle=True)
-        self.valid_data, self.test_data = train_test_split(valid_test_data, test_size=data_split_size[1], shuffle=True)
+        train_data, valid_test_data = train_test_split(windows, train_size=self.split_size[0], shuffle=True)
+        valid_data, test_data = train_test_split(valid_test_data, test_size=self.split_size[1], shuffle=True)
 
         # --! normalize training data
-        self.train_data = torch.stack(
-            [self.scale(self.demean(data, dim=0), dim=0, minmax=self.scale_minmax) for data in self.train_data], dim=0)
+        train_data = torch.stack(
+            [self.scale(self.demean(data, dim=0), dim=0, minmax=self.scale_minmax) for data in train_data], dim=0)
 
-    def load(self, flag='train'):
-        assert flag in ['train', 'valid', 'test']
-        if flag=='train':
-            data = self.train_data
-        elif flag=='valid':
-            data = self.valid_data
-        else:
-            data = self.test_data
+        # --! create datasets by splitting the windows into lookback and forecast parts
+        train_back, train_fore = torch.split(train_data, list(self.window_nsample), dim=1)
+        valid_back, valid_fore = torch.split(valid_data, list(self.window_nsample), dim=1)
+        test_back, test_fore = torch.split(test_data, list(self.window_nsample), dim=1)
 
-        # --! create a dataset by splitting the windows into lookback and forecast parts
-        back, fore = torch.split(data, list(self.window_nsample), dim=1)
+        # --! since our datasets are already tensors, then wrap them in tensor datasets
+        train_dataset = torch.utils.data.TensorDataset(train_back, train_fore)
+        valid_dataset = torch.utils.data.TensorDataset(valid_back, valid_fore)
+        test_dataset = torch.utils.data.TensorDataset(test_back, test_fore)
 
-        # --! since our dataset is already a tensor, then wrap it in a tensor dataset
-        dataset = torch.utils.data.TensorDataset(back, fore)
-        return torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        # --! wrap the datasets into loaders
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+        valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=True)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=self.batch_size, shuffle=True)
 
-    def plot(self, flag='train'):
-        assert flag in ['train', 'valid', 'test']
-        if flag=='train':
-            data = self.train_data
-        elif flag=='valid':
-            data = self.valid_data
-        else:
-            data = self.test_data
+        return train_loader, valid_loader, test_loader
 
-        plt.figure(figsize=(6,3))
-        plt.plot(data[0])
-        plt.show()
+    def load_trans():
+        pass
+
+    def load_mixed():
+        pass
 
 
 class minmax_scaler:

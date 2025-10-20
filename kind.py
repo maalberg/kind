@@ -22,8 +22,10 @@ def create_args_parser():
     parser = argparse.ArgumentParser(description='KIND timeseries forecasting')
 
     # --! data arguments
-    parser.add_argument('--data_t', type=str, required=True, default='sim', help='data type')
-    parser.add_argument('--data_path', type=str, required=True, default='../../data/delay/tesla_sim.csv', help='data file path')
+    parser.add_argument('--data_name', type=str, required=True, default='SRF gun simulation', help='data name')
+    parser.add_argument('--data_dir', type=str, required=True, default='../../data/delay', help='path to data directory')
+    parser.add_argument('--data_file', type=str, required=True, default='srfgun', help='data file name without extension and suffix')
+    parser.add_argument('--data_ext', type=str, required=False, default='.csv', help='data file extension')
     parser.add_argument('--data_nsample', type=int, required=True, default=200, help='number of samples in timeseries stored in data')
     parser.add_argument('--data_scale_min', type=float, required=True, default=-1, help='data minimum value when scaled using min-max')
     parser.add_argument('--data_scale_max', type=float, required=True, default=1, help='data maximum value when scaled using min-max')
@@ -280,16 +282,12 @@ class model_fit(model_mode):
         to carry out specific tasks that may vary.
         """
 
-        # --! first, make any necessary model initializations before training
-        self.get_state().init()
-
         args = self.model.args
 
-        # --! make sure to select an optimizer after initializing this model
+        # --! make model initializations, data loading, optimizer selection, etc.
+        self.get_state().init_model()
+        train_loader, valid_loader, test_loader = self.get_state().load_data(dataset)
         model_optim = self.select_optimizer()
-        train_loader = dataset.load(flag='train')
-        valid_loader = dataset.load(flag='valid')
-        test_loader = dataset.load(flag='test')
         early_stopping = utils_nn.early_stopping(patience=args.patience, checkpoint_path=args.checkpoints)
 
         # --! start training
@@ -329,7 +327,7 @@ class model_fit(model_mode):
                 print("\tearly stopping ...")
                 break
 
-            # --! adjust learning rate
+            # --! adjust learning rate here
 
         best_model_path = args.checkpoints + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path, weights_only=True))
@@ -400,8 +398,13 @@ class fit_state(interface):
         self.mode = mode
 
     @abstractmethod
-    def init(self):
+    def init_model(self):
         """ Initializes this KIND model before training. """
+        return
+
+    @abstractmethod
+    def load_data(self, dataset):
+        """ Loads training, validation and test data from a given ``dataset``. """
         return
 
     @abstractmethod
@@ -436,7 +439,7 @@ class fit_stationary_mean(fit_state):
     def __init__(self, mode):
         super().__init__(mode)
 
-    def init(self):
+    def init_model(self):
 
         print('>>> train stationary mean >>>')
         model = self.mode.model
@@ -446,6 +449,9 @@ class fit_stationary_mean(fit_state):
 
         model.stationary.unfreeze()
         model.stationary.freeze_var()
+
+    def load_data(self, dataset):
+        return dataset.load_stat()
 
     def forward(self, timeseries):
         return self.mode.model(timeseries)
@@ -474,7 +480,7 @@ class fit_stationary_uncertainty(fit_state):
     def __init__(self, mode):
         super().__init__(mode)
 
-    def init(self):
+    def init_model(self):
 
         model = self.mode.model
 
@@ -483,6 +489,9 @@ class fit_stationary_uncertainty(fit_state):
 
         model.stationary.unfreeze()
         model.stationary.freeze_mean()
+
+    def load_data(self, dataset):
+        return dataset.load_mixed()
 
     def forward(self, timeseries):
         return self.mode.model.stationary(timeseries)
@@ -512,7 +521,7 @@ class fit_transient_mean(fit_state):
     def __init__(self, fit):
         super().__init__(fit)
 
-    def init(self):
+    def init_model(self):
 
         model = self.mode.model
 
@@ -521,6 +530,9 @@ class fit_transient_mean(fit_state):
 
         model.stationary.freeze_mean()
         model.stationary.freeze_var()
+
+    def load_data(self, dataset):
+        return dataset.load_trans()
 
     def forward(self, timeseries):
         return self.mode.model.transient(timeseries)
@@ -549,7 +561,7 @@ class fit_transient_uncertainty(fit_state):
     def __init__(self, mode):
         super().__init__(mode)
 
-    def init(self):
+    def init_model(self):
 
         model = self.mode.model
 
@@ -558,6 +570,9 @@ class fit_transient_uncertainty(fit_state):
 
         model.stationary.freeze_mean()
         model.stationary.freeze_var()
+
+    def load_data(self, dataset):
+        return dataset.load_mixed()
 
     def forward(self, timeseries):
         return self.mode.model.transient(timeseries)
