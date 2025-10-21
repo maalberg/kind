@@ -158,8 +158,8 @@ class model_mode(interface):
         """ Uses scaled ``timeseries`` to execute a forward pass of this KIND model. """
 
         # --! execute both operators on given time series
-        timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pre, _, _     = self.model.stationary(timeseries)
-        timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pre, _, _ = self.model.transient(timeseries)
+        timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model.stationary(timeseries)
+        timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model.transient(timeseries)
 
         # --! derive alpha
         timeseries_stat_var  = torch.exp(timeseries_stat_logvar) + 1e-6
@@ -167,15 +167,17 @@ class model_mode(interface):
         alpha = timeseries_trans_var / (timeseries_trans_var + timeseries_stat_var)
 
         # --! blend the two types of time series using the derived alpha to get the final prediction
-        timeseries_pre = alpha * timeseries_stat + (1 - alpha) * timeseries_trans
+        timeseries_pred = alpha * timeseries_stat + (1 - alpha) * timeseries_trans
 
         output = (
-            timeseries_pre,
+            timeseries_pred,
             timeseries_stat, timeseries_stat_logvar,
             timeseries_trans, timeseries_trans_logvar,
-            fun_stat, fun_stat_pre,
-            fun_trans, fun_trans_pre,
-            alpha
+            fun_stat, fun_stat_pred,
+            fun_trans, fun_trans_pred,
+            alpha,
+            dfun_stat, dfun_stat_pred,
+            dfun_trans, dfun_trans_pred
         )
 
         return output
@@ -233,15 +235,18 @@ class model_eval(model_mode):
         #
         # --! since the indeces of target dimensions must be present in above dictionaries,
         # --! we use these indeces to directly access the dictionaries
+
         timeseries_pred = torch.cat([scaler[k].inverse_transform(timeseries_pred[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
         timeseries_pred = torch.cat([timeseries_pred[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
+
         timeseries_stat = torch.cat([scaler[k].inverse_transform(timeseries_stat[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
         timeseries_stat = torch.cat([timeseries_stat[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
+
         timeseries_trans = torch.cat([scaler[k].inverse_transform(timeseries_trans[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
         timeseries_trans = torch.cat([timeseries_trans[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
 
         # --! put unscaled timeseries back to the result tuple and return the tuple
-        model_output    = list(model_output)
+        model_output = list(model_output)
         model_output[0] = timeseries_pred
         model_output[1] = timeseries_stat
         model_output[3] = timeseries_trans
@@ -285,6 +290,8 @@ class model_fit(model_mode):
         args = self.model.args
 
         # --! make model initializations, data loading, optimizer selection, etc.
+        #
+        # --! select optimizer after initializing this model!
         self.get_state().init_model()
         train_loader, valid_loader, test_loader = self.get_state().load_data(dataset)
         model_optim = self.select_optimizer()
@@ -373,7 +380,7 @@ class model_fit(model_mode):
                 # --! extract target dimensions
                 truth = truth[:, :, self.model.args.target_dim]
 
-                loss = self.get_state().compute_loss(truth, self.get_state().forward(back))
+                loss = self.get_state().compute_loss(truth, self.get_state().forward(back), validated=True)
                 total_loss.append(loss)
 
         # --! reset this model back to training mode
@@ -409,12 +416,12 @@ class fit_state(interface):
 
     @abstractmethod
     def forward(self, timeseries):
-        """ Executes a forward pass of a KIND model according to this fit state. """
+        """ Executes a forward pass of a KIND model. """
         return
 
     @abstractmethod
-    def compute_loss(self, true, pred):
-        """ Computes loss from ``true`` and ``pred``icted timeseries according to this fit state. """
+    def compute_loss(self, true, pred, validated=False):
+        """ Computes loss based on ``true`` and ``pred``icted timeseries. """
         return
 
     @abstractmethod
@@ -427,7 +434,7 @@ class fit_state(interface):
         return criterion(timeseries_pred, timeseries)
 
     def apply_criterion_uncertain(self, timeseries, timeseries_pred_mean, timeseries_pred_uncertain):
-        uncertainty_log = torch.clamp(timeseries_pred_uncertain, min=-5, max=5)
+        uncertainty_log = torch.clamp(timeseries_pred_uncertain, min=-14) # -14 is approximately 1e-6 variance
         uncertainty = torch.exp(uncertainty_log) + 1e-6
 
         criterion = torch.nn.GaussianNLLLoss()
@@ -451,12 +458,12 @@ class fit_stationary_mean(fit_state):
         model.stationary.freeze_var()
 
     def load_data(self, dataset):
-        return dataset.load_stat()
+        return dataset.load(data_type='stat')
 
     def forward(self, timeseries):
         return self.mode.model(timeseries)
 
-    def compute_loss(self, true, pred):
+    def compute_loss(self, true, pred, validated=False):
 
         timeseries = true
         timeseries_pred = pred[1] # < stationary prediction
@@ -482,6 +489,7 @@ class fit_stationary_uncertainty(fit_state):
 
     def init_model(self):
 
+        print('>>> train stationary uncertainty >>>')
         model = self.mode.model
 
         model.transient.freeze_mean()
@@ -491,23 +499,32 @@ class fit_stationary_uncertainty(fit_state):
         model.stationary.freeze_mean()
 
     def load_data(self, dataset):
-        return dataset.load_mixed()
+        return dataset.load(data_type='mixed')
 
     def forward(self, timeseries):
-        return self.mode.model.stationary(timeseries)
+        return self.mode.model(timeseries)
 
-    def compute_loss(self, true, pred):
+    def compute_loss(self, true, pred, validated=False):
 
         timeseries = true
-        timeseries_pred_mean = pred[0]
-        timeseries_pred_uncertain = pred[1]
+        timeseries_pred_mean = pred[1]
+        timeseries_pred_uncertain = pred[2]
+        dfun = pred[10]
+        dfun_pred = pred[11]
 
-        dfun = pred[4]
-        dfun_pred = pred[5]
+        # --! when validating, scale model's output
+        #
+        # --! validation and test data are not initially scaled - the data is scaled internally bu the model and
+        # --! then scaled back - but for computing uncertainty loss it seems to be more
+        # --! straightforward to operate with scaled data
+        if validated:
+            mixmax_range = [self.mode.model.args.data_scale_min, self.mode.model.args.data_scale_max]
+            timeseries = utils_data.dataset.scale(utils_data.dataset.demean(timeseries, dim=1), dim=1, minmax=mixmax_range)
+            timeseries_pred_mean = utils_data.dataset.scale(utils_data.dataset.demean(timeseries_pred_mean, dim=1), dim=1, minmax=mixmax_range)
 
         loss_linear = self.apply_criterion_mean(dfun, dfun_pred)
-        loss_recon  = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
-        loss        = loss_recon + loss_linear
+        loss_uncertain = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
+        loss = loss_uncertain + 1e0 * loss_linear
 
         return loss
 
@@ -532,7 +549,7 @@ class fit_transient_mean(fit_state):
         model.stationary.freeze_var()
 
     def load_data(self, dataset):
-        return dataset.load_trans()
+        return dataset.load(data_type='trans')
 
     def forward(self, timeseries):
         return self.mode.model.transient(timeseries)
@@ -572,7 +589,7 @@ class fit_transient_uncertainty(fit_state):
         model.stationary.freeze_var()
 
     def load_data(self, dataset):
-        return dataset.load_mixed()
+        return dataset.load(data_type='mixed')
 
     def forward(self, timeseries):
         return self.mode.model.transient(timeseries)
@@ -711,7 +728,7 @@ class operator(torch.nn.Module, interface):
 
 
 class operator_stationary(operator):
-    """Models dynamics of stationary timeseries in a DMD-like manner."""
+    """ Models dynamics of stationary timeseries in a DMD-like manner. """
 
     def __init__(self, args):
 
