@@ -353,7 +353,7 @@ class model_fit(model_mode):
     def get_state_transient_mean(self):
         return self._state_transient_mean
 
-    def get_transient_uncertainty(self):
+    def get_state_transient_uncertainty(self):
         return self._state_transient_uncertainty
 
     def get_state(self):
@@ -514,7 +514,7 @@ class fit_stationary_uncertainty(fit_state):
 
         # --! when validating, scale model's output
         #
-        # --! validation and test data are not initially scaled - the data is scaled internally bu the model and
+        # --! validation and test data are not initially scaled - the data is scaled internally by the model and
         # --! then scaled back - but for computing uncertainty loss it seems to be more
         # --! straightforward to operate with scaled data
         if validated:
@@ -540,6 +540,7 @@ class fit_transient_mean(fit_state):
 
     def init_model(self):
 
+        print('>>> train transient mean >>>')
         model = self.mode.model
 
         model.transient.unfreeze()
@@ -552,15 +553,15 @@ class fit_transient_mean(fit_state):
         return dataset.load(data_type='trans')
 
     def forward(self, timeseries):
-        return self.mode.model.transient(timeseries)
+        return self.mode.model(timeseries)
 
-    def compute_loss(self, true, pred):
+    def compute_loss(self, true, pred, validated=False):
 
         timeseries = true
-        timeseries_pred_mean = pred[0]
+        timeseries_pred_mean = pred[3]
 
-        fun = pred[2]
-        fun_pred = pred[3]
+        fun = pred[7]
+        fun_pred = pred[8]
 
         loss_recon = self.apply_criterion_mean(timeseries, timeseries_pred_mean)
         loss_linear = self.apply_criterion_mean(fun, fun_pred)
@@ -580,6 +581,7 @@ class fit_transient_uncertainty(fit_state):
 
     def init_model(self):
 
+        print('>>> train transient uncertainty >>>')
         model = self.mode.model
 
         model.transient.unfreeze()
@@ -592,20 +594,29 @@ class fit_transient_uncertainty(fit_state):
         return dataset.load(data_type='mixed')
 
     def forward(self, timeseries):
-        return self.mode.model.transient(timeseries)
+        return self.mode.model(timeseries)
 
-    def compute_loss(self, true, pred):
+    def compute_loss(self, true, pred, validated=False):
 
         timeseries = true
-        timeseries_pred_mean = pred[0]
-        timeseries_pred_uncertain = pred[1]
+        timeseries_pred_mean = pred[3]
+        timeseries_pred_uncertain = pred[4]
+        dfun = pred[12]
+        dfun_pred = pred[13]
 
-        dfun = pred[4]
-        dfun_pred = pred[5]
+        # --! when validating, scale model's output
+        #
+        # --! validation and test data are not initially scaled - the data is scaled internally by the model and
+        # --! then scaled back - but for computing uncertainty loss it seems to be more
+        # --! straightforward to operate with scaled data
+        if validated:
+            mixmax_range = [self.mode.model.args.data_scale_min, self.mode.model.args.data_scale_max]
+            timeseries = utils_data.dataset.scale(utils_data.dataset.demean(timeseries, dim=1), dim=1, minmax=mixmax_range)
+            timeseries_pred_mean = utils_data.dataset.scale(utils_data.dataset.demean(timeseries_pred_mean, dim=1), dim=1, minmax=mixmax_range)
 
         loss_linear = self.apply_criterion_mean(dfun_pred, dfun)
-        loss_recon  = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
-        loss        = loss_linear + loss_recon
+        loss_recon = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
+        loss = loss_linear + loss_recon
 
         return loss
 
