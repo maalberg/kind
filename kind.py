@@ -31,10 +31,11 @@ def create_args_parser():
     parser.add_argument('--data_scale_max', type=float, required=True, default=1, help='data maximum value when scaled using min-max')
     parser.add_argument('--data_train_size', type=float, required=True, default=0.75, help='dataset part to include in training')
     parser.add_argument('--data_test_size', type=float, required=True, default=0.5, help='non-train part to include in test, rest is validation')
+    parser.add_argument('--feature_dim', type=conv_str2ints, required=True, default='0', help='list of feature dimensions in data')
+    parser.add_argument('--target_dim', type=conv_str2ints, required=True, default='0', help='list of target dimensions in data')
+    parser.add_argument('--mask_dim', type=conv_str2ints, required=True, default='0', help='list of mask dimensions in data')
 
     # --! forecasting arguments
-    parser.add_argument('--feature_dim', type=conv_str2ints, required=True, default=0, help='list of feature dimensions in data')
-    parser.add_argument('--target_dim', type=conv_str2ints, required=True, default=0, help='list of target dimensions in data')
     parser.add_argument('--lookback_nsample', type=int, required=True, default=96, help='number of samples in a lookback window')
     parser.add_argument('--forecast_nsample', type=int, required=True, default=48, help='number of samples in a forecast window')
 
@@ -209,19 +210,36 @@ class model_eval(model_mode):
         """ Uses unnormalized ``timeseries`` to execute a forward pass of KIND model in evaluation mode. """
 
         # --! combine feature and target dimension indeces into a unique-valued set
-        dim = self.model.args.feature_dim + self.model.args.target_dim
-        dim = set(dim)
+        #dim = self.model.args.feature_dim + self.model.args.target_dim
+        #dim = set(dim)
 
         # --! collect means of data dimensions into dictionary, where dimension indeces serve as keys
-        mean = dict([(k, torch.mean(timeseries[:, :, [k]], dim=1, keepdim=True)) for k in dim])
+        #mean = dict([(k, torch.mean(timeseries[:, :, [k]], dim=1, keepdim=True)) for k in dim])
 
         # --! create scalers for data dimensions as a dictionary, where dimension indeces serve as keys
-        scaler_range = (self.model.args.data_scale_min, self.model.args.data_scale_max)
-        scaler = dict([(k, minmax_scaler(scaler_range)) for k in dim])
+        #scaler_range = (self.model.args.data_scale_min, self.model.args.data_scale_max)
+        #scaler = dict([(k, minmax_scaler(scaler_range)) for k in dim])
 
         # --! scale timeseries
-        timeseries = torch.cat([timeseries[:, :, [k]] - mean[k] for k in dim], dim=-1)
-        timeseries = torch.cat([scaler[k].fit_transform(timeseries[:, :, [k]], dim=1) for k in dim], dim=-1)
+        #timeseries = torch.cat([timeseries[:, :, [k]] - mean[k] for k in dim], dim=-1)
+        #timeseries = torch.cat([scaler[k].fit_transform(timeseries[:, :, [k]], dim=1) for k in dim], dim=-1)
+
+        detuning, control, mask = torch.split(timeseries, 1, dim=-1)
+
+        detuning_mean = torch.mean(detuning, dim=1, keepdim=True)
+        control_mean = torch.mean(control, dim=1, keepdim=True)
+
+        scaler_range = (self.model.args.data_scale_min, self.model.args.data_scale_max)
+        detuning_scaler = minmax_scaler(scaler_range)
+        control_scaler = minmax_scaler(scaler_range)
+
+        detuning = detuning - detuning_mean
+        detuning = detuning_scaler.fit_transform(detuning)
+        control = control - control_mean
+        control = control_scaler.fit_transform(control)
+        control = control * mask
+
+        timeseries = torch.cat([detuning, control, mask], dim=-1)
 
         # --! having scaled given timeseries, call the scaled version of KIND forward method
         model_output = self._forward_scaled(timeseries)
@@ -231,19 +249,28 @@ class model_eval(model_mode):
         timeseries_stat = model_output[1]
         timeseries_trans = model_output[3]
 
+        timeseries_pred = detuning_scaler.inverse_transform(timeseries_pred)
+        timeseries_pred = timeseries_pred + detuning_mean
+
+        timeseries_stat = detuning_scaler.inverse_transform(timeseries_stat)
+        timeseries_stat = timeseries_stat + detuning_mean
+
+        timeseries_trans = detuning_scaler.inverse_transform(timeseries_trans)
+        timeseries_trans = timeseries_trans + detuning_mean
+
         # --! unscale predicted timeseries
         #
         # --! since the indeces of target dimensions must be present in above dictionaries,
         # --! we use these indeces to directly access the dictionaries
 
-        timeseries_pred = torch.cat([scaler[k].inverse_transform(timeseries_pred[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
-        timeseries_pred = torch.cat([timeseries_pred[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
+        #timeseries_pred = torch.cat([scaler[k].inverse_transform(timeseries_pred[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
+        #timeseries_pred = torch.cat([timeseries_pred[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
 
-        timeseries_stat = torch.cat([scaler[k].inverse_transform(timeseries_stat[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
-        timeseries_stat = torch.cat([timeseries_stat[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
+        #timeseries_stat = torch.cat([scaler[k].inverse_transform(timeseries_stat[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
+        #timeseries_stat = torch.cat([timeseries_stat[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
 
-        timeseries_trans = torch.cat([scaler[k].inverse_transform(timeseries_trans[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
-        timeseries_trans = torch.cat([timeseries_trans[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
+        #timeseries_trans = torch.cat([scaler[k].inverse_transform(timeseries_trans[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
+        #timeseries_trans = torch.cat([timeseries_trans[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
 
         # --! put unscaled timeseries back to the result tuple and return the tuple
         model_output = list(model_output)
@@ -639,6 +666,7 @@ class operator(torch.nn.Module, interface):
         # --! store mutual configuration inside this base class
         self.nfeature = len(args.feature_dim)
         self.ntarget = len(args.target_dim)
+        self.nmask = len(args.mask_dim)
         self.lookback_nsample = args.lookback_nsample
         self.forecast_nsample = args.forecast_nsample
 
@@ -771,16 +799,16 @@ class operator_stationary(operator):
         # --! more precisely, input timeseries are partitioned into slices, and the encoder
         # --! encodes slice-specific kernels for every function parameter
         # --! in the embedded (latent) space
-        fun_enc_ni   = self.param_kernsize * self.nfeature
-        fun_enc_no   = nparam * self.param_kernsize * self.nfeature
+        fun_enc_ni   = self.param_kernsize * (self.nfeature + self.nmask)
+        fun_enc_no   = nparam * self.param_kernsize * (self.nfeature + self.nmask)
         self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, fun_enc_no], actfun_hid='relu')
 
-        if self.nfeature > 1:
+        if (self.nfeature + self.nmask) > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
             # --! basis functions, such that only the number of these basis functions
             # --! influences the order of the DMD matrix, whereas the number of data
             # --! dimensions has no effect on the order
-            fun_prune_ni = nfun * self.nfeature
+            fun_prune_ni = nfun * (self.nfeature + self.nmask)
             fun_prune_no = nfun
             self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
@@ -816,8 +844,8 @@ class operator_stationary(operator):
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
-        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
-        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
+        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, (self.nfeature + self.nmask))
+        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * (self.nfeature + self.nmask))
 
         # --! based on inputs, encode parameter kernels (filters)
         kern = self.fun_enc(i)
@@ -834,12 +862,12 @@ class operator_stationary(operator):
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize * self.nfeature)
+            self.param_kernsize * (self.nfeature + self.nmask))
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize, self.nfeature)
-        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
+            self.param_kernsize, (self.nfeature + self.nmask))
+        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature + self.nmask)
 
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
@@ -856,7 +884,7 @@ class operator_stationary(operator):
         fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(fun) if self.nfeature > 1 else fun
+        return self.fun_prune(fun) if (self.nfeature + self.nmask) > 1 else fun
 
     def predict_mean(self, functions):
 
@@ -977,7 +1005,7 @@ class operator_stationary(operator):
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.fun_enc)
-        if self.nfeature > 1:
+        if (self.nfeature + self.nmask) > 1:
             utils_nn.freeze_module(self.fun_prune)
         utils_nn.freeze_module(self.mod_mean)
         utils_nn.freeze_module(self.pre_mean_dec)
@@ -988,7 +1016,7 @@ class operator_stationary(operator):
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
-        if self.nfeature > 1:
+        if (self.nfeature + self.nmask) > 1:
             utils_nn.unfreeze_module(self.fun_prune)
         utils_nn.unfreeze_module(self.mod_mean)
         utils_nn.unfreeze_module(self.mod_var_gen)
@@ -1029,16 +1057,16 @@ class operator_transient(operator):
         # --! more precisely, input timeseries are partitioned into slices, and the encoder
         # --! encodes slice-specific kernels for every function parameter
         # --! in the embedded (latent) space
-        fun_enc_ni   = self.param_kernsize * self.nfeature
-        fun_enc_no   = nparam * self.param_kernsize * self.nfeature
+        fun_enc_ni   = self.param_kernsize * (self.nfeature + self.nmask)
+        fun_enc_no   = nparam * self.param_kernsize * (self.nfeature + self.nmask)
         self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, fun_enc_no], actfun_hid='relu')
 
-        if self.nfeature > 1:
+        if (self.nfeature + self.nmask) > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
             # --! basis functions, such that only the number of these basis functions
             # --! influences the order of linear matrices and the number of data
             # --! dimensions has no effect on that order
-            fun_prune_ni = nfun * self.nfeature
+            fun_prune_ni = nfun * (self.nfeature + self.nmask)
             fun_prune_no = nfun
             self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
@@ -1090,8 +1118,8 @@ class operator_transient(operator):
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
-        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
-        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
+        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature + self.nmask)
+        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * (self.nfeature + self.nmask))
 
         # --! based on inputs, encode parameter kernels (filters)
         kern = self.fun_enc(i)
@@ -1108,12 +1136,12 @@ class operator_transient(operator):
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize * self.nfeature)
+            self.param_kernsize * (self.nfeature + self.nmask))
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize, self.nfeature)
-        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
+            self.param_kernsize, self.nfeature + self.nmask)
+        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature + self.nmask)
 
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
@@ -1132,7 +1160,7 @@ class operator_transient(operator):
         fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(fun) if self.nfeature > 1 else fun
+        return self.fun_prune(fun) if (self.nfeature + self.nmask) > 1 else fun
 
     def predict_mean(self, functions):
 
@@ -1255,7 +1283,7 @@ class operator_transient(operator):
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.fun_enc)
-        if self.nfeature > 1:
+        if (self.nfeature + self.nmask) > 1:
             utils_nn.freeze_module(self.fun_prune)
         utils_nn.freeze_module(self.mod_mean_att_enc)
         utils_nn.freeze_module(self.mod_mean_gen)
@@ -1267,7 +1295,7 @@ class operator_transient(operator):
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
-        if self.nfeature > 1:
+        if (self.nfeature + self.nmask) > 1:
             utils_nn.unfreeze_module(self.fun_prune)
         utils_nn.unfreeze_module(self.mod_mean_att_enc)
         utils_nn.unfreeze_module(self.mod_mean_gen)

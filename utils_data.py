@@ -23,8 +23,16 @@ from matplotlib import pyplot as plt
 class dataset_factory:
     def create_dataset(self, args):
 
-        if args.data_name == 'SRF gun simulation':
+        if args.data_name=='kind':
             return dataset_sim(
+                args.data_dir, args.data_file, args.data_ext,
+                args.data_nsample,
+                (args.data_scale_min, args.data_scale_max),
+                (args.data_train_size, args.data_test_size),
+                args.batch_size, (args.lookback_nsample, args.forecast_nsample))
+
+        elif args.data_name=='kind-rl-policy-eval':
+            return dataset_policy_eval(
                 args.data_dir, args.data_file, args.data_ext,
                 args.data_nsample,
                 (args.data_scale_min, args.data_scale_max),
@@ -68,13 +76,15 @@ class dataset(interface):
         else:
             windows = self.read_windows(self.make_path(data_type))
 
+        # --! adapt control mask in read data windows to comply with current dataset use case
+        windows = self.adapt_mask(windows)
+
         # --! split data into train, valid and test partitions
         train_data, valid_test_data = train_test_split(windows, train_size=self.split_size[0], shuffle=True)
         valid_data, test_data = train_test_split(valid_test_data, test_size=self.split_size[1], shuffle=True)
 
         # --! normalize training data
-        train_data = torch.stack(
-            [self.scale(self.demean(data, dim=0), dim=0, minmax=self.scale_minmax) for data in train_data], dim=0)
+        train_data = self.normalize(train_data)
 
         # --! create datasets by splitting the windows into lookback and forecast parts
         train_back, train_fore = torch.split(train_data, list(self.window_nsample), dim=1)
@@ -95,6 +105,11 @@ class dataset(interface):
 
     @abstractmethod
     def make_path(self, data_type='stat'):
+        return
+
+    @abstractmethod
+    def adapt_mask(self, windows):
+        """ Adapts mask data dimension in ``windows`` to the use in current dataset. """
         return
 
     def read_windows(self, data_path):
@@ -129,12 +144,16 @@ class dataset(interface):
         dataframe = pd.read_csv(data_path, header=None, dtype=np.float32)
         return torch.from_numpy(dataframe.to_numpy())
 
+    @abstractmethod
+    def normalize(self, data):
+        return
+
     @staticmethod
     def demean(data, dim=0):
         return data - torch.mean(data, dim, keepdim=True)
 
     @staticmethod
-    def scale(data, dim=0, minmax=(-1, 1)):
+    def scale(data, dim=0, minmax=(-1., 1.)):
         scaler = minmax_scaler(feature_range=minmax)
         return scaler.fit_transform(data, dim)
 
@@ -153,6 +172,65 @@ class dataset_sim(dataset):
     def make_path(self, data_type='stat'):
         data_file = self.data_file + '_' + data_type + self.data_ext
         return os.path.join(self.data_dir, data_file)
+
+    def adapt_mask(self, windows):
+
+        # --! get a random number of active control samples in our lookback window
+        k = np.random.randint(0, high=self.window_nsample[0] + 1) # add 1 to use the result for negative slicing
+
+        # --! since the whole window includes a forecast part as well, adjust the random position
+        k = k + self.window_nsample[1]
+
+        # if a window mask dimension starts with a zero then randomize the size of the zero region
+        for window in windows:
+            if window[0, 2]==0.:
+                window[-k:, 2] = 1.
+
+        return windows
+
+    def normalize(self, data):
+
+        detuning, control, mask = torch.split(data, 1, dim=-1)
+
+        detuning = torch.stack(
+            [self.scale(self.demean(d, dim=0), dim=0, minmax=self.scale_minmax) for d in detuning], dim=0)
+        control = torch.stack(
+            [self.scale(self.demean(c, dim=0), dim=0, minmax=self.scale_minmax) for c in control], dim=0)
+
+        control = control * mask
+
+        return torch.cat([detuning, control, mask], dim=-1)
+
+
+class dataset_policy_eval(dataset):
+    def __init__(self,
+                 data_dir, data_file, data_ext,
+                 data_nsample,
+                 data_scale_minmax, data_split_size,
+                 batch_size, window_nsample):
+        super().__init__(data_dir, data_file, data_ext,
+                         data_nsample, data_scale_minmax, data_split_size,
+                         batch_size, window_nsample)
+
+    def make_path(self, data_type='stat'):
+        data_file = self.data_file + '_' + data_type + self.data_ext
+        return os.path.join(self.data_dir, data_file)
+
+    def adapt_mask(self, windows):
+        return windows
+
+    def normalize(self, data):
+
+        detuning, control, mask = torch.split(data, 1, dim=-1)
+
+        detuning = torch.stack(
+            [self.scale(self.demean(d, dim=0), dim=0, minmax=self.scale_minmax) for d in detuning], dim=0)
+        control = torch.stack(
+            [self.scale(self.demean(c, dim=0), dim=0, minmax=self.scale_minmax) for c in control], dim=0)
+
+        control = control * mask
+
+        return torch.cat([detuning, control, mask], dim=-1)
 
 
 class minmax_scaler:
