@@ -16,6 +16,8 @@ import utils_nn
 
 from utils_data import conv_str2ints, minmax_scaler
 
+from matplotlib import pyplot as plt
+
 
 def create_args_parser():
     """ Creates a command-line parser for KIND arguments. """
@@ -68,6 +70,8 @@ class model(torch.nn.Module):
         super().__init__()
 
         self.args = args
+
+        self._fit_dataset = None
 
         # --! declare KIND operators
         self.stationary = operator_stationary(args)
@@ -224,22 +228,24 @@ class model_eval(model_mode):
         #timeseries = torch.cat([timeseries[:, :, [k]] - mean[k] for k in dim], dim=-1)
         #timeseries = torch.cat([scaler[k].fit_transform(timeseries[:, :, [k]], dim=1) for k in dim], dim=-1)
 
-        detuning, control, mask = torch.split(timeseries, 1, dim=-1)
+        #detuning, control, mask = torch.split(timeseries, 1, dim=-1)
 
-        detuning_mean = torch.mean(detuning, dim=1, keepdim=True)
-        control_mean = torch.mean(control, dim=1, keepdim=True)
+        #detuning_mean = torch.mean(detuning, dim=1, keepdim=True)
+        #control_mean = torch.mean(control, dim=1, keepdim=True)
 
-        scaler_range = (self.model.args.data_scale_min, self.model.args.data_scale_max)
-        detuning_scaler = minmax_scaler(scaler_range)
-        control_scaler = minmax_scaler(scaler_range)
+        #scaler_range = (self.model.args.data_scale_min, self.model.args.data_scale_max)
+        #detuning_scaler = minmax_scaler(scaler_range)
+        #control_scaler = minmax_scaler(scaler_range)
 
-        detuning = detuning - detuning_mean
-        detuning = detuning_scaler.fit_transform(detuning)
-        control = control - control_mean
-        control = control_scaler.fit_transform(control)
-        control = control * mask
+        #detuning = detuning - detuning_mean
+        #detuning = detuning_scaler.fit_transform(detuning)
+        #control = control - control_mean
+        #control = control_scaler.fit_transform(control)
+        #control = control * mask
 
-        timeseries = torch.cat([detuning, control, mask], dim=-1)
+        #timeseries = torch.cat([detuning, control, mask], dim=-1)
+
+        timeseries = self.model._fit_dataset.normalize(timeseries)
 
         # --! having scaled given timeseries, call the scaled version of KIND forward method
         model_output = self._forward_scaled(timeseries)
@@ -249,14 +255,9 @@ class model_eval(model_mode):
         timeseries_stat = model_output[1]
         timeseries_trans = model_output[3]
 
-        timeseries_pred = detuning_scaler.inverse_transform(timeseries_pred)
-        timeseries_pred = timeseries_pred + detuning_mean
-
-        timeseries_stat = detuning_scaler.inverse_transform(timeseries_stat)
-        timeseries_stat = timeseries_stat + detuning_mean
-
-        timeseries_trans = detuning_scaler.inverse_transform(timeseries_trans)
-        timeseries_trans = timeseries_trans + detuning_mean
+        timeseries_pred = self.model._fit_dataset.denormalize(timeseries_pred)
+        timeseries_stat = self.model._fit_dataset.denormalize(timeseries_stat)
+        timeseries_trans = self.model._fit_dataset.denormalize(timeseries_trans)
 
         # --! unscale predicted timeseries
         #
@@ -315,6 +316,9 @@ class model_fit(model_mode):
         """
 
         args = self.model.args
+
+        # --! test
+        self.model._fit_dataset = dataset
 
         # --! make model initializations, data loading, optimizer selection, etc.
         #
@@ -461,11 +465,15 @@ class fit_state(interface):
         return criterion(timeseries_pred, timeseries)
 
     def apply_criterion_uncertain(self, timeseries, timeseries_pred_mean, timeseries_pred_uncertain):
-        uncertainty_log = torch.clamp(timeseries_pred_uncertain, min=-14) # -14 is approximately 1e-6 variance
-        uncertainty = torch.exp(uncertainty_log) + 1e-6
+        # --! clamp a log-variance to avoid big numbers
+        uncertainty_log = torch.clamp(timeseries_pred_uncertain, min=-10, max=5)
 
-        criterion = torch.nn.GaussianNLLLoss()
-        return criterion(timeseries_pred_mean, timeseries, uncertainty)
+        # --! convert the log variance into variance
+        uncertainty = torch.exp(-uncertainty_log)
+
+        # --! compute a negative log-likelihood manually, instead of calling torch.nn.GaussianNLLLoss
+        loss = 0.5 * (uncertainty_log + (timeseries_pred_mean - timeseries)**2 * uncertainty)
+        return loss.mean()
 
 
 class fit_stationary_mean(fit_state):
@@ -975,9 +983,10 @@ class operator_stationary(operator):
         # --! facilitate subsequent learning of the error dynamics
         dfun         = fun_pre - fun
         dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
-        dfun         = dfun - dfun_mean
-        scaler       = minmax_scaler(feature_range=(-1, 1))
-        dfun         = scaler.fit_transform(dfun)
+        dfun_std     = torch.std(dfun, dim=1, keepdim=True)
+        dfun         = (dfun - dfun_mean) / (dfun_std + 1e-8)
+        #scaler       = minmax_scaler(feature_range=(-1, 1))
+        #dfun         = scaler.fit_transform(dfun)
 
         # --! predict the evolution of a function error starting from the first error value upto
         # --! a specified horizon
@@ -986,8 +995,10 @@ class operator_stationary(operator):
 
         # --! denormalize predicted errors to restore original magnitudes, which are essential for
         # --! decoding the right uncertainty magnitudes
-        dfun_pre_unsca = scaler.inverse_transform(torch.cat([dfun_pre, dfun_pre_forecast], dim=1))
-        dfun_pre_unsca = dfun_pre_unsca + dfun_mean
+        dfun_pre_unsca = torch.cat([dfun_pre, dfun_pre_forecast], dim=1)
+        dfun_pre_unsca = dfun_pre_unsca * dfun_std + dfun_mean
+        #dfun_pre_unsca = scaler.inverse_transform()
+        #dfun_pre_unsca = dfun_pre_unsca + dfun_mean
 
         # --! decode predicted embeddings to timeseries
         #
@@ -1251,11 +1262,13 @@ class operator_transient(operator):
 
         # --! compute a function prediction error (difference) and normalize the error in order to
         # --! facilitate subsequent learning of the error dynamics
-        dfun         = fun_pre - fun
+        dfun         = fun_pre - fun        
         dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
-        dfun         = dfun - dfun_mean
-        scaler       = minmax_scaler(feature_range=(-1, 1))
-        dfun         = scaler.fit_transform(dfun)
+        dfun_std     = torch.std(dfun, dim=1, keepdim=True)
+        dfun         = (dfun - dfun_mean) / (dfun_std + 1e-8)
+        #dfun         = dfun - dfun_mean
+        #scaler       = minmax_scaler(feature_range=(-1, 1))
+        #dfun         = scaler.fit_transform(dfun)
 
         # --! predict the evolution of a function error starting from the first error value upto
         # --! a specified horizon
@@ -1264,8 +1277,10 @@ class operator_transient(operator):
 
         # --! denormalize predicted errors to restore original magnitudes, which are essential for
         # --! decoding the right uncertainty magnitudes
-        dfun_pre_unsca = scaler.inverse_transform(torch.cat([dfun_pre, dfun_pre_forecast], dim=1))
-        dfun_pre_unsca = dfun_pre_unsca + dfun_mean
+        dfun_pre_unsca = torch.cat([dfun_pre, dfun_pre_forecast], dim=1)
+        dfun_pre_unsca = dfun_pre_unsca * dfun_std + dfun_mean
+        #dfun_pre_unsca = scaler.inverse_transform(torch.cat([dfun_pre, dfun_pre_forecast], dim=1))
+        #dfun_pre_unsca = dfun_pre_unsca + dfun_mean
 
         # --! decode predicted embeddings to timeseries
         #

@@ -62,8 +62,14 @@ class dataset(interface):
         # --! read rolling windows from a data file
         if data_type=='mixed':
             # --! read both data types
-            window_stat = self.read_windows(self.make_path(data_type='stat'))
-            window_trans = self.read_windows(self.make_path(data_type='trans'))
+            timeseries_stat = self.read_timeseries(self.make_path(data_type='stat'))
+            timeseries_trans = self.read_timeseries(self.make_path(data_type='trans'))
+
+            # --! update normalization statistics
+            self.init_normalization(torch.cat([timeseries_stat, timeseries_trans]))
+
+            window_stat = self.extract_windows(timeseries_stat)
+            window_trans = self.extract_windows(timeseries_trans)
 
             # --! ensure both data have the same size in the first dimension
             nwindow = window_stat.shape[0] if window_stat.shape[0] < window_trans.shape[0] else window_trans.shape[0]
@@ -74,7 +80,12 @@ class dataset(interface):
             windows = torch.stack([window_stat, window_trans], dim=1)
             windows = torch.flatten(windows, start_dim=0, end_dim=1)
         else:
-            windows = self.read_windows(self.make_path(data_type))
+            timeseries = self.read_timeseries(self.make_path(data_type))
+
+            # --! update normalization statistics
+            self.init_normalization(timeseries)
+
+            windows = self.extract_windows(timeseries)
 
         # --! adapt control mask in read data windows to comply with current dataset use case
         windows = self.adapt_mask(windows)
@@ -98,8 +109,8 @@ class dataset(interface):
 
         # --! wrap the datasets into loaders
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-        valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=True)
-        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=self.batch_size, shuffle=True)
+        valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=False)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
 
         return train_loader, valid_loader, test_loader
 
@@ -112,28 +123,43 @@ class dataset(interface):
         """ Adapts mask data dimension in ``windows`` to the use in current dataset. """
         return
 
-    def read_windows(self, data_path):
-        """ Reads data from a file located at ``data_path`` in a rolling window fashion. """
+    def read_timeseries(self, path):
+        """ Reads time series from a data file located at ``path``. """
 
         # --! read data from a csv file
-        data = self.read_csv(data_path)
+        data = self.read_csv(path)
 
-        # --! convert read data to a 3D torch tensor
-        ndata = data.shape[0] // self.data_nsample
-        data = torch.reshape(data, (ndata, self.data_nsample, data.shape[1]))
+        # --! convert read data to a 3D torch tensor where the first dimension contains time series
+        ntimeseries = data.shape[0] // self.data_nsample
+        return torch.reshape(data, (ntimeseries, self.data_nsample, data.shape[1]))
+
+    @abstractmethod
+    def init_normalization(self, timeseries):
+        return
+
+    @abstractmethod
+    def normalize(self, window):
+        return
+
+    @abstractmethod
+    def denormalize(self, window):
+        return
+
+    def extract_windows(self, timeseries):
+        """ Extracts windows from ``timeseries`` in a rolling window manner. """
 
         # --! prepare to extract data windows
         window_nsample = self.window_nsample[0] + self.window_nsample[1]
         data_start = 0
-        data_end = data.shape[1] - window_nsample
+        data_end = timeseries.shape[1] - window_nsample
         windows = []
 
-        # --! extract data windows in a rolling window manner
-        for d in data:
+        # --! extract windows in a rolling window manner
+        for ts in timeseries:
             for j in range(data_start, data_end):
                 window_start = j
                 window_end = window_start + window_nsample
-                window = d[window_start:window_end]
+                window = ts[window_start:window_end]
 
                 windows.append(window)
         return torch.stack(windows, dim=0)
@@ -143,10 +169,6 @@ class dataset(interface):
         # --! read a csv-file with no header
         dataframe = pd.read_csv(data_path, header=None, dtype=np.float32)
         return torch.from_numpy(dataframe.to_numpy())
-
-    @abstractmethod
-    def normalize(self, data):
-        return
 
     @staticmethod
     def demean(data, dim=0):
@@ -160,6 +182,9 @@ class dataset(interface):
 
 class dataset_sim(dataset):
 
+    # --! minimum standard deviation to avoid division by zero-like deviation values
+    min_std = torch.tensor(1e-3, dtype=torch.float32)
+
     def __init__(self,
                  data_dir, data_file, data_ext,
                  data_nsample,
@@ -168,6 +193,9 @@ class dataset_sim(dataset):
         super().__init__(data_dir, data_file, data_ext,
                          data_nsample, data_scale_minmax, data_split_size,
                          batch_size, window_nsample)
+
+        self.mean = 0.
+        self.std = self.min_std
 
     def make_path(self, data_type='stat'):
         data_file = self.data_file + '_' + data_type + self.data_ext
@@ -188,18 +216,38 @@ class dataset_sim(dataset):
 
         return windows
 
-    def normalize(self, data):
+    def init_normalization(self, timeseries):
 
-        detuning, control, mask = torch.split(data, 1, dim=-1)
+        detuning_control, mask = torch.split(timeseries, [2, 1], dim=-1)
 
-        detuning = torch.stack(
-            [self.scale(self.demean(d, dim=0), dim=0, minmax=self.scale_minmax) for d in detuning], dim=0)
-        control = torch.stack(
-            [self.scale(self.demean(c, dim=0), dim=0, minmax=self.scale_minmax) for c in control], dim=0)
+        # --! take global statistics
+        self.mean = detuning_control.mean()
+        self.std = detuning_control.std()
+        self.std = torch.maximum(self.std, self.min_std)
 
+    def normalize(self, window):
+
+        detuning, control, mask = torch.split(window, 1, dim=-1)
+
+        detuning = torch.clip((detuning - self.mean) / self.std, min=-3.0, max=3.0)
+        control = torch.clip((control - self.mean) / self.std, min=-3.0, max=3.0)
         control = control * mask
 
         return torch.cat([detuning, control, mask], dim=-1)
+
+    def denormalize(self, window):
+
+        if window.shape[-1]==1:
+            window = window * self.std + self.mean
+        else:
+            detuning, control, mask = torch.split(window, 1, dim=-1)
+
+            detuning = detuning * self.std + self.mean
+            control = control * self.std + self.mean
+
+            window = torch.cat([detuning, control, mask], dim=-1)
+
+        return window
 
 
 class dataset_policy_eval(dataset):
