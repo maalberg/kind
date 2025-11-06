@@ -317,7 +317,7 @@ class model_fit(model_mode):
 
         args = self.model.args
 
-        # --! test
+        # --! FIX ME - this may not be the best way to get access to dataset normalization methods
         self.model._fit_dataset = dataset
 
         # --! make model initializations, data loading, optimizer selection, etc.
@@ -553,13 +553,15 @@ class fit_stationary_uncertainty(fit_state):
         # --! then scaled back - but for computing uncertainty loss it seems to be more
         # --! straightforward to operate with scaled data
         if validated:
-            mixmax_range = [self.mode.model.args.data_scale_min, self.mode.model.args.data_scale_max]
-            timeseries = utils_data.dataset.scale(utils_data.dataset.demean(timeseries, dim=1), dim=1, minmax=mixmax_range)
-            timeseries_pred_mean = utils_data.dataset.scale(utils_data.dataset.demean(timeseries_pred_mean, dim=1), dim=1, minmax=mixmax_range)
+            timeseries = self.mode.model._fit_dataset.normalize(timeseries)
+            timeseries_pred_mean = self.mode.model._fit_dataset.normalize(timeseries_pred_mean)
+            #mixmax_range = [self.mode.model.args.data_scale_min, self.mode.model.args.data_scale_max]
+            #timeseries = utils_data.dataset.scale(utils_data.dataset.demean(timeseries, dim=1), dim=1, minmax=mixmax_range)
+            #timeseries_pred_mean = utils_data.dataset.scale(utils_data.dataset.demean(timeseries_pred_mean, dim=1), dim=1, minmax=mixmax_range)
 
         loss_linear = self.apply_criterion_mean(dfun, dfun_pred)
         loss_uncertain = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
-        loss = loss_uncertain + 1e0 * loss_linear
+        loss = loss_uncertain + loss_linear
 
         return loss
 
@@ -645,9 +647,11 @@ class fit_transient_uncertainty(fit_state):
         # --! then scaled back - but for computing uncertainty loss it seems to be more
         # --! straightforward to operate with scaled data
         if validated:
-            mixmax_range = [self.mode.model.args.data_scale_min, self.mode.model.args.data_scale_max]
-            timeseries = utils_data.dataset.scale(utils_data.dataset.demean(timeseries, dim=1), dim=1, minmax=mixmax_range)
-            timeseries_pred_mean = utils_data.dataset.scale(utils_data.dataset.demean(timeseries_pred_mean, dim=1), dim=1, minmax=mixmax_range)
+            timeseries = self.mode.model._fit_dataset.normalize(timeseries)
+            timeseries_pred_mean = self.mode.model._fit_dataset.normalize(timeseries_pred_mean)
+            #mixmax_range = [self.mode.model.args.data_scale_min, self.mode.model.args.data_scale_max]
+            #timeseries = utils_data.dataset.scale(utils_data.dataset.demean(timeseries, dim=1), dim=1, minmax=mixmax_range)
+            #timeseries_pred_mean = utils_data.dataset.scale(utils_data.dataset.demean(timeseries_pred_mean, dim=1), dim=1, minmax=mixmax_range)
 
         loss_linear = self.apply_criterion_mean(dfun_pred, dfun)
         loss_recon = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)

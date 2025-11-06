@@ -227,13 +227,18 @@ class dataset_sim(dataset):
 
     def normalize(self, window):
 
-        detuning, control, mask = torch.split(window, 1, dim=-1)
+        if window.shape[-1]==1:
+            window = torch.clip((window - self.mean) / self.std, min=-3.0, max=3.0)
+        else:
+            detuning, control, mask = torch.split(window, 1, dim=-1)
 
-        detuning = torch.clip((detuning - self.mean) / self.std, min=-3.0, max=3.0)
-        control = torch.clip((control - self.mean) / self.std, min=-3.0, max=3.0)
-        control = control * mask
+            detuning = torch.clip((detuning - self.mean) / self.std, min=-3.0, max=3.0)
+            control = torch.clip((control - self.mean) / self.std, min=-3.0, max=3.0)
+            control = control * mask
 
-        return torch.cat([detuning, control, mask], dim=-1)
+            window = torch.cat([detuning, control, mask], dim=-1)
+
+        return window
 
     def denormalize(self, window):
 
@@ -251,6 +256,10 @@ class dataset_sim(dataset):
 
 
 class dataset_policy_eval(dataset):
+
+    # --! minimum standard deviation to avoid division by zero-like deviation values
+    min_std = torch.tensor(1e-3, dtype=torch.float32)
+
     def __init__(self,
                  data_dir, data_file, data_ext,
                  data_nsample,
@@ -260,6 +269,9 @@ class dataset_policy_eval(dataset):
                          data_nsample, data_scale_minmax, data_split_size,
                          batch_size, window_nsample)
 
+        self.mean = 0.
+        self.std = self.min_std
+
     def make_path(self, data_type='stat'):
         data_file = self.data_file + '_' + data_type + self.data_ext
         return os.path.join(self.data_dir, data_file)
@@ -267,18 +279,43 @@ class dataset_policy_eval(dataset):
     def adapt_mask(self, windows):
         return windows
 
-    def normalize(self, data):
+    def init_normalization(self, timeseries):
 
-        detuning, control, mask = torch.split(data, 1, dim=-1)
+        detuning_control, mask = torch.split(timeseries, [2, 1], dim=-1)
 
-        detuning = torch.stack(
-            [self.scale(self.demean(d, dim=0), dim=0, minmax=self.scale_minmax) for d in detuning], dim=0)
-        control = torch.stack(
-            [self.scale(self.demean(c, dim=0), dim=0, minmax=self.scale_minmax) for c in control], dim=0)
+        # --! take global statistics
+        self.mean = detuning_control.mean()
+        self.std = detuning_control.std()
+        self.std = torch.maximum(self.std, self.min_std)
 
-        control = control * mask
+    def normalize(self, window):
 
-        return torch.cat([detuning, control, mask], dim=-1)
+        if window.shape[-1]==1:
+            window = torch.clip((window - self.mean) / self.std, min=-3.0, max=3.0)
+        else:
+            detuning, control, mask = torch.split(window, 1, dim=-1)
+
+            detuning = torch.clip((detuning - self.mean) / self.std, min=-3.0, max=3.0)
+            control = torch.clip((control - self.mean) / self.std, min=-3.0, max=3.0)
+            control = control * mask
+
+            window = torch.cat([detuning, control, mask], dim=-1)
+
+        return window
+
+    def denormalize(self, window):
+
+        if window.shape[-1]==1:
+            window = window * self.std + self.mean
+        else:
+            detuning, control, mask = torch.split(window, 1, dim=-1)
+
+            detuning = detuning * self.std + self.mean
+            control = control * self.std + self.mean
+
+            window = torch.cat([detuning, control, mask], dim=-1)
+
+        return window
 
 
 class minmax_scaler:
