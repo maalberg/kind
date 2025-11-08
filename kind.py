@@ -986,11 +986,10 @@ class operator_stationary(operator):
         # --! compute a function prediction error (difference) and normalize the error in order to
         # --! facilitate subsequent learning of the error dynamics
         dfun         = fun_pre - fun
+        #dfun[:, :1]  = 1e-8
         dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
         dfun_std     = torch.std(dfun, dim=1, keepdim=True)
         dfun         = (dfun - dfun_mean) / (dfun_std + 1e-8)
-        #scaler       = minmax_scaler(feature_range=(-1, 1))
-        #dfun         = scaler.fit_transform(dfun)
 
         # --! predict the evolution of a function error starting from the first error value upto
         # --! a specified horizon
@@ -1001,8 +1000,6 @@ class operator_stationary(operator):
         # --! decoding the right uncertainty magnitudes
         dfun_pre_unsca = torch.cat([dfun_pre, dfun_pre_forecast], dim=1)
         dfun_pre_unsca = dfun_pre_unsca * dfun_std + dfun_mean
-        #dfun_pre_unsca = scaler.inverse_transform()
-        #dfun_pre_unsca = dfun_pre_unsca + dfun_mean
 
         # --! decode predicted embeddings to timeseries
         #
