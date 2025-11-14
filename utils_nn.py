@@ -158,3 +158,13 @@ def cumprod_mat(mat_array):
         prevprod = prod
 
     return torch.stack(cumprod, dim=1)
+
+def make_feat(ni=1, no=1, nneuron=32, nlayer=2):
+    """ Makes a feature list for a fully-connected neural network.
+    Arguments ``ni``, ``no``, ``nneuron`` and ``nlayer`` denote the number of
+    network inputs, outputs, neurons in a hidden layer and the layers of the network, respectively."""
+    ni = [ni]
+    no = [no]
+    hidden = [nneuron for _ in range(nlayer)]
+
+    return ni + hidden + no

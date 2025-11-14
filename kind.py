@@ -54,6 +54,10 @@ def create_args_parser():
     parser.add_argument('--seg_nsample_trans', type=int, required=True, default=12, help='number of samples in a transient data segment')
     parser.add_argument('--fun_stat', type=json.loads, required=True, default='{"data": 8}', help='embedded functions for stationary operator')
     parser.add_argument('--fun_trans', type=json.loads, required=True, default='{"data": 8}', help='embedded functions for transient operator')
+    parser.add_argument('--nneuron_stat', type=int, required=False, default=64, help='number of neurons in stationary operator layers')
+    parser.add_argument('--nlayer_stat', type=int, required=False, default=3, help='number of layers in stationary operator')
+    parser.add_argument('--nneuron_trans', type=int, required=False, default=64, help='number of neurons in transient operator layers')
+    parser.add_argument('--nlayer_trans', type=int, required=False, default=3, help='number of layers in transient operator')
 
     return parser
 
@@ -813,7 +817,8 @@ class operator_stationary(operator):
         # --! in the embedded (latent) space
         fun_enc_ni   = self.param_kernsize * (self.nfeature + self.nmask)
         fun_enc_no   = nparam * self.param_kernsize * (self.nfeature + self.nmask)
-        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, fun_enc_no], actfun_hid='relu')
+        fun_enc_feat = utils_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.fun_enc = utils_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
 
         if (self.nfeature + self.nmask) > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
@@ -838,13 +843,15 @@ class operator_stationary(operator):
         # --! a flattened sequence of square matrices
         mod_var_gen_ni = fun_nsample * nfun
         mod_var_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
-        self.mod_var_gen = utils_nn.fcnn(feat=[mod_var_gen_ni, 64, 64, mod_var_gen_no], actfun_hid='relu')
+        mod_var_gen_feat = utils_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.mod_var_gen = utils_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
 
         # --! create prediction decoders to decode predicted embeddings back to timeseries and uncertainty
-        pre_dec_ni        = nfun
-        pre_dec_no        = self.param_kernsize * self.ntarget
-        self.pre_mean_dec = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
-        self.pre_var_dec  = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
+        pre_dec_ni = nfun
+        pre_dec_no = self.param_kernsize * self.ntarget
+        pre_dec_feat = utils_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.pre_mean_dec = utils_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+        self.pre_var_dec  = utils_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -986,7 +993,6 @@ class operator_stationary(operator):
         # --! compute a function prediction error (difference) and normalize the error in order to
         # --! facilitate subsequent learning of the error dynamics
         dfun         = fun_pre - fun
-        #dfun[:, :1]  = 1e-8
         dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
         dfun_std     = torch.std(dfun, dim=1, keepdim=True)
         dfun         = (dfun - dfun_mean) / (dfun_std + 1e-8)
@@ -1071,7 +1077,8 @@ class operator_transient(operator):
         # --! in the embedded (latent) space
         fun_enc_ni   = self.param_kernsize * (self.nfeature + self.nmask)
         fun_enc_no   = nparam * self.param_kernsize * (self.nfeature + self.nmask)
-        self.fun_enc = utils_nn.fcnn(feat=[fun_enc_ni, 128, 128, fun_enc_no], actfun_hid='relu')
+        fun_enc_feat = utils_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.fun_enc = utils_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
 
         if (self.nfeature + self.nmask) > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
@@ -1090,9 +1097,9 @@ class operator_transient(operator):
             torch.nn.TransformerEncoderLayer(
                 d_model=mod_mean_att_enc_ni,
                 nhead=1,
-                dim_feedforward=64,
+                dim_feedforward=args.nneuron_trans,
                 batch_first=True),
-            num_layers=2,
+            num_layers=args.nlayer_trans,
             enable_nested_tensor=False)
 
         # --! an additional generator to create linear time-varying matrices from
@@ -1104,7 +1111,8 @@ class operator_transient(operator):
         # --! covering all prediction horizon
         mod_mean_gen_ni = fun_nsample * nfun
         mod_mean_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
-        self.mod_mean_gen = utils_nn.fcnn(feat=[mod_mean_gen_ni, 64, 64, mod_mean_gen_no], actfun_hid='relu')
+        mod_mean_gen_feat = utils_nn.make_feat(ni=mod_mean_gen_ni, no=mod_mean_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.mod_mean_gen = utils_nn.fcnn(feat=mod_mean_gen_feat, actfun_hid='relu')
 
         # --! create a generator that produces models capturing the evolution of variance (uncertainty)
         #
@@ -1112,13 +1120,15 @@ class operator_transient(operator):
         # --! a flattened sequence of square matrices
         mod_var_gen_ni = fun_nsample * nfun
         mod_var_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
-        self.mod_var_gen = utils_nn.fcnn(feat=[mod_var_gen_ni, 64, 64, mod_var_gen_no], actfun_hid='relu')
+        mod_var_gen_feat = utils_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.mod_var_gen = utils_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
 
         # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
-        pre_dec_ni        = nfun
-        pre_dec_no        = self.param_kernsize * self.ntarget
-        self.pre_mean_dec = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
-        self.pre_var_dec  = utils_nn.fcnn(feat=[pre_dec_ni, 64, 64, pre_dec_no], actfun_hid='relu')
+        pre_dec_ni = nfun
+        pre_dec_no = self.param_kernsize * self.ntarget
+        pre_dec_feat = utils_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.pre_mean_dec = utils_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+        self.pre_var_dec = utils_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
 
     def embed(self, timeseries):
 
