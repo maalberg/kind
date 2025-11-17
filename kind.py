@@ -12,11 +12,9 @@ import time
 import json
 
 import utils_data
+from utils_data import conv_str2ints
+
 import utils_nn
-
-from utils_data import conv_str2ints, minmax_scaler
-
-from matplotlib import pyplot as plt
 
 
 def create_args_parser():
@@ -29,8 +27,6 @@ def create_args_parser():
     parser.add_argument('--data_file', type=str, required=True, default='srfgun', help='data file name without extension and suffix')
     parser.add_argument('--data_ext', type=str, required=False, default='.csv', help='data file extension')
     parser.add_argument('--data_nsample', type=int, required=True, default=200, help='number of samples in timeseries stored in data')
-    parser.add_argument('--data_scale_min', type=float, required=True, default=-1, help='data minimum value when scaled using min-max')
-    parser.add_argument('--data_scale_max', type=float, required=True, default=1, help='data maximum value when scaled using min-max')
     parser.add_argument('--data_train_size', type=float, required=True, default=0.75, help='dataset part to include in training')
     parser.add_argument('--data_test_size', type=float, required=True, default=0.5, help='non-train part to include in test, rest is validation')
     parser.add_argument('--feature_dim', type=conv_str2ints, required=True, default='0', help='list of feature dimensions in data')
@@ -217,38 +213,7 @@ class model_eval(model_mode):
     def forward(self, timeseries):
         """ Uses unnormalized ``timeseries`` to execute a forward pass of KIND model in evaluation mode. """
 
-        # --! combine feature and target dimension indeces into a unique-valued set
-        #dim = self.model.args.feature_dim + self.model.args.target_dim
-        #dim = set(dim)
-
-        # --! collect means of data dimensions into dictionary, where dimension indeces serve as keys
-        #mean = dict([(k, torch.mean(timeseries[:, :, [k]], dim=1, keepdim=True)) for k in dim])
-
-        # --! create scalers for data dimensions as a dictionary, where dimension indeces serve as keys
-        #scaler_range = (self.model.args.data_scale_min, self.model.args.data_scale_max)
-        #scaler = dict([(k, minmax_scaler(scaler_range)) for k in dim])
-
-        # --! scale timeseries
-        #timeseries = torch.cat([timeseries[:, :, [k]] - mean[k] for k in dim], dim=-1)
-        #timeseries = torch.cat([scaler[k].fit_transform(timeseries[:, :, [k]], dim=1) for k in dim], dim=-1)
-
-        #detuning, control, mask = torch.split(timeseries, 1, dim=-1)
-
-        #detuning_mean = torch.mean(detuning, dim=1, keepdim=True)
-        #control_mean = torch.mean(control, dim=1, keepdim=True)
-
-        #scaler_range = (self.model.args.data_scale_min, self.model.args.data_scale_max)
-        #detuning_scaler = minmax_scaler(scaler_range)
-        #control_scaler = minmax_scaler(scaler_range)
-
-        #detuning = detuning - detuning_mean
-        #detuning = detuning_scaler.fit_transform(detuning)
-        #control = control - control_mean
-        #control = control_scaler.fit_transform(control)
-        #control = control * mask
-
-        #timeseries = torch.cat([detuning, control, mask], dim=-1)
-
+        # --! FIXME
         timeseries = self.model._fit_dataset.normalize(timeseries)
 
         # --! having scaled given timeseries, call the scaled version of KIND forward method
@@ -259,23 +224,13 @@ class model_eval(model_mode):
         timeseries_stat = model_output[1]
         timeseries_trans = model_output[3]
 
-        timeseries_pred = self.model._fit_dataset.denormalize(timeseries_pred)
-        timeseries_stat = self.model._fit_dataset.denormalize(timeseries_stat)
-        timeseries_trans = self.model._fit_dataset.denormalize(timeseries_trans)
-
         # --! unscale predicted timeseries
         #
         # --! since the indeces of target dimensions must be present in above dictionaries,
         # --! we use these indeces to directly access the dictionaries
-
-        #timeseries_pred = torch.cat([scaler[k].inverse_transform(timeseries_pred[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
-        #timeseries_pred = torch.cat([timeseries_pred[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
-
-        #timeseries_stat = torch.cat([scaler[k].inverse_transform(timeseries_stat[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
-        #timeseries_stat = torch.cat([timeseries_stat[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
-
-        #timeseries_trans = torch.cat([scaler[k].inverse_transform(timeseries_trans[:, :, [k]]) for k in self.model.args.target_dim], dim=-1)
-        #timeseries_trans = torch.cat([timeseries_trans[:, :, [k]] + mean[k] for k in self.model.args.target_dim], dim=-1)
+        timeseries_pred = self.model._fit_dataset.denormalize(timeseries_pred)
+        timeseries_stat = self.model._fit_dataset.denormalize(timeseries_stat)
+        timeseries_trans = self.model._fit_dataset.denormalize(timeseries_trans)
 
         # --! put unscaled timeseries back to the result tuple and return the tuple
         model_output = list(model_output)
@@ -559,9 +514,6 @@ class fit_stationary_uncertainty(fit_state):
         if validated:
             timeseries = self.mode.model._fit_dataset.normalize(timeseries)
             timeseries_pred_mean = self.mode.model._fit_dataset.normalize(timeseries_pred_mean)
-            #mixmax_range = [self.mode.model.args.data_scale_min, self.mode.model.args.data_scale_max]
-            #timeseries = utils_data.dataset.scale(utils_data.dataset.demean(timeseries, dim=1), dim=1, minmax=mixmax_range)
-            #timeseries_pred_mean = utils_data.dataset.scale(utils_data.dataset.demean(timeseries_pred_mean, dim=1), dim=1, minmax=mixmax_range)
 
         loss_linear = self.apply_criterion_mean(dfun, dfun_pred)
         loss_uncertain = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
@@ -653,9 +605,6 @@ class fit_transient_uncertainty(fit_state):
         if validated:
             timeseries = self.mode.model._fit_dataset.normalize(timeseries)
             timeseries_pred_mean = self.mode.model._fit_dataset.normalize(timeseries_pred_mean)
-            #mixmax_range = [self.mode.model.args.data_scale_min, self.mode.model.args.data_scale_max]
-            #timeseries = utils_data.dataset.scale(utils_data.dataset.demean(timeseries, dim=1), dim=1, minmax=mixmax_range)
-            #timeseries_pred_mean = utils_data.dataset.scale(utils_data.dataset.demean(timeseries_pred_mean, dim=1), dim=1, minmax=mixmax_range)
 
         loss_linear = self.apply_criterion_mean(dfun_pred, dfun)
         loss_recon = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
@@ -1277,9 +1226,6 @@ class operator_transient(operator):
         dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
         dfun_std     = torch.std(dfun, dim=1, keepdim=True)
         dfun         = (dfun - dfun_mean) / (dfun_std + 1e-8)
-        #dfun         = dfun - dfun_mean
-        #scaler       = minmax_scaler(feature_range=(-1, 1))
-        #dfun         = scaler.fit_transform(dfun)
 
         # --! predict the evolution of a function error starting from the first error value upto
         # --! a specified horizon
@@ -1290,8 +1236,6 @@ class operator_transient(operator):
         # --! decoding the right uncertainty magnitudes
         dfun_pre_unsca = torch.cat([dfun_pre, dfun_pre_forecast], dim=1)
         dfun_pre_unsca = dfun_pre_unsca * dfun_std + dfun_mean
-        #dfun_pre_unsca = scaler.inverse_transform(torch.cat([dfun_pre, dfun_pre_forecast], dim=1))
-        #dfun_pre_unsca = dfun_pre_unsca + dfun_mean
 
         # --! decode predicted embeddings to timeseries
         #
