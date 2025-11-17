@@ -2,28 +2,38 @@ import numpy as np
 import scipy as sp
 from filterpy.kalman import KalmanFilter as KF
 
-def filter_detuning(param):
-    """Creates a linear Kalman filter to filter a cavity detuning signal.
-    """
-    dt    = param['dt']
-    omega = 2 * np.pi * param['f']
-    q     = param['q']
-    k     = 2 * np.pi * param['k']
-    a     = np.array([[0, 1], [-omega**2, -omega/q]])
-    b     = np.array([[0], [-k*omega**2]])
+import utils_detuning
 
-    kf    = KF(dim_x=2, dim_z=1)
-    kf.F  = sp.linalg.expm(a * dt)
-    kf.H  = np.array([[1, 0]])
-    kf.B  = b * dt
+def filter_detuning(param):
+    """ Creates a linear Kalman filter to filter a cavity detuning signal. """
+
+    f = param['f']
+    q = param['q']
+    k = param['k']
+    dt = param['dt']
+    kalman_q = param['kalman_q']
+    kalman_r = param['kalman_r']
+
+    # --! create observed process matrices
+    a = utils_detuning.make_mm_a_array(f, q)
+    b = utils_detuning.make_mm_b_array(f, k)
+    c = utils_detuning.make_mm_c_array(len(f))
+
+    # --! there two states (position and velocity) per one mechanical mode frequency
+    nstate = 2 * len(f)
+    nmeas = 1
+
+    # --! create a linear Kalman filter
+    kf = KF(dim_x=nstate, dim_z=nmeas)
+    kf.F = sp.linalg.expm(a * dt)
+    kf.B = b * dt
+    kf.H = c
 
     # initial state and covariances
-    kf.x  = np.array([[0.], [0.]])
-    kf.P *= np.eye(2)   # uncertainty about the initial condition
+    kf.x = np.zeros((nstate, 1))
+    kf.P *= 10. * np.eye(nstate)   # uncertainty about the initial condition
 
-    # --! here is the point: we assume the measurement is noisy, which is not exactly true (the sensor improved),
-    # --! and we overestimate our model knowledge 
-    kf.R *= 0.1  # measurement noise
-    kf.Q *= 0.01  # process uncertainty
+    kf.R *= kalman_r  # measurement noise
+    kf.Q *= kalman_q  # process uncertainty
 
     return kf

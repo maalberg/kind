@@ -1,242 +1,301 @@
 import numpy as np
-
-from scipy.integrate import solve_ivp
+import control as ct
+from collections import namedtuple
 from scipy.linalg import block_diag
 
-from matplotlib import pyplot as plt
+# --! mechanical mode properties --!
+mechanical_mode = namedtuple('mechanical_mode', 'f q k t')
 
-import utils_data
+def make_rf_a(f, q):
+    w     = 2 * np.pi * f
+    hbw   = w/2/q  # < half-bandwidth of an rf cavity in rad/s
 
-def make_a_m(t, f, q, fe: float = 0.):
-    """Make matrix A of a mechanical mode.
+    return np.array([
+        [-hbw,     0.],
+        [ 0.,    -hbw],
+    ])
 
-    The matrix is parameterized by frequency ``f`` in hertz and quality ``q``.
-    The frequency can be made time-varying by setting frequency
-    factor ``fe`` to something else than 0, e.g., if fe > 0,
-    then the frequency will increase with time, and if
-    fe < 0, the frequency will decrease. Time ``t``
-    represents current simulation time.
-    """
-    f = f + fe * t
+def make_rf_b(f, q):
+    w     = 2 * np.pi * f
+    hbw   = w/2/q  # < half-bandwidth of an rf cavity in rad/s
+
+    return np.array([
+        [hbw,    0.],
+        [0.,    hbw],
+    ])
+
+def make_mm_a(f, q):
+    """Constructs the matrix A of a single mechanical mode (mm)."""
     w = 2 * np.pi * f
     return np.array([
         [ 0,             1  ],
-        [-np.square(w), -w/q]])
+        [-np.square(w), -w/q],
+    ])
 
-def make_b_m(t, f, k, fe: float = 0.):
-    f = f + fe * t
+def make_mm_b(f, k):
+    """Constructs the matrix B of a single mechanical mode (mm)."""
     w = 2 * np.pi * f
     return np.array([
-        [0              ],
-        [-k*np.square(w)]])
+        [0               ],
+        [k * np.square(w)],
+    ])
 
-def cavfun(t, x, sim_self):
-    """
-    Executes the logic of cavity differential equations. Input parameters ``t``
-    and ``x`` are time and state, respectively.
-    """
+def make_mm_c():
+    return np.array([[1, 0]])
 
-    pctr_on_rf = sim_self.pctr_on_rf
-    K_rf       = sim_self.K_rf
-    v_rf       = sim_self.v_rf
-    modes_m_n  = sim_self.modes_m_n
-    t_m        = sim_self.t_m
-    a_rf       = sim_self.a_rf
-    b_rf       = sim_self.b_rf
+def make_mm_a_array(f, q):
+    return block_diag(*[make_mm_a(f, q) for f, q in zip(f, q)])
 
-    # --! current state of a cavity field: real and imaginary components
-    x_rf = np.array(x[:2]).reshape((-1, 1))
+def make_mm_b_array(f, k):
+    return np.concatenate([make_mm_b(f, k) for f, k in zip(f, k)], axis=0)
 
-    # --! current states of all mechanical modes: displacements and velocities
-    x_m = np.array(x[2:]).reshape((-1, 1))
+def make_mm_c_array(nf=1):
+    return np.tile(make_mm_c(), nf)
 
-    # --! input to cavity field: real and imaginary parts of a generator voltage
-    u_rf = np.zeros((2, 1))
-    if pctr_on_rf:
-        # --! proportional control is on, so calculate an actuation signal u
-        r_rf = np.array([
-            [v_rf[0]],
-            [v_rf[1]]])
+def make_mm_system(f=np.array([100.]), q=np.array([1000.]), k=np.array([1.]), dt=0.):
+    a = make_mm_a_array(f, q)
+    b = make_mm_b_array(f, k)
+    c = make_mm_c_array(len(f))
+    d = np.array(([[0]]))
 
-        e_rf = r_rf - x_rf
+    return ct.ss(a, b, c, d, dt, name='mm_plant')
 
-        u_rf = K_rf * e_rf
-    else:
-        # --! proportional control is off, so our setpoint becomes our actuation signal
-        u_rf = np.array([
-            [v_rf[0]],
-            [v_rf[1]]])
+def make_lqr(f, q, k, action_cost=1., state_cost=1., dt=0.):
 
-    # --! input to mechanical mode: accelerating field gradient squared
+    lqr_plant = make_mm_system(f=f, q=q, k=k, dt=dt)
+
+    # --! define maximum expected signal values
+    det_max = 1.0      # detuning max [rad/s]
+    vel_max = 200.0    # velocity max [rad/s^2]
+    lqr_max = 1.0     # control max [V]
+    x_norm = np.diag(np.tile([det_max, vel_max], len(f)))
+    u_norm = lqr_max
+
+    # --! normalize plant matrices
+    a_norm = np.linalg.inv(x_norm) @ lqr_plant.A @ x_norm
+    b_norm = np.linalg.inv(x_norm) @ lqr_plant.B * u_norm
+
+    q_norm = np.diag(np.tile([state_cost, 0.1], len(f)))
+    r_norm = np.diag([action_cost])
+
+    k_norm, _, _ = ct.lqr(a_norm, b_norm, q_norm, r_norm)
+
+    return lqr_plant, k_norm @ np.linalg.inv(x_norm)
+
+def make_est(lqr_plant, q=0.1, r=0.1):
+
+    q = np.eye(1) * q
+    r = np.eye(1) * r
+
+    # --! make Q and R symmetric
+    q = q @ q.T
+    r = r @ r.T
+
+    est_gain, _, _ = ct.lqe(lqr_plant, q, r)
+    est_a = lqr_plant.A - est_gain @ lqr_plant.C
+    est_b = np.hstack([est_gain, lqr_plant.B])  # input: [y, u]
+
+    return est_a, est_b
+
+def cavity_update(t, x, u, param):
+
+    # --! get parameters
+    rf_f = param.get('rf_f')
+    rf_q = param.get('rf_q')
+    rf_v = param.get('rf_v')
+    rf_len = param.get('rf_len')
+    mm_control_used = param.get('mm_control_used')
+    mm_f = param.get('mm_f')
+    mm_q = param.get('mm_q')
+    nmm = len(mm_f)
+    mm_k = param.get('mm_k')
+    mm_t = param.get('mm_t')
+
+    # --! extract current state of a cavity field: real and imaginary components
+    rf_x = np.array(x[:2]).reshape((-1, 1))
+
+    # --! extract current states of all mechanical modes: displacements and velocities
+    mm_x = np.array(x[2:]).reshape((-1, 1))
+
+    # --! assemble input to cavity field: real and imaginary parts of a generator voltage
+    rf_u = np.array([
+        [rf_v[0]],
+        [rf_v[1]]
+    ])
+
+    # --! compute input to mechanical mode: accelerating field gradient squared
     #
     # --! field gradient has units MV/m, but since we simulate only one cell,
-    # --! and one cell is approximately 0.1615 meters, then
+    # --! and the length of one cell is passed as a parameter,
     # --! we need to adjust the total gradient
-    grad = np.sqrt(np.square(x_rf[0]) + np.square(x_rf[1]))
-    grad = grad * 0.1615
-    u_m = np.square(grad)
+    rf_grad = np.sqrt(np.square(rf_x[0]) + np.square(rf_x[1]))
+    rf_grad = rf_grad * rf_len
+    rf_grad = np.square(rf_grad)
 
-    # --! update detuning in cavity system dynamics
-    disp_m = np.sum([x_m[2*i] for i in range(modes_m_n)])
-    a_rf[0, 1] = -disp_m
-    a_rf[1, 0] =  disp_m
+    # --! create rf matrices A and B
+    rf_a = make_rf_a(rf_f, rf_q)
+    rf_b = make_rf_b(rf_f, rf_q)
 
-    f_m  = sim_self.f_m
-    fe_m = sim_self.fe_m
-    q_m  = sim_self.q_m
+    # --! update detuning in rf matrix A
+    mm_disp = np.sum([mm_x[2*j] for j in range(nmm)])
+    rf_a[0, 1] = -mm_disp
+    rf_a[1, 0] =  mm_disp
 
-    k_m = np.ones_like(f_m) * 2 * np.pi * 1. # coupling with units (2 * pi * Hz) / (MV/m)^2
+    # --! assemble mechanical mode matrices: A and B
+    mm_a = block_diag(*[make_mm_a(f, q) for f, q in zip(mm_f, mm_q)])
+    mm_b_field = np.concatenate([make_mm_b(f, k) for f, k in zip(mm_f, mm_k)], axis=0)
+    mm_b_control = np.concatenate([make_mm_b(f, k) for f, k in zip(mm_f, mm_k)], axis=0)
 
-    # --! assemble mechanical system and input matrices, A and B
-    a_m = block_diag(*[make_a_m(t, f, q, fe) for f, fe, q in zip(f_m, fe_m, q_m)])
-    b_m = np.concatenate([make_b_m(t, f, k, fe) for f, fe, k in zip(f_m, fe_m, k_m)], axis=0)
-
-    # --! create an additional instance of mechanical matrix B and split it into
-    # --! per-mode submatrices
-    b_m_var  = b_m
-    bs_m_var = np.split(b_m_var, b_m_var.shape[0] // 2, axis=0)
+    # --! split matrix B of mechanical modes into per-mode B matrices
+    mm_b_mode = np.split(mm_b_field, mm_b_field.shape[0] // 2, axis=0)
 
     # --! split mechanical time boundary array into per-mode parts
-    ts_m = np.split(t_m, t_m.shape[0], axis=0) # split into rows
+    mm_t_mode = np.split(mm_t, mm_t.shape[0], axis=0) # split into rows
 
-    for mat, timespan in zip(bs_m_var, ts_m):
+    for mat, timespan in zip(mm_b_mode, mm_t_mode):
         if not (timespan[0, 0] <= t and t < timespan[0, 1]):
             mat[:] = 0.
 
+    # --! mechanical modes are excited by field gradient ...
+    mm_u_field = rf_grad
+
+    mm_u_control = 0.
+    if mm_control_used:
+        # --! ... and compensated by control (if used)
+        mm_u_control = u
+
     # --! calculate derivatives
-    dx_rf = a_rf @ x_rf + b_rf    @ u_rf
-    dx_m  = a_m  @ x_m  + b_m_var * u_m
+    rf_dx = rf_a @ rf_x + rf_b @ rf_u
+    mm_dx = mm_a @ mm_x + mm_b_field * mm_u_field + mm_b_control * mm_u_control
 
     return np.array([
-        *dx_rf.flatten(),
-        *dx_m.flatten()])
+        *rf_dx.flatten(),
+        *mm_dx.flatten(),
+    ])
 
+def cavity_output(t, x, u, param):
+    """ Outputs summed positions of all mechanical modes, i.e. cavity detuning. """
+    mm_x = x[2:]
+    nmm  = len(mm_x) // 2
+    mm_d = np.sum([mm_x[2*j] for j in range(nmm)])
+    return np.array([mm_d])
 
-class detuning_sim:
-    def __init__(self, config):
+def estimator_update(t, x, u, param):
 
-        q_rf       = config['q_rf']
-        f_rf       = config['f_rf']
-        w_rf       = 2 * np.pi * f_rf
-        w_hbw_rf   = w_rf/2/q_rf  # half-bandwidth of RF cavity in rad/s
-        f_hbw_rf   = w_hbw_rf/2/np.pi
-        self.t_rf  = round(1/f_hbw_rf, 2)
+    est_a = param.get('est_a')
+    est_b = param.get('est_b')
+    est_x = np.array(x).reshape((-1, 1))
+    est_u = np.array(u).reshape((-1, 1))
 
-        print(f'inf >> half-bandwidth of this radio frequency cavity is {f_hbw_rf:.2f} Herz')
-        print(f'inf >> cavity filling time is {self.t_rf:.2f} seconds')
+    est_dx = est_a @ est_x + est_b @ est_u
 
-        self.a_rf = np.array([
-            [-w_hbw_rf,  0.      ],
-            [ 0.,       -w_hbw_rf]])
+    return np.array([
+        *est_dx.flatten(),
+    ])
 
-        self.b_rf = np.array([
-            [w_hbw_rf, 0       ],
-            [0,        w_hbw_rf]])
+def estimator_output(t, x, u, param):
+    return np.array([x])
 
-        self.pctr_on_rf = config['pctr_on_rf']
-        self.K_rf       = config['K_rf']
-        self.v_rf       = config['v_rf']
+def control_output(t, x, u, param):
 
-        # --! additional placeholders for the properties of cavity mechanical modes
-        self.modes_m_n  = None
-        self.t_m        = None
+    # --! get parameters
+    lqr_gain = param.get('lqr_gain')
 
-    def __call__(self, param, start: int=10, noise=None):
-        """Simulates detuning according to given parameters ``param``."""
+    est_x = np.array(u).reshape((-1, 1))
+    return -(lqr_gain @ est_x)
 
-        # --! simulate with different parameters
-        sim_o = [self.__sim(p) for p in param]
+def sim_cavity_control(t,
+                       start_jsample=0, end_jsample=200,
+                       lqr_used=False, lqr_q=1., lqr_r=1.,
+                       est_q=1., est_r=1.,
+                       mm_f=np.array([40.]), mm_q=np.array([400.]), mm_k=np.array([1.]), mm_t=np.array([[-1., -1.]]),
+                       control_f=np.array([40.]), control_q=np.array([400.]), control_k=np.array([1.]),
+                       plotted=False,
+                       solve_method='RK45'):
+    """ Simulates cavity equations under control. """
 
-        # --! sum detuning
-        #
-        # --! the first two data in y are rf i and q, after that come mechanical modes
-        # --! as displacement and velocity
-        detuning = [self.__sum(o.y[2:]) for o in sim_o]
-
-        # --! skip the first transient samples and reshape detuning row arrays into column arrays
-        detuning = [d[:, start:].T for d in detuning]
-
-        # --! add noise if specified
-        if noise is not None:
-            detuning = [d + np.random.normal(0, noise, size=d.shape) for d in detuning]
-
-        return detuning
-
-    def __sim(self, param):
-        """
-        Simulate a cavity resonance detuning by solving the cavity differential equation.
-        The equation is parameterized using ``param``.
-        """
-
-        self.f_m  = param['f_m']
-        self.fe_m = param['fe_m']
-        self.q_m  = param['q_m']
-
-        self.modes_m_n = len(self.f_m)
-        print(f'inf >> number of mechanical modes specified: {self.modes_m_n}')
-
-        # --! define timing parameters
-        t_span = [0, param['t_rf_n'] * self.t_rf]
-        dt     = param['dt']
-        t      = np.arange(t_span[0], t_span[1], dt)
-
-        # --! create a mechanical time boundary matrix, where
-        # --! 'dont care' parameter -1 is replaced
-        # --! by the actual time boundaries
-        self.t_m = param['t_m']
-        for timespan in np.split(self.t_m, self.t_m.shape[0], axis=0): # split into rows
-            if timespan[0, 0] == -1:
+    # --! actualize time boundaries
+    for timespan in np.split(mm_t, mm_t.shape[0], axis=0): # split into rows
+            if timespan[0, 0]==-1.:
                 timespan[0, 0] = t[0]
-            if timespan[0, 1] == -1:
+            if timespan[0, 1]==-1.:
                 timespan[0, 1] = t[-1]
 
-        # --! every mechanical mode has two states:
-        # --! 1. displacement
-        # --! 2. velocity
-        modes_m = np.zeros(self.modes_m_n * 2)
+    # --! prepare parameters for cavity plant simulation
+    cavity_param = {
+        'rf_f' : 1.3e9,
+        'rf_q' : 4e6,
+        'rf_v' : [9.5, 0.],
+        'rf_len' : 0.1615,
+        'mm_control_used' : lqr_used,
+        'mm_f' : mm_f,
+        'mm_q' : mm_q,
+        'mm_k' : mm_k,
+        'mm_t' : mm_t,
+    }
 
-        # --! define zero initial conditions
-        x0 = [
-            0,         # cavity field real
-            0,         # cavity field imaginary
-            *modes_m ] # all mechanical modes
+    # --! number of cavity states includes two rf states and the number of mechaical modes times two
+    nstate = 2 + 2 * len(cavity_param.get('mm_f'))
 
-        # --! simulate
-        return solve_ivp(cavfun, t_span, x0, method='RK45', t_eval=t, args=(self,))
+    # --! wrap a cavity plant in a nonlinear input/output system
+    cavity = ct.nlsys(
+        cavity_update, cavity_output,
+        states=nstate,
+        name='cavity',
+        inputs=1, outputs=1,
+        params=cavity_param)
 
-    def __sum(self, modes):
-        """
-        Detuning is a sum of mechanical mode displacements. Input ``modes``
-        is shaped as [N, T], where N and T are the number of modes
-        and the length of time series, respectively.
-        """
-        summed = np.zeros_like(modes[:2])
+    # --! create cavity control
+    lqr_plant, lqr_gain = make_lqr(f=control_f, q=control_q, k=control_k,
+                                   state_cost=lqr_q, action_cost=lqr_r)
 
-        modes_n = len(modes) // 2
+    est_a, est_b = make_est(lqr_plant, q=est_q, r=est_r)
+    estimator_param = {
+        'est_a': est_a,
+        'est_b': est_b,
+    }
+    est_plant_nstate = lqr_plant.nstates
+    estimator = ct.nlsys(
+        estimator_update, estimator_output,
+        name='estimator',
+        states=est_plant_nstate,
+        inputs=2, outputs=est_plant_nstate,
+        params=estimator_param
+    )
 
-        # --! sum displacements
-        for i in range(modes_n):
-            summed[0] = summed[0] + modes[2*i]
-            summed[1] = summed[1] + modes[2*i + 1]
-        return summed
+    control_param = {
+        'lqr_gain': lqr_gain,
+    }
+    control = ct.nlsys(
+        None, control_output,
+        name='control',
+        inputs=est_plant_nstate, outputs=1,
+        params=control_param
+    )
 
-    def disp(self, detuning, timestep=0.001):
+    # --! build a closed loop system
+    cavity_closed = ct.interconnect(
+        [control, estimator, cavity],
+        connections=[
+            ['cavity.u', 'control.y'],
+            ['estimator.u[0]', 'cavity.y'],
+            ['estimator.u[1]', 'control.y'],
+            ['control.u', 'estimator.y'],
+        ],
+        outlist=['cavity.y', 'control.y'],
+        outputs=['dw', 'pzt'],
+    )
 
-        l = len(detuning[:, 0])
-        t = np.arange(0., l*timestep, timestep)
+    # --! display input-output response
+    resp = ct.input_output_response(cavity_closed, t, solve_ivp_method=solve_method)
+    if plotted:
+        resp.plot(plot_inputs=False)
 
-        plt.figure(figsize=(6, 3))
-        plt.subplot(1, 2, 1)
-        plt.plot(t, detuning[:, 0])
-        plt.xlabel('Time [s]')
-        plt.ylabel('Detuning [rad/s]')
-        plt.tight_layout()
+    timeseries_nsample = end_jsample - start_jsample#resp.outputs[0].shape[0] - skip_nsample
 
-        plt.subplot(1, 2, 2)
-        plt.plot(t, detuning[:, 1])
-        plt.xlabel('Time [s]')
-        plt.ylabel('dDetuning/dt [rad/s^2]')
-        plt.tight_layout()
-
-        plt.show()
+    return np.concatenate(
+        [
+            resp.outputs[0][start_jsample:end_jsample].reshape(-1, 1),
+            resp.outputs[1][start_jsample:end_jsample].reshape(-1, 1),
+        ], axis=1).reshape(-1, timeseries_nsample, 2)
 
