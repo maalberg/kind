@@ -16,23 +16,23 @@ from sklearn.model_selection import train_test_split
 class dataset_factory:
     def create_dataset(self, args):
 
-        if args.data_name=='kind-detuning-filter':
+        if args.dataset_id=='kind-detuning-filter':
             return dataset_detuning_filter(
-                args.data_dir, args.data_file, args.data_ext,
+                args.file_dir, args.file_name, args.file_ext,
                 args.data_nsample,
                 (args.data_train_size, args.data_test_size),
                 args.batch_size, (args.lookback_nsample, args.forecast_nsample))
 
-        if args.data_name=='kind-detuning-meas':
+        if args.dataset_id=='kind-detuning-meas':
             return dataset_detuning_meas(
-                args.data_dir, args.data_file, args.data_ext,
+                args.file_dir, args.file_name, args.file_ext,
                 args.data_nsample,
                 (args.data_train_size, args.data_test_size),
                 args.batch_size, (args.lookback_nsample, args.forecast_nsample))
 
-        if args.data_name=='kind-detuning-raw':
+        if args.dataset_id=='kind-detuning-raw':
             return dataset_detuning_raw(
-                args.data_dir, args.data_file, args.data_ext,
+                args.file_dir, args.file_name, args.file_ext,
                 args.data_nsample,
                 (args.data_train_size, args.data_test_size),
                 args.batch_size, (args.lookback_nsample, args.forecast_nsample))
@@ -44,11 +44,11 @@ class dataset_factory:
 class dataset(interface):
 
     def __init__(self,
-                 data_dir, data_file, data_ext, data_nsample,
-                 data_split_size, batch_size, window_nsample):
-        self.data_dir = data_dir
-        self.data_file = data_file
-        self.data_ext = data_ext
+                 file_dir, file_name, file_ext,
+                 data_nsample, data_split_size, batch_size, window_nsample):
+        self.file_dir = file_dir
+        self.file_name = file_name
+        self.file_ext = file_ext
         self.data_nsample = data_nsample
         self.split_size = data_split_size
         self.batch_size = batch_size
@@ -185,11 +185,11 @@ class dataset_detuning_raw(dataset):
     min_std = torch.tensor(1e-3, dtype=torch.float32)
 
     def __init__(self,
-                 data_dir, data_file, data_ext,
+                 file_dir, file_name, file_ext,
                  data_nsample,
                  data_split_size,
                  batch_size, window_nsample):
-        super().__init__(data_dir, data_file, data_ext,
+        super().__init__(file_dir, file_name, file_ext,
                          data_nsample, data_split_size,
                          batch_size, window_nsample)
 
@@ -197,8 +197,8 @@ class dataset_detuning_raw(dataset):
         self.std = self.min_std
 
     def make_path(self, data_type='stat'):
-        data_file = self.data_file + '_raw' + self.data_ext
-        return os.path.join(self.data_dir, data_file)
+        file_name = self.file_name + '_raw' + self.file_ext
+        return os.path.join(self.file_dir, file_name)
 
     def extract_target(self, window):
         return window[:, :, [0]]
@@ -256,11 +256,11 @@ class dataset_detuning_filter(dataset):
     min_std = torch.tensor(1e-3, dtype=torch.float32)
 
     def __init__(self,
-                 data_dir, data_file, data_ext,
+                 file_dir, file_name, file_ext,
                  data_nsample,
                  data_split_size,
                  batch_size, window_nsample):
-        super().__init__(data_dir, data_file, data_ext,
+        super().__init__(file_dir, file_name, file_ext,
                          data_nsample, data_split_size,
                          batch_size, window_nsample)
 
@@ -268,8 +268,8 @@ class dataset_detuning_filter(dataset):
         self.std = self.min_std
 
     def make_path(self, data_type='stat'):
-        data_file = self.data_file + '_stat' + self.data_ext
-        return os.path.join(self.data_dir, data_file)
+        file_name = self.file_name + '_stat' + self.file_ext
+        return os.path.join(self.file_dir, file_name)
 
     def extract_target(self, window):
         return window[:, :, [0]]
@@ -330,11 +330,11 @@ class dataset_detuning_meas(dataset):
     min_std = torch.tensor(1e-3, dtype=torch.float32)
 
     def __init__(self,
-                 data_dir, data_file, data_ext,
+                 file_dir, file_name, file_ext,
                  data_nsample,
                  data_split_size,
                  batch_size, window_nsample):
-        super().__init__(data_dir, data_file, data_ext,
+        super().__init__(file_dir, file_name, file_ext,
                          data_nsample, data_split_size,
                          batch_size, window_nsample)
 
@@ -342,8 +342,8 @@ class dataset_detuning_meas(dataset):
         self.std = self.min_std
 
     def make_path(self, data_type='stat'):
-        data_file = self.data_file + '_' + data_type + self.data_ext
-        return os.path.join(self.data_dir, data_file)
+        file_name = self.file_name + '_' + data_type + self.file_ext
+        return os.path.join(self.file_dir, file_name)
 
     def extract_target(self, window):
         return window[:, :, [0]]
