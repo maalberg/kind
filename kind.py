@@ -12,8 +12,6 @@ import time
 import json
 
 import utils_data
-from utils_data import conv_str2ints
-
 import utils_nn
 
 
@@ -29,8 +27,7 @@ def create_args_parser():
     parser.add_argument('--data_nsample', type=int, required=True, default=200, help='number of samples in timeseries stored in data')
     parser.add_argument('--data_train_size', type=float, required=True, default=0.75, help='dataset part to include in training')
     parser.add_argument('--data_test_size', type=float, required=True, default=0.5, help='non-train part to include in test, rest is validation')
-    parser.add_argument('--feature_dim', type=conv_str2ints, required=True, default='0', help='list of feature dimensions in data')
-    parser.add_argument('--mask_dim', type=conv_str2ints, required=True, default='0', help='list of mask dimensions in data')
+    parser.add_argument('--feature_ndim', type=int, required=True, help='number of feature dimensions in data')
     parser.add_argument('--target_ndim', type=int, required=True, help='number of target dimensions in data')
 
     # --! forecasting arguments
@@ -629,11 +626,10 @@ class operator(torch.nn.Module, interface):
         super().__init__()
 
         # --! store mutual configuration inside this base class
-        self.nfeature = len(args.feature_dim)
+        self.nfeature = args.feature_ndim
         self.ntarget = args.target_ndim
-        self.nmask = len(args.mask_dim)
-        self.lookback_nsample = args.lookback_nsample
-        self.forecast_nsample = args.forecast_nsample
+        self.back_nsample = args.lookback_nsample
+        self.fore_nsample = args.forecast_nsample
 
     @abstractmethod
     def embed(self, timeseries):
@@ -750,31 +746,31 @@ class operator_stationary(operator):
         self.fun            = self._respec_fun(args.fun_stat)
         self.param_kernsize = args.seg_nsample_stat
 
-        if self.forecast_nsample % self.param_kernsize:
+        if self.fore_nsample % self.param_kernsize:
             raise Exception('the number of forecast samples must be a multiple of a kernel size!')
-        self.fun_nsample_forecast  = self.forecast_nsample // self.param_kernsize
+        self.fun_nsample_forecast  = self.fore_nsample // self.param_kernsize
 
         # --! here the function configuration is already respecified, such that it is convenient
         # --! to get the total number of required function parameters
         nparam      = sum(self.fun.values())
-        fun_nsample = self.lookback_nsample // self.param_kernsize
+        fun_nsample = self.back_nsample // self.param_kernsize
 
         # --! create an encoder to encode timeseries into embedded functions
         #
         # --! more precisely, input timeseries are partitioned into slices, and the encoder
         # --! encodes slice-specific kernels for every function parameter
         # --! in the embedded (latent) space
-        fun_enc_ni   = self.param_kernsize * (self.nfeature + self.nmask)
-        fun_enc_no   = nparam * self.param_kernsize * (self.nfeature + self.nmask)
+        fun_enc_ni   = self.param_kernsize * self.nfeature
+        fun_enc_no   = nparam * self.param_kernsize * self.nfeature
         fun_enc_feat = utils_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
         self.fun_enc = utils_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
 
-        if (self.nfeature + self.nmask) > 1:
+        if self.nfeature > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
             # --! basis functions, such that only the number of these basis functions
             # --! influences the order of the DMD matrix, whereas the number of data
             # --! dimensions has no effect on the order
-            fun_prune_ni = nfun * (self.nfeature + self.nmask)
+            fun_prune_ni = nfun * self.nfeature
             fun_prune_no = nfun
             self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
@@ -812,8 +808,8 @@ class operator_stationary(operator):
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
-        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, (self.nfeature + self.nmask))
-        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * (self.nfeature + self.nmask))
+        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
+        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
 
         # --! based on inputs, encode parameter kernels (filters)
         kern = self.fun_enc(i)
@@ -830,12 +826,12 @@ class operator_stationary(operator):
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize * (self.nfeature + self.nmask))
+            self.param_kernsize * self.nfeature)
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize, (self.nfeature + self.nmask))
-        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature + self.nmask)
+            self.param_kernsize, self.nfeature)
+        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
 
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
@@ -852,7 +848,7 @@ class operator_stationary(operator):
         fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(fun) if (self.nfeature + self.nmask) > 1 else fun
+        return self.fun_prune(fun) if self.nfeature > 1 else fun
 
     def predict_mean(self, functions):
 
@@ -972,7 +968,7 @@ class operator_stationary(operator):
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.fun_enc)
-        if (self.nfeature + self.nmask) > 1:
+        if self.nfeature > 1:
             utils_nn.freeze_module(self.fun_prune)
         utils_nn.freeze_module(self.mod_mean)
         utils_nn.freeze_module(self.pre_mean_dec)
@@ -983,7 +979,7 @@ class operator_stationary(operator):
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
-        if (self.nfeature + self.nmask) > 1:
+        if self.nfeature > 1:
             utils_nn.unfreeze_module(self.fun_prune)
         utils_nn.unfreeze_module(self.mod_mean)
         utils_nn.unfreeze_module(self.mod_var_gen)
@@ -1010,31 +1006,31 @@ class operator_transient(operator):
         self.fun            = self._respec_fun(args.fun_trans)
         self.param_kernsize = args.seg_nsample_trans
 
-        if self.forecast_nsample % self.param_kernsize:
+        if self.fore_nsample % self.param_kernsize:
             raise Exception('the number of forecast samples must be a multiple of a kernel size!')
-        self.fun_nsample_forecast  = self.forecast_nsample // self.param_kernsize
+        self.fun_nsample_forecast  = self.fore_nsample // self.param_kernsize
 
         # --! here the function configuration is already respecified, such that it is convenient
         # --! to get the total number of required function parameters
         nparam = sum(self.fun.values())
-        fun_nsample = self.lookback_nsample // self.param_kernsize
+        fun_nsample = self.back_nsample // self.param_kernsize
 
         # --! create an MLP-based encoder to encode timeseries into embedded functions
         #
         # --! more precisely, input timeseries are partitioned into slices, and the encoder
         # --! encodes slice-specific kernels for every function parameter
         # --! in the embedded (latent) space
-        fun_enc_ni   = self.param_kernsize * (self.nfeature + self.nmask)
-        fun_enc_no   = nparam * self.param_kernsize * (self.nfeature + self.nmask)
+        fun_enc_ni   = self.param_kernsize * self.nfeature
+        fun_enc_no   = nparam * self.param_kernsize * self.nfeature
         fun_enc_feat = utils_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
         self.fun_enc = utils_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
 
-        if (self.nfeature + self.nmask) > 1:
+        if self.nfeature > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
             # --! basis functions, such that only the number of these basis functions
             # --! influences the order of linear matrices and the number of data
             # --! dimensions has no effect on that order
-            fun_prune_ni = nfun * (self.nfeature + self.nmask)
+            fun_prune_ni = nfun * self.nfeature
             fun_prune_no = nfun
             self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
@@ -1089,8 +1085,8 @@ class operator_transient(operator):
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
-        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature + self.nmask)
-        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * (self.nfeature + self.nmask))
+        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
+        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
 
         # --! based on inputs, encode parameter kernels (filters)
         kern = self.fun_enc(i)
@@ -1107,12 +1103,12 @@ class operator_transient(operator):
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize * (self.nfeature + self.nmask))
+            self.param_kernsize * self.nfeature)
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize, self.nfeature + self.nmask)
-        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature + self.nmask)
+            self.param_kernsize, self.nfeature)
+        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
 
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
@@ -1131,7 +1127,7 @@ class operator_transient(operator):
         fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(fun) if (self.nfeature + self.nmask) > 1 else fun
+        return self.fun_prune(fun) if self.nfeature > 1 else fun
 
     def predict_mean(self, functions):
 
@@ -1253,7 +1249,7 @@ class operator_transient(operator):
 
     def freeze_mean(self):
         utils_nn.freeze_module(self.fun_enc)
-        if (self.nfeature + self.nmask) > 1:
+        if self.nfeature > 1:
             utils_nn.freeze_module(self.fun_prune)
         utils_nn.freeze_module(self.mod_mean_att_enc)
         utils_nn.freeze_module(self.mod_mean_gen)
@@ -1265,7 +1261,7 @@ class operator_transient(operator):
 
     def unfreeze(self):
         utils_nn.unfreeze_module(self.fun_enc)
-        if (self.nfeature + self.nmask) > 1:
+        if self.nfeature > 1:
             utils_nn.unfreeze_module(self.fun_prune)
         utils_nn.unfreeze_module(self.mod_mean_att_enc)
         utils_nn.unfreeze_module(self.mod_mean_gen)
