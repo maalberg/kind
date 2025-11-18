@@ -66,8 +66,8 @@ class dataset(interface):
             # --! update normalization statistics
             self.init_normalization(torch.cat([timeseries_stat, timeseries_trans]))
 
-            window_stat = self.extract_windows(timeseries_stat)
-            window_trans = self.extract_windows(timeseries_trans)
+            window_stat = self.extract_window(timeseries_stat)
+            window_trans = self.extract_window(timeseries_trans)
 
             # --! ensure both data have the same size in the first dimension
             nwindow = window_stat.shape[0] if window_stat.shape[0] < window_trans.shape[0] else window_trans.shape[0]
@@ -75,22 +75,22 @@ class dataset(interface):
             window_trans = window_trans[:nwindow]
 
             # --! interleave both data to lay out windows as stationary, transient, stationary, transient, etc.
-            windows = torch.stack([window_stat, window_trans], dim=1)
-            windows = torch.flatten(windows, start_dim=0, end_dim=1)
+            window = torch.stack([window_stat, window_trans], dim=1)
+            window = torch.flatten(window, start_dim=0, end_dim=1)
         else:
             timeseries = self.read_timeseries(self.make_path(data_type))
 
             # --! update normalization statistics
             self.init_normalization(timeseries)
 
-            windows = self.extract_windows(timeseries)
+            window = self.extract_window(timeseries)
 
         # --! adapt control mask in read data windows to comply with current dataset use case
-        windows = self.adapt_mask(windows)
-        windows = self.noise(windows)
+        window = self.adapt_mask(window)
+        window = self.noise(window)
 
         # --! split data into train, valid and test partitions
-        train_data, valid_test_data = train_test_split(windows, train_size=self.split_size[0], shuffle=True)
+        train_data, valid_test_data = train_test_split(window, train_size=self.split_size[0], shuffle=True)
         valid_data, test_data = train_test_split(valid_test_data, test_size=self.split_size[1], shuffle=True)
 
         # --! normalize training data
@@ -118,8 +118,13 @@ class dataset(interface):
         return
 
     @abstractmethod
-    def adapt_mask(self, windows):
-        """ Adapts mask data dimension in ``windows`` to the use in current dataset. """
+    def extract_target(self, window):
+        """ Extracts target dimension from given ``window``. """
+        return
+
+    @abstractmethod
+    def adapt_mask(self, window):
+        """ Adapts mask data dimension in ``window`` to the use in current dataset. """
         return
 
     def read_timeseries(self, path):
@@ -148,7 +153,7 @@ class dataset(interface):
     def noise(self, window):
         return
 
-    def extract_windows(self, timeseries):
+    def extract_window(self, timeseries):
         """ Extracts windows from ``timeseries`` in a rolling window manner. """
 
         # --! prepare to extract data windows
@@ -195,10 +200,13 @@ class dataset_detuning_raw(dataset):
         data_file = self.data_file + '_raw' + self.data_ext
         return os.path.join(self.data_dir, data_file)
 
-    def adapt_mask(self, windows):
+    def extract_target(self, window):
+        return window[:, :, [0]]
+
+    def adapt_mask(self, window):
 
         # --! mask stays as it is
-        return windows
+        return window
 
     def init_normalization(self, timeseries):
 
@@ -263,10 +271,13 @@ class dataset_detuning_filter(dataset):
         data_file = self.data_file + '_stat' + self.data_ext
         return os.path.join(self.data_dir, data_file)
 
-    def adapt_mask(self, windows):
+    def extract_target(self, window):
+        return window[:, :, [0]]
+
+    def adapt_mask(self, window):
 
         # --! mask stays as it is
-        return windows
+        return window
 
     def init_normalization(self, timeseries):
 
@@ -334,12 +345,15 @@ class dataset_detuning_meas(dataset):
         data_file = self.data_file + '_' + data_type + self.data_ext
         return os.path.join(self.data_dir, data_file)
 
-    def adapt_mask(self, windows):
+    def extract_target(self, window):
+        return window[:, :, [0]]
+
+    def adapt_mask(self, window):
 
         # --! mask stays as it is
-        return windows
+        return window
 
-    def extract_windows(self, timeseries):
+    def extract_window(self, timeseries):
 
         # --! given time series should already contain windows
         return timeseries

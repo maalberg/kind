@@ -30,8 +30,8 @@ def create_args_parser():
     parser.add_argument('--data_train_size', type=float, required=True, default=0.75, help='dataset part to include in training')
     parser.add_argument('--data_test_size', type=float, required=True, default=0.5, help='non-train part to include in test, rest is validation')
     parser.add_argument('--feature_dim', type=conv_str2ints, required=True, default='0', help='list of feature dimensions in data')
-    parser.add_argument('--target_dim', type=conv_str2ints, required=True, default='0', help='list of target dimensions in data')
     parser.add_argument('--mask_dim', type=conv_str2ints, required=True, default='0', help='list of mask dimensions in data')
+    parser.add_argument('--target_ndim', type=int, required=True, help='number of target dimensions in data')
 
     # --! forecasting arguments
     parser.add_argument('--lookback_nsample', type=int, required=True, default=96, help='number of samples in a lookback window')
@@ -299,7 +299,7 @@ class model_fit(model_mode):
                 truth = torch.cat([back, fore], dim=1)
 
                 # --! extract target dimensions
-                truth = truth[:, :, self.model.args.target_dim]
+                truth = dataset.extract_target(truth)
 
                 model_optim.zero_grad()
 
@@ -314,8 +314,8 @@ class model_fit(model_mode):
                 model_optim.step()
 
             train_loss = np.average(train_loss)
-            valid_loss = self.validate(valid_loader)
-            test_loss = self.validate(test_loader)
+            valid_loss = self.validate(dataset, valid_loader)
+            test_loss = self.validate(dataset, test_loader)
 
             print(f'\tepoch {epoch+1} losses: train={train_loss:.6f}, valid={valid_loss:.6f}, test={test_loss:.6f}')
 
@@ -352,7 +352,7 @@ class model_fit(model_mode):
     def set_state(self, state):
         self._state = state
 
-    def validate(self, data_loader):
+    def validate(self, dataset, data_loader):
 
         total_loss = []
 
@@ -368,7 +368,7 @@ class model_fit(model_mode):
                 truth = torch.cat([back, fore], dim=1)
 
                 # --! extract target dimensions
-                truth = truth[:, :, self.model.args.target_dim]
+                truth = dataset.extract_target(truth)
 
                 loss = self.get_state().compute_loss(truth, self.get_state().forward(back), validated=True)
                 total_loss.append(loss)
@@ -630,7 +630,7 @@ class operator(torch.nn.Module, interface):
 
         # --! store mutual configuration inside this base class
         self.nfeature = len(args.feature_dim)
-        self.ntarget = len(args.target_dim)
+        self.ntarget = args.target_ndim
         self.nmask = len(args.mask_dim)
         self.lookback_nsample = args.lookback_nsample
         self.forecast_nsample = args.forecast_nsample
