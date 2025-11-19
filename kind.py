@@ -68,8 +68,6 @@ class model(torch.nn.Module):
 
         self.args = args
 
-        self._fit_dataset = None
-
         # --! declare KIND operators
         self.stationary = operator_stationary(args)
         self.transient = operator_transient(args)
@@ -87,9 +85,9 @@ class model(torch.nn.Module):
         """ Fits this KIND model to given ``dataset`` according to the model's current mode and fit state. """
         return self._get_mode().fit(dataset)
 
-    def forward(self, timeseries):
+    def forward(self, dataset, timeseries):
         """ Uses given ``timeseries`` to execute a forward pass of this model according to current mode. """
-        return self._get_mode().forward(timeseries)
+        return self._get_mode().forward(dataset, timeseries)
 
     def train(self, mode=True):
         """ Switches this model mode according to ``mode``: True - go to fit, False - go to evaluation mode. """
@@ -152,16 +150,16 @@ class model_mode(interface):
         return
 
     @abstractmethod
-    def forward(self, timeseries):
+    def forward(self, dataset, timeseries):
         """ Executes a forward pass on given ``timeseries`` according to current mode of this KIND model. """
         return
 
-    def _forward_scaled(self, timeseries):
-        """ Uses scaled ``timeseries`` to execute a forward pass of this KIND model. """
+    def _forward_norm(self, window):
+        """ Executes a forward pass through this model using normalized data ``window``. """
 
         # --! execute both operators on given time series
-        timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model.stationary(timeseries)
-        timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model.transient(timeseries)
+        timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model.stationary(window)
+        timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model.transient(window)
 
         # --! derive alpha
         timeseries_stat_var  = torch.exp(timeseries_stat_logvar) + 1e-6
@@ -207,27 +205,27 @@ class model_eval(model_mode):
         """ Returns immediately as KIND model is currently in evaluation mode. """
         return
 
-    def forward(self, timeseries):
-        """ Uses unnormalized ``timeseries`` to execute a forward pass of KIND model in evaluation mode. """
+    def forward(self, dataset, window):
+        """ Executes a forward pass through this model using denormalized ``window`` loaded from given ``dataset``. """
 
-        # --! FIXME
-        timeseries = self.model._fit_dataset.normalize(timeseries)
+        # --! normalize data
+        timeseries = dataset.normalize(window)
 
-        # --! having scaled given timeseries, call the scaled version of KIND forward method
-        model_output = self._forward_scaled(timeseries)
+        # --! having normalized given data, call the normalized version of KIND forward method
+        model_output = self._forward_norm(timeseries)
 
         # --! extract to-be-unscaled timeseries from the forwarded result
         timeseries_pred = model_output[0]
         timeseries_stat = model_output[1]
         timeseries_trans = model_output[3]
 
-        # --! unscale predicted timeseries
+        # --! denormalize predicted timeseries
         #
         # --! since the indeces of target dimensions must be present in above dictionaries,
         # --! we use these indeces to directly access the dictionaries
-        timeseries_pred = self.model._fit_dataset.denormalize(timeseries_pred)
-        timeseries_stat = self.model._fit_dataset.denormalize(timeseries_stat)
-        timeseries_trans = self.model._fit_dataset.denormalize(timeseries_trans)
+        timeseries_pred = dataset.denormalize(timeseries_pred)
+        timeseries_stat = dataset.denormalize(timeseries_stat)
+        timeseries_trans = dataset.denormalize(timeseries_trans)
 
         # --! put unscaled timeseries back to the result tuple and return the tuple
         model_output = list(model_output)
@@ -273,9 +271,6 @@ class model_fit(model_mode):
 
         args = self.model.args
 
-        # --! FIX ME - this may not be the best way to get access to dataset normalization methods
-        self.model._fit_dataset = dataset
-
         # --! make model initializations, data loading, optimizer selection, etc.
         #
         # --! select optimizer after initializing this model!
@@ -301,7 +296,7 @@ class model_fit(model_mode):
                 model_optim.zero_grad()
 
                 # --! forward pass
-                loss = self.get_state().compute_loss(truth, self.get_state().forward(back))
+                loss = self.get_state().compute_loss(dataset, truth, self.get_state().forward(dataset, back))
                 train_loss.append(loss.item())
 
                 # --! backward pass
@@ -327,9 +322,9 @@ class model_fit(model_mode):
         self.model.load_state_dict(torch.load(best_model_path, weights_only=True))
         return
 
-    def forward(self, timeseries):
-        """ Executes a forward pass on scaled ``timeseries`` in fit mode. """
-        return self._forward_scaled(timeseries)
+    def forward(self, dataset, timeseries):
+        """ Executes a forward pass on normalized ``timeseries`` in fit mode. """
+        return self._forward_norm(timeseries)
 
     def get_state_stationary_mean(self):
         return self._state_stationary_mean
@@ -367,7 +362,7 @@ class model_fit(model_mode):
                 # --! extract target dimensions
                 truth = dataset.extract_target(truth)
 
-                loss = self.get_state().compute_loss(truth, self.get_state().forward(back), validated=True)
+                loss = self.get_state().compute_loss(dataset, truth, self.get_state().forward(dataset, back), validated=True)
                 total_loss.append(loss)
 
         # --! reset this model back to training mode
@@ -402,12 +397,12 @@ class fit_state(interface):
         return
 
     @abstractmethod
-    def forward(self, timeseries):
+    def forward(self, dataset, timeseries):
         """ Executes a forward pass of a KIND model. """
         return
 
     @abstractmethod
-    def compute_loss(self, true, pred, validated=False):
+    def compute_loss(self, dataset, true, pred, validated=False):
         """ Computes loss based on ``true`` and ``pred``icted timeseries. """
         return
 
@@ -451,10 +446,10 @@ class fit_stationary_mean(fit_state):
     def load_data(self, dataset):
         return dataset.load(data_type='stat')
 
-    def forward(self, timeseries):
-        return self.mode.model(timeseries)
+    def forward(self, dataset, timeseries):
+        return self.mode.model(dataset, timeseries)
 
-    def compute_loss(self, true, pred, validated=False):
+    def compute_loss(self, dataset, true, pred, validated=False):
 
         timeseries = true
         timeseries_pred = pred[1] # < stationary prediction
@@ -492,10 +487,10 @@ class fit_stationary_uncertainty(fit_state):
     def load_data(self, dataset):
         return dataset.load(data_type='mixed')
 
-    def forward(self, timeseries):
-        return self.mode.model(timeseries)
+    def forward(self, dataset, timeseries):
+        return self.mode.model(dataset, timeseries)
 
-    def compute_loss(self, true, pred, validated=False):
+    def compute_loss(self, dataset, true, pred, validated=False):
 
         timeseries = true
         timeseries_pred_mean = pred[1]
@@ -509,8 +504,8 @@ class fit_stationary_uncertainty(fit_state):
         # --! then scaled back - but for computing uncertainty loss it seems to be more
         # --! straightforward to operate with scaled data
         if validated:
-            timeseries = self.mode.model._fit_dataset.normalize(timeseries)
-            timeseries_pred_mean = self.mode.model._fit_dataset.normalize(timeseries_pred_mean)
+            timeseries = dataset.normalize(timeseries)
+            timeseries_pred_mean = dataset.normalize(timeseries_pred_mean)
 
         loss_linear = self.apply_criterion_mean(dfun, dfun_pred)
         loss_uncertain = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
@@ -542,10 +537,10 @@ class fit_transient_mean(fit_state):
     def load_data(self, dataset):
         return dataset.load(data_type='trans')
 
-    def forward(self, timeseries):
-        return self.mode.model(timeseries)
+    def forward(self, dataset, timeseries):
+        return self.mode.model(dataset, timeseries)
 
-    def compute_loss(self, true, pred, validated=False):
+    def compute_loss(self, dataset, true, pred, validated=False):
 
         timeseries = true
         timeseries_pred_mean = pred[3]
@@ -583,10 +578,10 @@ class fit_transient_uncertainty(fit_state):
     def load_data(self, dataset):
         return dataset.load(data_type='mixed')
 
-    def forward(self, timeseries):
-        return self.mode.model(timeseries)
+    def forward(self, dataset, timeseries):
+        return self.mode.model(dataset, timeseries)
 
-    def compute_loss(self, true, pred, validated=False):
+    def compute_loss(self, dataset, true, pred, validated=False):
 
         timeseries = true
         timeseries_pred_mean = pred[3]
@@ -600,8 +595,8 @@ class fit_transient_uncertainty(fit_state):
         # --! then scaled back - but for computing uncertainty loss it seems to be more
         # --! straightforward to operate with scaled data
         if validated:
-            timeseries = self.mode.model._fit_dataset.normalize(timeseries)
-            timeseries_pred_mean = self.mode.model._fit_dataset.normalize(timeseries_pred_mean)
+            timeseries = dataset.normalize(timeseries)
+            timeseries_pred_mean = dataset.normalize(timeseries_pred_mean)
 
         loss_linear = self.apply_criterion_mean(dfun_pred, dfun)
         loss_recon = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
