@@ -1,10 +1,16 @@
+# --! example: function and class definitions for detuning
+
 import numpy as np
 import control as ct
 from collections import namedtuple
 from scipy.linalg import block_diag
+import scipy as sp
+from filterpy.kalman import KalmanFilter as KF
+
 
 # --! mechanical mode properties --!
 mechanical_mode = namedtuple('mechanical_mode', 'f q k t')
+
 
 def make_rf_a(f, q):
     w     = 2 * np.pi * f
@@ -15,6 +21,7 @@ def make_rf_a(f, q):
         [ 0.,    -hbw],
     ])
 
+
 def make_rf_b(f, q):
     w     = 2 * np.pi * f
     hbw   = w/2/q  # < half-bandwidth of an rf cavity in rad/s
@@ -24,6 +31,7 @@ def make_rf_b(f, q):
         [0.,    hbw],
     ])
 
+
 def make_mm_a(f, q):
     """Constructs the matrix A of a single mechanical mode (mm)."""
     w = 2 * np.pi * f
@@ -31,6 +39,7 @@ def make_mm_a(f, q):
         [ 0,             1  ],
         [-np.square(w), -w/q],
     ])
+
 
 def make_mm_b(f, k):
     """Constructs the matrix B of a single mechanical mode (mm)."""
@@ -40,17 +49,22 @@ def make_mm_b(f, k):
         [k * np.square(w)],
     ])
 
+
 def make_mm_c():
     return np.array([[1, 0]])
+
 
 def make_mm_a_array(f, q):
     return block_diag(*[make_mm_a(f, q) for f, q in zip(f, q)])
 
+
 def make_mm_b_array(f, k):
     return np.concatenate([make_mm_b(f, k) for f, k in zip(f, k)], axis=0)
 
+
 def make_mm_c_array(nf=1):
     return np.tile(make_mm_c(), nf)
+
 
 def make_mm_system(f=np.array([100.]), q=np.array([1000.]), k=np.array([1.]), dt=0.):
     a = make_mm_a_array(f, q)
@@ -59,6 +73,7 @@ def make_mm_system(f=np.array([100.]), q=np.array([1000.]), k=np.array([1.]), dt
     d = np.array(([[0]]))
 
     return ct.ss(a, b, c, d, dt, name='mm_plant')
+
 
 def make_lqr(f, q, k, action_cost=1., state_cost=1., dt=0.):
 
@@ -82,6 +97,7 @@ def make_lqr(f, q, k, action_cost=1., state_cost=1., dt=0.):
 
     return lqr_plant, k_norm @ np.linalg.inv(x_norm)
 
+
 def make_est(lqr_plant, q=0.1, r=0.1):
 
     q = np.eye(1) * q
@@ -96,6 +112,7 @@ def make_est(lqr_plant, q=0.1, r=0.1):
     est_b = np.hstack([est_gain, lqr_plant.B])  # input: [y, u]
 
     return est_a, est_b
+
 
 def cavity_update(t, x, u, param):
 
@@ -173,12 +190,14 @@ def cavity_update(t, x, u, param):
         *mm_dx.flatten(),
     ])
 
+
 def cavity_output(t, x, u, param):
     """ Outputs summed positions of all mechanical modes, i.e. cavity detuning. """
     mm_x = x[2:]
     nmm  = len(mm_x) // 2
     mm_d = np.sum([mm_x[2*j] for j in range(nmm)])
     return np.array([mm_d])
+
 
 def estimator_update(t, x, u, param):
 
@@ -193,8 +212,10 @@ def estimator_update(t, x, u, param):
         *est_dx.flatten(),
     ])
 
+
 def estimator_output(t, x, u, param):
     return np.array([x])
+
 
 def control_output(t, x, u, param):
 
@@ -203,6 +224,7 @@ def control_output(t, x, u, param):
 
     est_x = np.array(u).reshape((-1, 1))
     return -(lqr_gain @ est_x)
+
 
 def sim_cavity_control(t,
                        start_jsample=0, end_jsample=200,
@@ -299,3 +321,37 @@ def sim_cavity_control(t,
             resp.outputs[1][start_jsample:end_jsample].reshape(-1, 1),
         ], axis=1).reshape(-1, timeseries_nsample, 2)
 
+
+def filter_detuning(param):
+    """ Creates a linear Kalman filter to filter a cavity detuning signal. """
+
+    f = param['f']
+    q = param['q']
+    k = param['k']
+    dt = param['dt']
+    kalman_q = param['kalman_q']
+    kalman_r = param['kalman_r']
+
+    # --! create observed process matrices
+    a = make_mm_a_array(f, q)
+    b = make_mm_b_array(f, k)
+    c = make_mm_c_array(len(f))
+
+    # --! there two states (position and velocity) per one mechanical mode frequency
+    nstate = 2 * len(f)
+    nmeas = 1
+
+    # --! create a linear Kalman filter
+    kf = KF(dim_x=nstate, dim_z=nmeas)
+    kf.F = sp.linalg.expm(a * dt)
+    kf.B = b * dt
+    kf.H = c
+
+    # initial state and covariances
+    kf.x = np.zeros((nstate, 1))
+    kf.P *= 10. * np.eye(nstate)   # uncertainty about the initial condition
+
+    kf.R *= kalman_r  # measurement noise
+    kf.Q *= kalman_q  # process uncertainty
+
+    return kf
