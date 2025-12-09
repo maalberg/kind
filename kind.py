@@ -11,7 +11,7 @@ import argparse
 import time
 import json
 
-import utils_data
+import util_data
 import utils_nn
 
 
@@ -20,7 +20,6 @@ def create_args_parser():
     parser = argparse.ArgumentParser(description='KIND timeseries forecasting')
 
     # --! data arguments
-    parser.add_argument('--dataset_id', type=str, required=True, help='dataset identificator')
     parser.add_argument('--file_dir', type=str, required=True, help='relative path to file directory')
     parser.add_argument('--file_name', type=str, required=True, help='file name with no extension (e.g., .csv) and no suffix (e.g., _stat)')
     parser.add_argument('--file_ext', type=str, required=False, default='.csv', help='data file extension')
@@ -434,7 +433,7 @@ class fit_stationary_mean(fit_state):
 
     def init_model(self):
 
-        print('>>> train stationary mean >>>')
+        print('>>> train nominal mean >>>')
         model = self.mode.model
 
         model.transient.freeze_mean()
@@ -444,7 +443,7 @@ class fit_stationary_mean(fit_state):
         model.stationary.freeze_var()
 
     def load_data(self, dataset):
-        return dataset.load(data_type='stat')
+        return dataset.load(data_type='nom')
 
     def forward(self, dataset, timeseries):
         return self.mode.model(dataset, timeseries)
@@ -475,7 +474,7 @@ class fit_stationary_uncertainty(fit_state):
 
     def init_model(self):
 
-        print('>>> train stationary uncertainty >>>')
+        print('>>> train nominal uncertainty >>>')
         model = self.mode.model
 
         model.transient.freeze_mean()
@@ -525,7 +524,7 @@ class fit_transient_mean(fit_state):
 
     def init_model(self):
 
-        print('>>> train transient mean >>>')
+        print('>>> train excursion mean >>>')
         model = self.mode.model
 
         model.transient.unfreeze()
@@ -535,7 +534,7 @@ class fit_transient_mean(fit_state):
         model.stationary.freeze_var()
 
     def load_data(self, dataset):
-        return dataset.load(data_type='trans')
+        return dataset.load(data_type='exc')
 
     def forward(self, dataset, timeseries):
         return self.mode.model(dataset, timeseries)
@@ -566,7 +565,7 @@ class fit_transient_uncertainty(fit_state):
 
     def init_model(self):
 
-        print('>>> train transient uncertainty >>>')
+        print('>>> train excursion uncertainty >>>')
         model = self.mode.model
 
         model.transient.unfreeze()

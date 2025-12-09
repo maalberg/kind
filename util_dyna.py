@@ -29,7 +29,7 @@ class lqr(policy):
 class simulator(interface):
 
     @abstractmethod
-    def simulate(self, ic, dt_control=1e-2, dt_sim=1e-4, t_final=100):
+    def simulate(self, ic, dt_control=1e-2, dt_sim=1e-4, t_final=100, skip_nsample=0):
         """Simulates a control system from an initial condition ``ic``."""
         return
 
