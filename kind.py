@@ -12,7 +12,7 @@ import time
 import json
 
 import util_data
-import utils_nn
+import util_nn
 
 
 def create_args_parser():
@@ -276,7 +276,7 @@ class model_fit(model_mode):
         self.get_state().init_model()
         train_loader, valid_loader, test_loader = self.get_state().load_data(dataset)
         model_optim = self.select_optimizer()
-        early_stopping = utils_nn.early_stopping(patience=args.patience, checkpoint_path=args.checkpoints)
+        early_stopping = util_nn.early_stopping(patience=args.patience, checkpoint_path=args.checkpoints)
 
         # --! start training
         for epoch in range(args.nepoch):
@@ -756,8 +756,8 @@ class operator_stationary(operator):
         # --! in the embedded (latent) space
         fun_enc_ni   = self.param_kernsize * self.nfeature
         fun_enc_no   = nparam * self.param_kernsize * self.nfeature
-        fun_enc_feat = utils_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
-        self.fun_enc = utils_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
+        fun_enc_feat = util_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.fun_enc = util_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
 
         if self.nfeature > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
@@ -782,15 +782,15 @@ class operator_stationary(operator):
         # --! a flattened sequence of square matrices
         mod_var_gen_ni = fun_nsample * nfun
         mod_var_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
-        mod_var_gen_feat = utils_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
-        self.mod_var_gen = utils_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
+        mod_var_gen_feat = util_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.mod_var_gen = util_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
 
         # --! create prediction decoders to decode predicted embeddings back to timeseries and uncertainty
         pre_dec_ni = nfun
         pre_dec_no = self.param_kernsize * self.ntarget
-        pre_dec_feat = utils_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
-        self.pre_mean_dec = utils_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
-        self.pre_var_dec  = utils_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+        pre_dec_feat = util_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.pre_mean_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+        self.pre_var_dec  = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -895,7 +895,7 @@ class operator_stationary(operator):
         # --! capture the evolution of error values
         i           = torch.flatten(errors, start_dim=1)
         mat         = self.mod_var_gen(i).reshape(batsize, -1, nfun, nfun)
-        mat         = utils_nn.cumprod_mat(mat[:, 1:])
+        mat         = util_nn.cumprod_mat(mat[:, 1:])
 
         # --! extract the initial condition of error history
         #
@@ -961,24 +961,24 @@ class operator_stationary(operator):
         return timeseries_pre_mean, timeseries_pre_var, fun, fun_pre, dfun, dfun_pre
 
     def freeze_mean(self):
-        utils_nn.freeze_module(self.fun_enc)
+        util_nn.freeze_module(self.fun_enc)
         if self.nfeature > 1:
-            utils_nn.freeze_module(self.fun_prune)
-        utils_nn.freeze_module(self.mod_mean)
-        utils_nn.freeze_module(self.pre_mean_dec)
+            util_nn.freeze_module(self.fun_prune)
+        util_nn.freeze_module(self.mod_mean)
+        util_nn.freeze_module(self.pre_mean_dec)
 
     def freeze_var(self):
-        utils_nn.freeze_module(self.mod_var_gen)
-        utils_nn.freeze_module(self.pre_var_dec)
+        util_nn.freeze_module(self.mod_var_gen)
+        util_nn.freeze_module(self.pre_var_dec)
 
     def unfreeze(self):
-        utils_nn.unfreeze_module(self.fun_enc)
+        util_nn.unfreeze_module(self.fun_enc)
         if self.nfeature > 1:
-            utils_nn.unfreeze_module(self.fun_prune)
-        utils_nn.unfreeze_module(self.mod_mean)
-        utils_nn.unfreeze_module(self.mod_var_gen)
-        utils_nn.unfreeze_module(self.pre_mean_dec)
-        utils_nn.unfreeze_module(self.pre_var_dec)
+            util_nn.unfreeze_module(self.fun_prune)
+        util_nn.unfreeze_module(self.mod_mean)
+        util_nn.unfreeze_module(self.mod_var_gen)
+        util_nn.unfreeze_module(self.pre_mean_dec)
+        util_nn.unfreeze_module(self.pre_var_dec)
 
 
 class operator_transient(operator):
@@ -1016,8 +1016,8 @@ class operator_transient(operator):
         # --! in the embedded (latent) space
         fun_enc_ni   = self.param_kernsize * self.nfeature
         fun_enc_no   = nparam * self.param_kernsize * self.nfeature
-        fun_enc_feat = utils_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
-        self.fun_enc = utils_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
+        fun_enc_feat = util_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.fun_enc = util_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
 
         if self.nfeature > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
@@ -1050,8 +1050,8 @@ class operator_transient(operator):
         # --! covering all prediction horizon
         mod_mean_gen_ni = fun_nsample * nfun
         mod_mean_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
-        mod_mean_gen_feat = utils_nn.make_feat(ni=mod_mean_gen_ni, no=mod_mean_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
-        self.mod_mean_gen = utils_nn.fcnn(feat=mod_mean_gen_feat, actfun_hid='relu')
+        mod_mean_gen_feat = util_nn.make_feat(ni=mod_mean_gen_ni, no=mod_mean_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.mod_mean_gen = util_nn.fcnn(feat=mod_mean_gen_feat, actfun_hid='relu')
 
         # --! create a generator that produces models capturing the evolution of variance (uncertainty)
         #
@@ -1059,15 +1059,15 @@ class operator_transient(operator):
         # --! a flattened sequence of square matrices
         mod_var_gen_ni = fun_nsample * nfun
         mod_var_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
-        mod_var_gen_feat = utils_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
-        self.mod_var_gen = utils_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
+        mod_var_gen_feat = util_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.mod_var_gen = util_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
 
         # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
         pre_dec_ni = nfun
         pre_dec_no = self.param_kernsize * self.ntarget
-        pre_dec_feat = utils_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
-        self.pre_mean_dec = utils_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
-        self.pre_var_dec = utils_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+        pre_dec_feat = util_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.pre_mean_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+        self.pre_var_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -1146,7 +1146,7 @@ class operator_transient(operator):
 
         # --! accumulate matrix products to enable predictions, such as z2 = A1*z1, z3 = A2*A1*z1, etc,
         # --! where zi are our embeddings, and where Ai are linear time-varying matrices
-        mat = utils_nn.cumprod_mat(mat[:, 1:])
+        mat = util_nn.cumprod_mat(mat[:, 1:])
 
         # --! extract the initial conditions of function values, i.e. the first slice
         #
@@ -1180,7 +1180,7 @@ class operator_transient(operator):
         # --! capture the evolution of error values
         i           = torch.flatten(errors, start_dim=1)
         mat         = self.mod_var_gen(i).reshape(batsize, -1, nfun, nfun)
-        mat         = utils_nn.cumprod_mat(mat[:, 1:])
+        mat         = util_nn.cumprod_mat(mat[:, 1:])
 
         # --! extract the initial condition of error history
         #
@@ -1242,24 +1242,24 @@ class operator_transient(operator):
         return timeseries_pre_mean, timeseries_pre_var, fun, fun_pre, dfun, dfun_pre
 
     def freeze_mean(self):
-        utils_nn.freeze_module(self.fun_enc)
+        util_nn.freeze_module(self.fun_enc)
         if self.nfeature > 1:
-            utils_nn.freeze_module(self.fun_prune)
-        utils_nn.freeze_module(self.mod_mean_att_enc)
-        utils_nn.freeze_module(self.mod_mean_gen)
-        utils_nn.freeze_module(self.pre_mean_dec)
+            util_nn.freeze_module(self.fun_prune)
+        util_nn.freeze_module(self.mod_mean_att_enc)
+        util_nn.freeze_module(self.mod_mean_gen)
+        util_nn.freeze_module(self.pre_mean_dec)
 
     def freeze_var(self):
-        utils_nn.freeze_module(self.mod_var_gen)
-        utils_nn.freeze_module(self.pre_var_dec)
+        util_nn.freeze_module(self.mod_var_gen)
+        util_nn.freeze_module(self.pre_var_dec)
 
     def unfreeze(self):
-        utils_nn.unfreeze_module(self.fun_enc)
+        util_nn.unfreeze_module(self.fun_enc)
         if self.nfeature > 1:
-            utils_nn.unfreeze_module(self.fun_prune)
-        utils_nn.unfreeze_module(self.mod_mean_att_enc)
-        utils_nn.unfreeze_module(self.mod_mean_gen)
-        utils_nn.unfreeze_module(self.mod_var_gen)
-        utils_nn.unfreeze_module(self.pre_mean_dec)
-        utils_nn.unfreeze_module(self.pre_var_dec)
+            util_nn.unfreeze_module(self.fun_prune)
+        util_nn.unfreeze_module(self.mod_mean_att_enc)
+        util_nn.unfreeze_module(self.mod_mean_gen)
+        util_nn.unfreeze_module(self.mod_var_gen)
+        util_nn.unfreeze_module(self.pre_mean_dec)
+        util_nn.unfreeze_module(self.pre_var_dec)
 
