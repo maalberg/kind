@@ -368,8 +368,9 @@ def filter_detuning(param):
 class dataset_synthetic(util_data.dataset):
     """Models a synthetic detuning database for nominal filtering."""
 
-    # --! minimum standard deviation to avoid division by zero-like deviation values
-    min_std = torch.tensor(1e-3, dtype=torch.float32)
+    state_ndim = 1
+    control_ndim = 1
+    mask_ndim = 1
 
     def __init__(self,
                  file_dir, file_name, file_ext,
@@ -379,72 +380,65 @@ class dataset_synthetic(util_data.dataset):
         super().__init__(file_dir, file_name, file_ext,
                          data_nsample, data_split_size,
                          batch_size, window_nsample)
-
-        self.mean = 0.
-        self.std = self.min_std
 
     def make_path(self, data_type='nom'):
         file_name = self.file_name + '_nom' + self.file_ext
         return os.path.join(self.file_dir, file_name)
 
     def extract_target(self, window):
-        return window[:, :, [0]]
+        return window[:, :, :self.state_ndim]
 
-    def adapt_mask(self, window):
+    def init_normalization(self):
 
-        # --! mask stays as it is
-        return window
+        # --! read nominal data
+        timeseries_nom = self.read_timeseries(self.make_path(data_type='nom'))
+        state_and_control, _ = torch.split(timeseries_nom, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-    def init_normalization(self, timeseries):
+        # --! take nominal statistics
+        self.mean_nom = state_and_control.mean()
+        self.std_nom = state_and_control.std()
+        self.std_nom = torch.maximum(self.std_nom, self.min_std)
 
-        detuning_control, mask = torch.split(timeseries, [2, 1], dim=-1)
+    def normalize(self, window, data_type='nom'):
 
-        # --! take global statistics
-        self.mean = detuning_control.mean()
-        self.std = detuning_control.std()
-        self.std = torch.maximum(self.std, self.min_std)
+        mean = self.mean_nom
+        std = self.std_nom
 
-    def normalize(self, window):
-
-        if window.shape[-1]==1:
-            window = torch.clip((window - self.mean) / self.std, min=-3.0, max=3.0)
+        if window.shape[-1]==self.state_ndim:
+            window = (window - mean) / std
         else:
-            detuning, control, mask = torch.split(window, 1, dim=-1)
+            state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-            detuning = torch.clip((detuning - self.mean) / self.std, min=-3.0, max=3.0)
-            control = torch.clip((control - self.mean) / self.std, min=-3.0, max=3.0)
+            state_and_control = (state_and_control - mean) / std
+            state, control = torch.split(state_and_control, [self.state_ndim, self.control_ndim], dim=-1)
             control = control * mask
 
-            window = torch.cat([detuning, control, mask], dim=-1)
+            window = torch.cat([state, control, mask], dim=-1)
 
         return window
 
-    def denormalize(self, window):
+    def denormalize(self, window, data_type='nom'):
 
-        if window.shape[-1]==1:
-            window = window * self.std + self.mean
+        mean = self.mean_nom
+        std = self.std_nom
+
+        if window.shape[-1]==self.state_ndim:
+            window = window * std + mean
         else:
-            detuning, control, mask = torch.split(window, 1, dim=-1)
+            state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+            state_and_control = state_and_control * std + mean
 
-            detuning = detuning * self.std + self.mean
-            control = control * self.std + self.mean
-
-            window = torch.cat([detuning, control, mask], dim=-1)
+            window = torch.cat([state_and_control, mask], dim=-1)
 
         return window
-
-    def noise(self, window):
-        detuning, control, mask = torch.split(window, 1, dim=-1)
-        detuning = detuning + 1e-3 * torch.randn(detuning.shape)
-
-        return torch.cat([detuning, control, mask], dim=-1)
 
 
 class dataset_measured(util_data.dataset):
     """Models measured detuning dataset, unfiltered."""
 
-    # --! minimum standard deviation to avoid division by zero-like deviation values
-    min_std = torch.tensor(1e-3, dtype=torch.float32)
+    state_ndim = 1
+    control_ndim = 1
+    mask_ndim = 1
 
     def __init__(self,
                  file_dir, file_name, file_ext,
@@ -454,69 +448,67 @@ class dataset_measured(util_data.dataset):
         super().__init__(file_dir, file_name, file_ext,
                          data_nsample, data_split_size,
                          batch_size, window_nsample)
-
-        self.mean = 0.
-        self.std = self.min_std
 
     def make_path(self, data_type='nom'):
         file_name = self.file_name + self.file_ext
         return os.path.join(self.file_dir, file_name)
 
     def extract_target(self, window):
-        return window[:, :, [0]]
+        return window[:, :, :self.state_ndim]
 
-    def adapt_mask(self, window):
+    def init_normalization(self):
 
-        # --! mask stays as it is
-        return window
+        # --! read measured data
+        #
+        # --! we pass 'nom' as a data type, but it does not matter here
+        timeseries_nom = self.read_timeseries(self.make_path(data_type='nom'))
+        state_and_control, _ = torch.split(timeseries_nom, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-    def init_normalization(self, timeseries):
+        # --! save statistics as nominal values
+        self.mean_nom = state_and_control.mean()
+        self.std_nom = state_and_control.std()
+        self.std_nom = torch.maximum(self.std_nom, self.min_std)
 
-        detuning_control, mask = torch.split(timeseries, [2, 1], dim=-1)
+    def normalize(self, window, data_type='nom'):
 
-        # --! take global statistics
-        self.mean = detuning_control.mean()
-        self.std = detuning_control.std()
-        self.std = torch.maximum(self.std, self.min_std)
+        mean = self.mean_nom
+        std = self.std_nom
 
-    def normalize(self, window):
-
-        if window.shape[-1]==1:
-            window = torch.clip((window - self.mean) / self.std, min=-3.0, max=3.0)
+        if window.shape[-1]==self.state_ndim:
+            window = (window - mean) / std
         else:
-            detuning, control, mask = torch.split(window, 1, dim=-1)
+            state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-            detuning = torch.clip((detuning - self.mean) / self.std, min=-3.0, max=3.0)
-            control = torch.clip((control - self.mean) / self.std, min=-3.0, max=3.0)
+            state_and_control = (state_and_control - mean) / std
+            state, control = torch.split(state_and_control, [self.state_ndim, self.control_ndim], dim=-1)
             control = control * mask
 
-            window = torch.cat([detuning, control, mask], dim=-1)
+            window = torch.cat([state, control, mask], dim=-1)
 
         return window
 
-    def denormalize(self, window):
+    def denormalize(self, window, data_type='nom'):
 
-        if window.shape[-1]==1:
-            window = window * self.std + self.mean
+        mean = self.mean_nom
+        std = self.std_nom
+
+        if window.shape[-1]==self.state_ndim:
+            window = window * std + mean
         else:
-            detuning, control, mask = torch.split(window, 1, dim=-1)
+            state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+            state_and_control = state_and_control * std + mean
 
-            detuning = detuning * self.std + self.mean
-            control = control * self.std + self.mean
+            window = torch.cat([state_and_control, mask], dim=-1)
 
-            window = torch.cat([detuning, control, mask], dim=-1)
-
-        return window
-
-    def noise(self, window):
         return window
 
 
 class dataset_filtered(util_data.dataset):
     """Models measured detuning dataset, filtered into nominal and excursion partitions."""
 
-    # --! minimum standard deviation to avoid division by zero-like deviation values
-    min_std = torch.tensor(1e-3, dtype=torch.float32)
+    state_ndim = 1
+    control_ndim = 1
+    mask_ndim = 1
 
     def __init__(self,
                  file_dir, file_name, file_ext,
@@ -527,66 +519,82 @@ class dataset_filtered(util_data.dataset):
                          data_nsample, data_split_size,
                          batch_size, window_nsample)
 
-        self.mean = 0.
-        self.std = self.min_std
-
     def make_path(self, data_type='nom'):
         file_name = self.file_name + '_' + data_type + self.file_ext
         return os.path.join(self.file_dir, file_name)
 
     def extract_target(self, window):
-        return window[:, :, [0]]
-
-    def adapt_mask(self, window):
-
-        # --! mask stays as it is
-        return window
+        return window[:, :, :self.state_ndim]
 
     def extract_window(self, timeseries):
 
         # --! given time series should already contain windows
         return timeseries
 
-    def init_normalization(self, timeseries):
+    def init_normalization(self):
 
-        detuning_control, mask = torch.split(timeseries, [2, 1], dim=-1)
+        # --! read nominal data
+        timeseries_nom = self.read_timeseries(self.make_path(data_type='nom'))
+        state_and_control, _ = torch.split(timeseries_nom, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-        # --! take global statistics
-        self.mean = detuning_control.mean()
-        self.std = detuning_control.std()
-        self.std = torch.maximum(self.std, self.min_std)
+        # --! take nominal statistics
+        self.mean_nom = state_and_control.mean()
+        self.std_nom = state_and_control.std()
+        self.std_nom = torch.maximum(self.std_nom, self.min_std)
 
-    def normalize(self, window):
+        # --! read excursion data
+        timeseries_exc = self.read_timeseries(self.make_path(data_type='exc'))
+        state_and_control, _ = torch.split(timeseries_exc, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-        if window.shape[-1]==1:
-            window = torch.clip((window - self.mean) / self.std, min=-3.0, max=3.0)
+        # --! take excursion statistics
+        self.mean_exc = state_and_control.mean()
+        self.std_exc = state_and_control.std()
+        self.std_exc = torch.maximum(self.std_exc, self.min_std)
+
+    def normalize(self, window, data_type='nom'):
+
+        # --! this method is not supposed to be called for mixed data
+        assert data_type in ['nom', 'exc']
+
+        if data_type=='nom':
+            mean = self.mean_nom
+            std = self.std_nom
         else:
-            detuning, control, mask = torch.split(window, 1, dim=-1)
+            mean = self.mean_exc
+            std = self.std_exc
 
-            detuning = torch.clip((detuning - self.mean) / self.std, min=-3.0, max=3.0)
-            control = torch.clip((control - self.mean) / self.std, min=-3.0, max=3.0)
+        if window.shape[-1]==self.state_ndim:
+            window = (window - mean) / std
+        else:
+            state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+
+            state_and_control = (state_and_control - mean) / std
+            state, control = torch.split(state_and_control, [self.state_ndim, self.control_ndim], dim=-1)
             control = control * mask
 
-            window = torch.cat([detuning, control, mask], dim=-1)
+            window = torch.cat([state, control, mask], dim=-1)
 
         return window
 
-    def denormalize(self, window):
+    def denormalize(self, window, data_type='nom'):
 
-        if window.shape[-1]==1:
-            window = window * self.std + self.mean
+        # --! this method is not supposed to be called for mixed data
+        assert data_type in ['nom', 'exc']
+
+        if data_type=='nom':
+            mean = self.mean_nom
+            std = self.std_nom
         else:
-            detuning, control, mask = torch.split(window, 1, dim=-1)
+            mean = self.mean_exc
+            std = self.std_exc
 
-            detuning = detuning * self.std + self.mean
-            control = control * self.std + self.mean
+        if window.shape[-1]==self.state_ndim:
+            window = window * std + mean
+        else:
+            state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+            state_and_control = state_and_control * std + mean
 
-            window = torch.cat([detuning, control, mask], dim=-1)
+            window = torch.cat([state_and_control, mask], dim=-1)
 
-        return window
-
-    def noise(self, window):
-
-        # --! measured data already has noise
         return window
 
