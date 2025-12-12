@@ -1,6 +1,4 @@
-# --!-------------------------------------------------------------------!
-# --! Implementation of Kalman-inspired neural decomposition, or KIND
-# --!-------------------------------------------------------------------!
+# --! Implementation of Kalman-inspired neural decomposition, or KIND --!
 
 from abc import abstractmethod
 from abc import ABC as interface
@@ -13,6 +11,8 @@ import json
 
 import util_data
 import util_nn
+
+from matplotlib import pyplot as plt
 
 
 def create_args_parser():
@@ -157,12 +157,10 @@ class model_mode(interface):
         """ Executes a forward pass through this model using normalized data ``window``. """
 
         # --! execute both operators on given time series
-        timeseries_stat, timeseries_stat_logvar, fun_stat, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model.stationary(window)
-        timeseries_trans, timeseries_trans_logvar, fun_trans, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model.transient(window)
+        timeseries_stat, timeseries_stat_var, fun_stat, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model.stationary(window)
+        timeseries_trans, timeseries_trans_var, fun_trans, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model.transient(window)
 
         # --! derive alpha
-        timeseries_stat_var  = torch.exp(timeseries_stat_logvar) + 1e-6
-        timeseries_trans_var = torch.exp(timeseries_trans_logvar) + 1e-6
         alpha = timeseries_trans_var / (timeseries_trans_var + timeseries_stat_var)
 
         # --! blend the two types of time series using the derived alpha to get the final prediction
@@ -170,8 +168,8 @@ class model_mode(interface):
 
         output = (
             timeseries_pred,
-            timeseries_stat, timeseries_stat_logvar,
-            timeseries_trans, timeseries_trans_logvar,
+            timeseries_stat, timeseries_stat_var,
+            timeseries_trans, timeseries_trans_var,
             fun_stat, fun_stat_pred,
             fun_trans, fun_trans_pred,
             alpha,
@@ -208,10 +206,10 @@ class model_eval(model_mode):
         """ Executes a forward pass through this model using denormalized ``window`` loaded from given ``dataset``. """
 
         # --! normalize data
-        timeseries = dataset.normalize(window)
+        #timeseries = dataset.normalize(window)
 
         # --! having normalized given data, call the normalized version of KIND forward method
-        model_output = self._forward_norm(timeseries)
+        model_output = self._forward_norm(window)
 
         # --! extract to-be-unscaled timeseries from the forwarded result
         timeseries_pred = model_output[0]
@@ -222,9 +220,9 @@ class model_eval(model_mode):
         #
         # --! since the indeces of target dimensions must be present in above dictionaries,
         # --! we use these indeces to directly access the dictionaries
-        timeseries_pred = dataset.denormalize(timeseries_pred)
-        timeseries_stat = dataset.denormalize(timeseries_stat)
-        timeseries_trans = dataset.denormalize(timeseries_trans)
+        #timeseries_pred = dataset.denormalize(timeseries_pred)
+        #timeseries_stat = dataset.denormalize(timeseries_stat)
+        #timeseries_trans = dataset.denormalize(timeseries_trans)
 
         # --! put unscaled timeseries back to the result tuple and return the tuple
         model_output = list(model_output)
@@ -493,21 +491,12 @@ class fit_stationary_uncertainty(fit_state):
 
         timeseries = true
         timeseries_pred_mean = pred[1]
-        timeseries_pred_uncertain = pred[2]
-        dfun = pred[10]
-        dfun_pred = pred[11]
+        timeseries_u_pre = pred[2]
+        fun_u = pred[10]
+        fun_u_pre = pred[11]
 
-        # --! when validating, scale model's output
-        #
-        # --! validation and test data are not initially scaled - the data is scaled internally by the model and
-        # --! then scaled back - but for computing uncertainty loss it seems to be more
-        # --! straightforward to operate with scaled data
-        if validated:
-            timeseries = dataset.normalize(timeseries)
-            timeseries_pred_mean = dataset.normalize(timeseries_pred_mean)
-
-        loss_linear = self.apply_criterion_mean(dfun, dfun_pred)
-        loss_uncertain = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
+        loss_linear = self.apply_criterion_mean(fun_u, fun_u_pre)
+        loss_uncertain = self.apply_criterion_uncertain_test(timeseries, timeseries_pred_mean, timeseries_u_pre)
         loss = loss_uncertain + loss_linear
 
         return loss
@@ -515,6 +504,10 @@ class fit_stationary_uncertainty(fit_state):
     def next(self):
         self.mode.set_state(self.mode.get_state_transient_mean())
         return True
+
+    def apply_criterion_uncertain_test(self, true, pre, pre_u):
+        err = torch.abs(true - pre)
+        return self.apply_criterion_mean(err, pre_u)
 
 
 class fit_transient_mean(fit_state):
@@ -584,27 +577,22 @@ class fit_transient_uncertainty(fit_state):
 
         timeseries = true
         timeseries_pred_mean = pred[3]
-        timeseries_pred_uncertain = pred[4]
-        dfun = pred[12]
-        dfun_pred = pred[13]
+        timeseries_u_pre = pred[4]
+        fun_u = pred[12]
+        fun_u_pre = pred[13]
 
-        # --! when validating, scale model's output
-        #
-        # --! validation and test data are not initially scaled - the data is scaled internally by the model and
-        # --! then scaled back - but for computing uncertainty loss it seems to be more
-        # --! straightforward to operate with scaled data
-        if validated:
-            timeseries = dataset.normalize(timeseries)
-            timeseries_pred_mean = dataset.normalize(timeseries_pred_mean)
-
-        loss_linear = self.apply_criterion_mean(dfun_pred, dfun)
-        loss_recon = self.apply_criterion_uncertain(timeseries, timeseries_pred_mean, timeseries_pred_uncertain)
-        loss = loss_linear + loss_recon
+        loss_linear = self.apply_criterion_mean(fun_u, fun_u_pre)
+        loss_uncertain = self.apply_criterion_uncertain_test(timeseries, timeseries_pred_mean, timeseries_u_pre)
+        loss = loss_uncertain + loss_linear
 
         return loss
 
     def next(self):
         return False
+
+    def apply_criterion_uncertain_test(self, true, pre, pre_u):
+        err = torch.abs(true - pre)
+        return self.apply_criterion_mean(err, pre_u)
     
 
 class operator(torch.nn.Module, interface):
@@ -758,6 +746,7 @@ class operator_stationary(operator):
         fun_enc_no   = nparam * self.param_kernsize * self.nfeature
         fun_enc_feat = util_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
         self.fun_enc = util_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
+        self.fun_u_enc = util_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
 
         if self.nfeature > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
@@ -767,6 +756,7 @@ class operator_stationary(operator):
             fun_prune_ni = nfun * self.nfeature
             fun_prune_no = nfun
             self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
+            self.fun_u_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
         # --! create a DMD-like model (a matrix) that captures stationary (mean) dynamics
         #
@@ -783,14 +773,14 @@ class operator_stationary(operator):
         mod_var_gen_ni = fun_nsample * nfun
         mod_var_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
         mod_var_gen_feat = util_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
-        self.mod_var_gen = util_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
+        self.mod_u_gen = util_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
 
         # --! create prediction decoders to decode predicted embeddings back to timeseries and uncertainty
         pre_dec_ni = nfun
         pre_dec_no = self.param_kernsize * self.ntarget
         pre_dec_feat = util_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
         self.pre_mean_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
-        self.pre_var_dec  = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+        self.pre_u_dec  = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -843,6 +833,58 @@ class operator_stationary(operator):
 
         # --! prune extra dimensionality caused by multidimensional data
         return self.fun_prune(fun) if self.nfeature > 1 else fun
+
+    def embed_uncertainty(self, timeseries):
+
+        # --! reshape timeseries to form an input to embeddings encoder
+        #
+        # --! the length of timeseries is reshaped to put kernels into the prelast dimension, i.e.
+        # --! [B, T, ndim] -> [B, T / kernsize, kernsize, ndim], where
+        # --! B, T and ndim are the number of batch elements,
+        # --! timesteps and data channels, respectively
+        #
+        # --! note that -1 below infers the size of a dimension
+        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
+        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
+
+        # --! based on inputs, encode parameter kernels (filters)
+        kern = self.fun_u_enc(i)
+
+        nparam = sum(self.fun.values())
+
+        # --! reshape encoded kernels to support their next multiplication with inputs, e.g.
+        # --!
+        # --! kernels:
+        # --! [B, T / kernsize, nparam * kernsize * C] -> [B, T / kernsize, nparam, kernsize, C]
+        # --!
+        # --! inputs:
+        # --! [B, T / kernsize, kernsize * C] -> [B, T / kernsize, kernsize, C]
+        kern = kern.reshape(
+            i.shape[0], i.shape[1],
+            nparam,
+            self.param_kernsize * self.nfeature)
+        kern = kern.reshape(
+            i.shape[0], i.shape[1],
+            nparam,
+            self.param_kernsize, self.nfeature)
+        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
+
+        # --! with the help of kernels extract function parameters from input timeseries
+        param = torch.einsum("blkdf, bldf -> blfk", kern, i)
+
+        # --! split extracted parameters based on the number of parameters required by each
+        # --! type of grouped basis functions
+        param = torch.split(param, list(self.fun.values()), dim=-1)
+
+        # --! evaluate embedding functions at each slice of timeseries
+        fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+
+        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nfun]
+        # --! to [B, T / kernsize, ndim * nfun]
+        fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
+
+        # --! prune extra dimensionality caused by multidimensional data
+        return self.fun_u_prune(fun) if self.nfeature > 1 else fun
 
     def predict_mean(self, functions):
 
@@ -917,34 +959,50 @@ class operator_stationary(operator):
         # --! note that the lookback window is -1, because we do not predict the initial condition
         return torch.split(err_pre, [err_nsample - 1, self.fun_nsample_forecast], dim=1)
 
+    def predict_uncertainty(self, functions):
+
+        # --! constants for convenience
+        batsize = functions.shape[0]
+        fun_nsample = functions.shape[1]
+        nfun = functions.shape[2]
+
+        # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
+        # --! capture the evolution of function values
+        i = torch.flatten(functions, start_dim=1)
+        mat = self.mod_u_gen(i).reshape(batsize, -1, nfun, nfun)
+        mat = util_nn.cumprod_mat(mat[:, 1:])
+
+        # --! extract the initial condition of function history
+        #
+        # --! the initial condition (ic) is shaped as [B, 1, 1, nfun] to allow tensor broadcasting
+        # --! when multiplying by the matrices
+        fun_ic = torch.unsqueeze(functions[:, :1], -2)
+
+        # --! predict the evolution of functions by multiplying their initial conditions by the matrices
+        #
+        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun],
+        # --! i.e. a batch with function trajectories consisting of individual error-points [1, nfun]
+        fun_pre = torch.matmul(fun_ic, mat)
+
+        # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
+        fun_pre = torch.squeeze(fun_pre, -2)
+
+        # --! return separate predictions for lookback and forecast windows
+        #
+        # --! note that the lookback window is -1, because we do not predict the initial condition
+        return torch.split(fun_pre, [fun_nsample - 1, self.fun_nsample_forecast], dim=1)
+
     def forward(self, timeseries):
 
         # --! from given timeseries, embed latent function values and then predict these embeddings
         # --! starting from the first value (initial condition) upto a specified horizon
-        fun                        = self.embed(timeseries)
+        fun = self.embed(timeseries)
         fun_pre, fun_pre_forecast  = self.predict_mean(fun)
-        fun_pre                    = torch.cat([fun[:, :1], fun_pre], dim=1)
+        fun_pre = torch.cat([fun[:, :1], fun_pre], dim=1)
 
-        # --! some constants for convenience
-        batsize          = fun.shape[0]
-        nfun             = fun.shape[-1]
-
-        # --! compute a function prediction error (difference) and normalize the error in order to
-        # --! facilitate subsequent learning of the error dynamics
-        dfun         = fun_pre - fun
-        dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
-        dfun_std     = torch.std(dfun, dim=1, keepdim=True)
-        dfun         = (dfun - dfun_mean) / (dfun_std + 1e-8)
-
-        # --! predict the evolution of a function error starting from the first error value upto
-        # --! a specified horizon
-        dfun_pre, dfun_pre_forecast = self.predict_var(dfun)
-        dfun_pre                    = torch.cat([dfun[:, :1], dfun_pre], dim=1)
-
-        # --! denormalize predicted errors to restore original magnitudes, which are essential for
-        # --! decoding the right uncertainty magnitudes
-        dfun_pre_unsca = torch.cat([dfun_pre, dfun_pre_forecast], dim=1)
-        dfun_pre_unsca = dfun_pre_unsca * dfun_std + dfun_mean
+        fun_u = self.embed_uncertainty(timeseries)
+        fun_u_pre, fun_u_pre_forecast = self.predict_uncertainty(fun_u)
+        fun_u_pre = torch.cat([fun_u[:, :1], fun_u_pre], dim=1)
 
         # --! decode predicted embeddings to timeseries
         #
@@ -954,11 +1012,11 @@ class operator_stationary(operator):
         timeseries_pre_mean  = self.pre_mean_dec(torch.cat([fun_pre, fun_pre_forecast], dim=1))
         timeseries_pre_mean  = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.ntarget)
 
-        # --! decode predicted and denormalized function errors to model uncertainty
-        timeseries_pre_var   = self.pre_var_dec(dfun_pre_unsca)
-        timeseries_pre_var   = timeseries_pre_var.reshape(timeseries_pre_var.shape[0], -1, self.ntarget)
+        # --! decode predicted and denormalized function uncertainty to model uncertainty
+        timeseries_u_pre = self.pre_u_dec(torch.cat([fun_u_pre, fun_u_pre_forecast], dim=1))
+        timeseries_u_pre = timeseries_u_pre.reshape(timeseries_u_pre.shape[0], -1, self.ntarget)
 
-        return timeseries_pre_mean, timeseries_pre_var, fun, fun_pre, dfun, dfun_pre
+        return timeseries_pre_mean, timeseries_u_pre, fun, fun_pre, fun_u, fun_u_pre
 
     def freeze_mean(self):
         util_nn.freeze_module(self.fun_enc)
@@ -968,17 +1026,22 @@ class operator_stationary(operator):
         util_nn.freeze_module(self.pre_mean_dec)
 
     def freeze_var(self):
-        util_nn.freeze_module(self.mod_var_gen)
-        util_nn.freeze_module(self.pre_var_dec)
+        util_nn.freeze_module(self.fun_u_enc)
+        if self.nfeature > 1:
+            util_nn.freeze_module(self.fun_u_prune)
+        util_nn.freeze_module(self.mod_u_gen)
+        util_nn.freeze_module(self.pre_u_dec)
 
     def unfreeze(self):
         util_nn.unfreeze_module(self.fun_enc)
+        util_nn.unfreeze_module(self.fun_u_enc)
         if self.nfeature > 1:
             util_nn.unfreeze_module(self.fun_prune)
+            util_nn.unfreeze_module(self.fun_u_prune)
         util_nn.unfreeze_module(self.mod_mean)
-        util_nn.unfreeze_module(self.mod_var_gen)
+        util_nn.unfreeze_module(self.mod_u_gen)
         util_nn.unfreeze_module(self.pre_mean_dec)
-        util_nn.unfreeze_module(self.pre_var_dec)
+        util_nn.unfreeze_module(self.pre_u_dec)
 
 
 class operator_transient(operator):
@@ -1018,6 +1081,7 @@ class operator_transient(operator):
         fun_enc_no   = nparam * self.param_kernsize * self.nfeature
         fun_enc_feat = util_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
         self.fun_enc = util_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
+        self.fun_u_enc = util_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
 
         if self.nfeature > 1:
             # --! this linear transformation is supposed to prune the dimensionality of the
@@ -1027,6 +1091,7 @@ class operator_transient(operator):
             fun_prune_ni = nfun * self.nfeature
             fun_prune_no = nfun
             self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
+            self.fun_u_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
         # --! encoder network which learns to attend over slices of embedded function values
         mod_mean_att_enc_ni = nfun
@@ -1057,17 +1122,17 @@ class operator_transient(operator):
         #
         # --! the generator takes a flattened sequence of function values and returns
         # --! a flattened sequence of square matrices
-        mod_var_gen_ni = fun_nsample * nfun
-        mod_var_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
-        mod_var_gen_feat = util_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
-        self.mod_var_gen = util_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
+        mod_u_gen_ni = fun_nsample * nfun
+        mod_u_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
+        mod_u_gen_feat = util_nn.make_feat(ni=mod_u_gen_ni, no=mod_u_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.mod_u_gen = util_nn.fcnn(feat=mod_u_gen_feat, actfun_hid='relu')
 
         # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
         pre_dec_ni = nfun
         pre_dec_no = self.param_kernsize * self.ntarget
         pre_dec_feat = util_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
         self.pre_mean_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
-        self.pre_var_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+        self.pre_u_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -1122,6 +1187,58 @@ class operator_transient(operator):
 
         # --! prune extra dimensionality caused by multidimensional data
         return self.fun_prune(fun) if self.nfeature > 1 else fun
+
+    def embed_uncertainty(self, timeseries):
+
+        # --! reshape timeseries to form an input to embeddings encoder
+        #
+        # --! the length of timeseries is reshaped to put kernels into the prelast dimension, i.e.
+        # --! [B, T, ndim] -> [B, T / kernsize, kernsize, ndim], where
+        # --! B, T and ndim are the number of batch elements,
+        # --! timesteps and data channels, respectively
+        #
+        # --! note that -1 below infers the size of a dimension
+        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
+        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
+
+        # --! based on inputs, encode parameter kernels (filters)
+        kern = self.fun_u_enc(i)
+
+        nparam = sum(self.fun.values())
+
+        # --! reshape encoded kernels to support their next multiplication with inputs, e.g.
+        # --!
+        # --! kernels:
+        # --! [B, T / kernsize, nparam * kernsize * C] -> [B, T / kernsize, nparam, kernsize, C]
+        # --!
+        # --! inputs:
+        # --! [B, T / kernsize, kernsize * C] -> [B, T / kernsize, kernsize, C]
+        kern = kern.reshape(
+            i.shape[0], i.shape[1],
+            nparam,
+            self.param_kernsize * self.nfeature)
+        kern = kern.reshape(
+            i.shape[0], i.shape[1],
+            nparam,
+            self.param_kernsize, self.nfeature)
+        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
+
+        # --! with the help of kernels extract function parameters from input timeseries
+        param = torch.einsum("blkdf, bldf -> blfk", kern, i)
+
+        # --! split extracted parameters based on the number of parameters required by each
+        # --! type of grouped basis functions
+        param = torch.split(param, list(self.fun.values()), dim=-1)
+
+        # --! evaluate embedding functions at each slice of timeseries
+        fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+
+        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nfun]
+        # --! to [B, T / kernsize, ndim * nfun]
+        fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
+
+        # --! prune extra dimensionality caused by multidimensional data
+        return self.fun_u_prune(fun) if self.nfeature > 1 else fun
 
     def predict_mean(self, functions):
 
@@ -1202,6 +1319,39 @@ class operator_transient(operator):
         # --! note that the lookback window is -1, because we do not predict the initial condition
         return torch.split(err_pre, [err_nsample - 1, self.fun_nsample_forecast], dim=1)
 
+    def predict_uncertainty(self, functions):
+
+        # --! constants for convenience
+        batsize = functions.shape[0]
+        fun_nsample = functions.shape[1]
+        nfun = functions.shape[2]
+
+        # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
+        # --! capture the evolution of function values
+        i = torch.flatten(functions, start_dim=1)
+        mat = self.mod_u_gen(i).reshape(batsize, -1, nfun, nfun)
+        mat = util_nn.cumprod_mat(mat[:, 1:])
+
+        # --! extract the initial condition of function history
+        #
+        # --! the initial condition (ic) is shaped as [B, 1, 1, nfun] to allow tensor broadcasting
+        # --! when multiplying by the matrices
+        fun_ic = torch.unsqueeze(functions[:, :1], -2)
+
+        # --! predict the evolution of functions by multiplying their initial conditions by the matrices
+        #
+        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun],
+        # --! i.e. a batch with function trajectories consisting of individual error-points [1, nfun]
+        fun_pre = torch.matmul(fun_ic, mat)
+
+        # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
+        fun_pre = torch.squeeze(fun_pre, -2)
+
+        # --! return separate predictions for lookback and forecast windows
+        #
+        # --! note that the lookback window is -1, because we do not predict the initial condition
+        return torch.split(fun_pre, [fun_nsample - 1, self.fun_nsample_forecast], dim=1)
+
     def forward(self, timeseries):
 
         # --! from given timeseries, embed latent function values and then predict these embeddings
@@ -1210,22 +1360,9 @@ class operator_transient(operator):
         fun_pre, fun_pre_forecast = self.predict_mean(fun)
         fun_pre                   = torch.cat([fun[:, :1], fun_pre], dim=1)
 
-        # --! compute a function prediction error (difference) and normalize the error in order to
-        # --! facilitate subsequent learning of the error dynamics
-        dfun         = fun_pre - fun        
-        dfun_mean    = torch.mean(dfun, dim=1, keepdim=True)
-        dfun_std     = torch.std(dfun, dim=1, keepdim=True)
-        dfun         = (dfun - dfun_mean) / (dfun_std + 1e-8)
-
-        # --! predict the evolution of a function error starting from the first error value upto
-        # --! a specified horizon
-        dfun_pre, dfun_pre_forecast = self.predict_var(dfun)
-        dfun_pre                    = torch.cat([dfun[:, :1], dfun_pre], dim=1)
-
-        # --! denormalize predicted errors to restore original magnitudes, which are essential for
-        # --! decoding the right uncertainty magnitudes
-        dfun_pre_unsca = torch.cat([dfun_pre, dfun_pre_forecast], dim=1)
-        dfun_pre_unsca = dfun_pre_unsca * dfun_std + dfun_mean
+        fun_u = self.embed_uncertainty(timeseries)
+        fun_u_pre, fun_u_pre_forecast = self.predict_uncertainty(fun_u)
+        fun_u_pre = torch.cat([fun_u[:, :1], fun_u_pre], dim=1)
 
         # --! decode predicted embeddings to timeseries
         #
@@ -1235,11 +1372,11 @@ class operator_transient(operator):
         timeseries_pre_mean = self.pre_mean_dec(torch.cat([fun_pre, fun_pre_forecast], dim=1))
         timeseries_pre_mean = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.ntarget)
 
-        # --! decode predicted and denormalized function errors to model uncertainty (variance)
-        timeseries_pre_var  = self.pre_var_dec(dfun_pre_unsca)
-        timeseries_pre_var  = timeseries_pre_var.reshape(timeseries_pre_var.shape[0], -1, self.ntarget)
+        # --! decode predicted and denormalized function uncertainty to model uncertainty
+        timeseries_u_pre = self.pre_u_dec(torch.cat([fun_u_pre, fun_u_pre_forecast], dim=1))
+        timeseries_u_pre = timeseries_u_pre.reshape(timeseries_u_pre.shape[0], -1, self.ntarget)
 
-        return timeseries_pre_mean, timeseries_pre_var, fun, fun_pre, dfun, dfun_pre
+        return timeseries_pre_mean, timeseries_u_pre, fun, fun_pre, fun_u, fun_u_pre
 
     def freeze_mean(self):
         util_nn.freeze_module(self.fun_enc)
@@ -1250,16 +1387,21 @@ class operator_transient(operator):
         util_nn.freeze_module(self.pre_mean_dec)
 
     def freeze_var(self):
-        util_nn.freeze_module(self.mod_var_gen)
-        util_nn.freeze_module(self.pre_var_dec)
+        util_nn.freeze_module(self.fun_u_enc)
+        if self.nfeature > 1:
+            util_nn.freeze_module(self.fun_u_prune)
+        util_nn.freeze_module(self.mod_u_gen)
+        util_nn.freeze_module(self.pre_u_dec)
 
     def unfreeze(self):
         util_nn.unfreeze_module(self.fun_enc)
+        util_nn.unfreeze_module(self.fun_u_enc)
         if self.nfeature > 1:
             util_nn.unfreeze_module(self.fun_prune)
+            util_nn.unfreeze_module(self.fun_u_prune)
         util_nn.unfreeze_module(self.mod_mean_att_enc)
         util_nn.unfreeze_module(self.mod_mean_gen)
-        util_nn.unfreeze_module(self.mod_var_gen)
+        util_nn.unfreeze_module(self.mod_u_gen)
         util_nn.unfreeze_module(self.pre_mean_dec)
-        util_nn.unfreeze_module(self.pre_var_dec)
+        util_nn.unfreeze_module(self.pre_u_dec)
 

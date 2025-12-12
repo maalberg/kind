@@ -115,14 +115,11 @@ def make_policy(duffing, q=[1.0, 0.1], r=[1.0]):
     k = np.linalg.solve(lhs, rhs)
 
     # --! wrap the gain matrix in a callable policy strategy
-    return util_dyna.lqr(k, noise=0.01)    
+    return util_dyna.lqr(k, noise=0.0)    
 
 
 class dataset(util_data.dataset):
     """Represents synthetic Duffing data, both nominal and excursion."""
-
-    # --! minimum standard deviation to avoid division by zero-like deviation values
-    min_std = torch.tensor(1e-3, dtype=torch.float32)
 
     state_ndim = 2
     control_ndim = 1
@@ -137,9 +134,6 @@ class dataset(util_data.dataset):
                          data_nsample, data_split_size,
                          batch_size, window_nsample)
 
-        self.mean = 0.
-        self.std = self.min_std
-
     def make_path(self, data_type='nom'):
         file_name = self.file_name + '_' + data_type + self.file_ext
         return os.path.join(self.file_dir, file_name)
@@ -148,28 +142,44 @@ class dataset(util_data.dataset):
         """Extracts the first two feature dimensions: position and velocity."""
         return window[:, :, :self.state_ndim]
 
-    def adapt_mask(self, window):
+    def init_normalization(self):
 
-        # --! mask stays as it is
-        return window
+        # --! read nominal data
+        timeseries_nom = self.read_timeseries(self.make_path(data_type='nom'))
+        state_and_control, _ = torch.split(timeseries_nom, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-    def init_normalization(self, timeseries):
+        # --! take nominal statistics
+        self.mean_nom = state_and_control.mean()
+        self.std_nom = state_and_control.std()
+        self.std_nom = torch.maximum(self.std_nom, self.min_std)
 
-        state_and_control, _ = torch.split(timeseries, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+        # --! read excursion data
+        timeseries_exc = self.read_timeseries(self.make_path(data_type='exc'))
+        state_and_control, _ = torch.split(timeseries_exc, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-        # --! take global statistics
-        self.mean = state_and_control.mean()
-        self.std = state_and_control.std()
-        self.std = torch.maximum(self.std, self.min_std)
+        # --! take excursion statistics
+        self.mean_exc = state_and_control.mean()
+        self.std_exc = state_and_control.std()
+        self.std_exc = torch.maximum(self.std_exc, self.min_std)
 
-    def normalize(self, window):
+    def normalize(self, window, data_type='nom'):
+
+        # --! this method is not supposed to be called for mixed data
+        assert data_type in ['nom', 'exc']
+
+        if data_type=='nom':
+            mean = self.mean_nom
+            std = self.std_nom
+        else:
+            mean = self.mean_exc
+            std = self.std_exc
 
         if window.shape[-1]==self.state_ndim:
-            window = torch.clip((window - self.mean) / self.std, min=-3.0, max=3.0)
+            window = (window - mean) / std
         else:
             state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-            state_and_control = torch.clip((state_and_control - self.mean) / self.std, min=-3.0, max=3.0)
+            state_and_control = (state_and_control - mean) / std
             state, control = torch.split(state_and_control, [self.state_ndim, self.control_ndim], dim=-1)
             control = control * mask
 
@@ -177,31 +187,25 @@ class dataset(util_data.dataset):
 
         return window
 
-    def denormalize(self, window):
+    def denormalize(self, window, data_type='nom'):
+
+        # --! this method is not supposed to be called for mixed data
+        assert data_type in ['nom', 'exc']
+
+        if data_type=='nom':
+            mean = self.mean_nom
+            std = self.std_nom
+        else:
+            mean = self.mean_exc
+            std = self.std_exc
 
         if window.shape[-1]==self.state_ndim:
-            window = window * self.std + self.mean
+            window = window * std + mean
         else:
             state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
-
-            state_and_control = state_and_control * self.std + self.mean
+            state_and_control = state_and_control * std + mean
 
             window = torch.cat([state_and_control, mask], dim=-1)
 
         return window
-
-    def noise(self, window):
-
-        # --! measured data already has noise
-        return window
-
-
-class dataset_factory(util_data.dataset_factory):
-
-    def create_synthetic(self, args):
-        return dataset(
-            args.file_dir, args.file_name, args.file_ext,
-            args.data_nsample,
-            (args.data_train_size, args.data_test_size),
-            args.batch_size, (args.lookback_nsample, args.forecast_nsample))
 

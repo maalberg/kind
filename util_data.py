@@ -15,9 +15,13 @@ from sklearn.model_selection import train_test_split
 
 class dataset(interface):
 
+    # --! minimum standard deviation to avoid division by zero-like deviation values
+    min_std = torch.tensor(1e-3, dtype=torch.float32)
+
     def __init__(self,
                  file_dir, file_name, file_ext,
                  data_nsample, data_split_size, batch_size, window_nsample):
+
         self.file_dir = file_dir
         self.file_name = file_name
         self.file_ext = file_ext
@@ -26,64 +30,77 @@ class dataset(interface):
         self.batch_size = batch_size
         self.window_nsample = window_nsample
 
+        # --! initialize dataset-wide normalization
+        self.mean_nom = 0.0
+        self.std_nom = self.min_std
+        self.mean_exc = 0.0
+        self.std_exc = self.min_std
+        self.init_normalization()
+
     def load(self, data_type='nom'):
         assert data_type in ['nom', 'exc', 'mixed']
 
         # --! read rolling windows from a data file
         if data_type=='mixed':
-            # --! read both data types
-            timeseries_stat = self.read_timeseries(self.make_path(data_type='nom'))
-            timeseries_trans = self.read_timeseries(self.make_path(data_type='exc'))
+            train_data_nom, valid_data_nom, test_data_nom = self._load_train_test_split(data_type='nom')
+            train_data_exc, valid_data_exc, test_data_exc = self._load_train_test_split(data_type='exc')
 
-            # --! update normalization statistics
-            self.init_normalization(torch.cat([timeseries_stat, timeseries_trans]))
-
-            window_stat = self.extract_window(timeseries_stat)
-            window_trans = self.extract_window(timeseries_trans)
-
-            # --! ensure both data have the same size in the first dimension
-            nwindow = window_stat.shape[0] if window_stat.shape[0] < window_trans.shape[0] else window_trans.shape[0]
-            window_stat = window_stat[:nwindow]
-            window_trans = window_trans[:nwindow]
-
-            # --! interleave both data to lay out windows as stationary, transient, stationary, transient, etc.
-            window = torch.stack([window_stat, window_trans], dim=1)
-            window = torch.flatten(window, start_dim=0, end_dim=1)
+            train_data = self._mix_data(train_data_nom, train_data_exc)
+            valid_data = self._mix_data(valid_data_nom, valid_data_exc)
+            test_data = self._mix_data(test_data_nom, test_data_exc)
         else:
-            timeseries = self.read_timeseries(self.make_path(data_type))
+            train_data, valid_data, test_data = self._load_train_test_split(data_type)
 
-            # --! update normalization statistics
-            self.init_normalization(timeseries)
+        train_loader = self._create_data_loader(train_data, shuffle=True)
+        valid_loader = self._create_data_loader(valid_data, shuffle=False)
+        test_loader = self._create_data_loader(test_data, shuffle=False)
 
-            window = self.extract_window(timeseries)
+        return train_loader, valid_loader, test_loader
 
-        # --! adapt control mask in read data windows to comply with current dataset use case
-        window = self.adapt_mask(window)
-        window = self.noise(window)
+    def _load_train_test_split(self, data_type='nom'):
 
-        # --! split data into train, valid and test partitions
+        # --! this method is not supposed to be called for mixed data
+        assert data_type in ['nom', 'exc']
+
+        timeseries = self.read_timeseries(self.make_path(data_type))
+        window = self.extract_window(timeseries)
+
+        # --! split loaded windows into train, valid, test sets of data
         train_data, valid_test_data = train_test_split(window, train_size=self.split_size[0], shuffle=True)
         valid_data, test_data = train_test_split(valid_test_data, test_size=self.split_size[1], shuffle=True)
 
-        # --! normalize training data
-        train_data = self.normalize(train_data)
+        # --! normalize train data
+        train_data = self.normalize(train_data, data_type)
+
+        # --! test
+        valid_data = self.normalize(valid_data, data_type)
+        test_data = self.normalize(test_data, data_type)
+
+        return train_data, valid_data, test_data
+
+    def _mix_data(self, data_nom, data_exc):
+
+        # --! ensure both data have the same size in the first dimension
+        ndata = data_nom.shape[0] if data_nom.shape[0] < data_exc.shape[0] else data_exc.shape[0]
+        data_nom = data_nom[:ndata]
+        data_exc = data_exc[:ndata]
+
+        # --! interleave both data to lay out windows as nominal, excursion, nominal, excursion, etc.
+        data = torch.stack([data_nom, data_exc], dim=1)
+        data = torch.flatten(data, start_dim=0, end_dim=1)
+
+        return data
+
+    def _create_data_loader(self, data, shuffle=False):
 
         # --! create datasets by splitting the windows into lookback and forecast parts
-        train_back, train_fore = torch.split(train_data, list(self.window_nsample), dim=1)
-        valid_back, valid_fore = torch.split(valid_data, list(self.window_nsample), dim=1)
-        test_back, test_fore = torch.split(test_data, list(self.window_nsample), dim=1)
+        data_back, data_fore = torch.split(data, list(self.window_nsample), dim=1)
 
         # --! since our datasets are already tensors, then wrap them in tensor datasets
-        train_dataset = torch.utils.data.TensorDataset(train_back, train_fore)
-        valid_dataset = torch.utils.data.TensorDataset(valid_back, valid_fore)
-        test_dataset = torch.utils.data.TensorDataset(test_back, test_fore)
+        dataset = torch.utils.data.TensorDataset(data_back, data_fore)
 
         # --! wrap the datasets into loaders
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-        valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=False)
-        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
-
-        return train_loader, valid_loader, test_loader
+        return torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle)
 
     @abstractmethod
     def make_path(self, data_type='nom'):
@@ -92,11 +109,6 @@ class dataset(interface):
     @abstractmethod
     def extract_target(self, window):
         """ Extracts target dimension from given ``window``. """
-        return
-
-    @abstractmethod
-    def adapt_mask(self, window):
-        """ Adapts mask data dimension in ``window`` to the use in current dataset. """
         return
 
     def read_timeseries(self, path):
@@ -110,19 +122,15 @@ class dataset(interface):
         return torch.reshape(data, (ntimeseries, self.data_nsample, data.shape[1]))
 
     @abstractmethod
-    def init_normalization(self, timeseries):
+    def init_normalization(self, timeseries_nom, timeseries_exc):
         return
 
     @abstractmethod
-    def normalize(self, window):
+    def normalize(self, window, data_type='nom'):
         return
 
     @abstractmethod
-    def denormalize(self, window):
-        return
-
-    @abstractmethod
-    def noise(self, window):
+    def denormalize(self, window, data_type='nom'):
         return
 
     def extract_window(self, timeseries):
