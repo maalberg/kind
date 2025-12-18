@@ -23,10 +23,10 @@ def duffing_update(t, state, sim, u):
     return [dx1, dx2]
 
 
-class duffing(util_dyna.simulator):
-    """Simulates a Duffing oscillator."""
+class duffing(util_dyna.environment):
+    """Simulates a Duffing oscillator. In addition, implements Dyna environment interface."""
 
-    def __init__(self, beta, gamma, alpha=-1.0, delta=0.2, omega=1.2):
+    def __init__(self, beta, gamma, alpha=-1.0, delta=0.2, omega=1.2, dt_sim=1e-4, dt_control=1e-2, t_final=100.0):
 
         self.alpha = alpha
         self.beta  = beta
@@ -34,49 +34,93 @@ class duffing(util_dyna.simulator):
         self.delta = delta
         self.omega = omega
 
+        self.ic = [0.0, 0.0]
+        self.x = self.ic[0]
+        self.dx = self.ic[1]
         self.policy = None
 
-    def simulate(self, ic, dt_control=1e-2, dt_sim=1e-4, t_final=100, skip_nsample=0):
+        # --! define simulation timing
+        self.dt_sim = dt_sim
+        self.dt_control = dt_control
+        self.jstep = 0
+        self.t_final = t_final
+        self.nstep = int(self.t_final / self.dt_control)
+
+    def reset(self):
+
+        # --! reset the state to the initial condition
+        self.x = self.ic[0]
+        self.dx = self.ic[1]
+
+        self.jstep = 0
+
+        return [self.x, self.dx]
+
+    def step(self, u):
+
+        # --! define step timing
+        t_start = self.jstep * self.dt_control
+        t = t_start + np.arange(0, self.dt_control, self.dt_sim)
+        t_span = (t[0], t[-1])
+
+        # --! solve this initial value problem
+        solution = solve_ivp(
+            duffing_update,
+            t_span,
+            [self.x, self.dx],
+            t_eval=t,
+            args=(self, u))
+
+        self.jstep += 1
+
+        # --! save the last integrated values as the current state
+        self.x = solution.y[0, -1]
+        self.dx = solution.y[1, -1]
+
+        return [self.x, self.dx]
+
+    def simulate(self):
+        """Simulates this duffing oscillator from time equals 0 seconds till time specified in ``t_final``."""
 
         x_buf = []
         dx_buf = []
         u_buf = []
 
-        x_buf.append(ic[0])
-        dx_buf.append(ic[1])
-        u_buf.append(0.0) # << the first action is initialized with zero
+        # --! first, we reset this simulator to start from the initial condition
+        state = self.reset()
 
-        for step in range(int(t_final / dt_control)):
+        # --! perform a number of simulation steps, where the number is defined by control steps
+        for step in range(self.nstep):
 
-            # --! define the timing of local simulation
-            t_local_start = step * dt_control
-            t_local = t_local_start + np.arange(0, dt_control, dt_sim)
-            t_span = (t_local[0], t_local[-1])
+            # --! derive control input
+            if self.policy is not None:
+                u = np.squeeze(self.policy(np.array(state).reshape((-1, 1))))
+            else:
+                u = 0.0
 
-            # --! simulate locally
-            solution = solve_ivp(duffing_update, t_span, [x_buf[-1], dx_buf[-1]], t_eval=t_local, args=(self, u_buf[-1]))
-
-            # --! save the last integrated value from the local simulation
-            x_buf.append(solution.y[0, -1])
-            dx_buf.append(solution.y[1, -1])
-
-            # --! based on integrated state, compute corresponding control input u
-            state = [x_buf[-1], dx_buf[-1]]
-            u = np.squeeze(self.policy(np.array(state).reshape((-1, 1))))
-
+            # --! save current state and action in replay buffers
+            x_buf.append(state[0])
+            dx_buf.append(state[1])
             u_buf.append(u)
 
+            # --! get the next state
+            state = self.step(u)
+
         # --! reshape lists as column vectors, concatenate them, unsqueeze at axis 0 and return
-        sim_o = np.concatenate([np.array(buf[skip_nsample:]).reshape(-1, 1) for buf in [x_buf, dx_buf, u_buf]], axis=-1)
+        sim_o = np.concatenate([np.array(buf).reshape(-1, 1) for buf in [x_buf, dx_buf, u_buf]], axis=-1)
         return np.expand_dims(sim_o, axis=0)
 
 
 def make_duffing(name):
 
     if name == 'ood':
-        return duffing(20.0, 20.0)
+        d = duffing(20.0, 20.0)
+        d.ic = [2.5, 5.0]
+        return d
     elif name == 'id':
-        return duffing(1.0, 0.1)
+        d = duffing(1.0, 0.1)
+        d.ic = [0.2, 0.2]
+        return d
     else:
         return None
 
