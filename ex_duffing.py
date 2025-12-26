@@ -24,9 +24,9 @@ def duffing_update(t, state, sim, u):
 
 
 class duffing(util_dyna.environment):
-    """Simulates a Duffing oscillator. In addition, implements Dyna environment interface."""
+    """Simulates a Duffing oscillator. Implements Dyna environment interface."""
 
-    def __init__(self, beta, gamma, alpha=-1.0, delta=0.2, omega=1.2, dt_sim=1e-4, dt_control=1e-2, t_final=100.0):
+    def __init__(self, beta, gamma, reward, alpha=-1.0, delta=0.2, omega=1.2, dt_sim=1e-4, dt_control=1e-2, t_final=100.0):
 
         self.alpha = alpha
         self.beta  = beta
@@ -37,7 +37,9 @@ class duffing(util_dyna.environment):
         self.ic = [0.0, 0.0]
         self.x = self.ic[0]
         self.dx = self.ic[1]
+
         self.policy = None
+        self.reward = reward
 
         # --! define simulation timing
         self.dt_sim = dt_sim
@@ -54,11 +56,16 @@ class duffing(util_dyna.environment):
 
         self.jstep = 0
 
-        return [self.x, self.dx]
+        return np.array([[self.x, self.dx]])
 
     def step(self, u):
 
-        # --! define step timing
+        # --! based on current state and action, calculate reward 
+        obs = np.array([[self.x, self.dx]])
+        action = np.array([[u]])
+        reward = self.reward(np.concatenate([obs, action], axis=-1))
+
+        # --! for integration below, define step timing
         t_start = self.jstep * self.dt_control
         t = t_start + np.arange(0, self.dt_control, self.dt_sim)
         t_span = (t[0], t[-1])
@@ -71,13 +78,45 @@ class duffing(util_dyna.environment):
             t_eval=t,
             args=(self, u))
 
-        self.jstep += 1
-
-        # --! save the last integrated values as the current state
+        # --! save the last integrated value as the next observation
         self.x = solution.y[0, -1]
         self.dx = solution.y[1, -1]
 
-        return [self.x, self.dx]
+        next_obs = np.array([[self.x, self.dx]])
+
+        self.jstep += 1
+        done = self.jstep == self.nstep
+
+        return next_obs, reward, done
+
+    def step_batch(self, state, action):
+        """Steps one time step for every ``state`` under corresponding ``action`` and returns the next states."""
+
+        # --! for integration below, define step timing
+        t_start = 0 * self.dt_control
+        t = t_start + np.arange(0, self.dt_control, self.dt_sim)
+        t_span = (t[0], t[-1])
+
+        next_state_buf = []
+
+        for s, a in zip(state, action):
+
+            # --! solve current initial value problem
+            solution = solve_ivp(
+                duffing_update,
+                t_span,
+                [s[0], s[1]],
+                t_eval=t,
+                args=(self, a))
+
+            # --! save the last integrated value as the next state
+            next_x1 = solution.y[0, -1]
+            next_x2 = solution.y[1, -1]
+
+            next_state = np.array([[next_x1, next_x2]])
+            next_state_buf.append(next_state)
+
+        return np.stack(next_state_buf, axis=0)
 
     def simulate(self):
         """Simulates this duffing oscillator from time equals 0 seconds till time specified in ``t_final``."""
@@ -87,42 +126,57 @@ class duffing(util_dyna.environment):
         u_buf = []
 
         # --! first, we reset this simulator to start from the initial condition
-        state = self.reset()
+        obs = self.reset()
+        done = False
 
-        # --! perform a number of simulation steps, where the number is defined by control steps
-        for step in range(self.nstep):
+        # --! step though this environment while not done
+        while not done:
 
             # --! derive control input
             if self.policy is not None:
-                u = np.squeeze(self.policy(np.array(state).reshape((-1, 1))))
+                action = np.squeeze(self.policy(obs))
             else:
-                u = 0.0
+                action = 0.0
 
-            # --! save current state and action in replay buffers
-            x_buf.append(state[0])
-            dx_buf.append(state[1])
-            u_buf.append(u)
+            # --! step to get the next observation
+            next_obs, reward, done = self.step(action)
 
-            # --! get the next state
-            state = self.step(u)
+            # --! save current observation and action in buffers
+            x_buf.append(obs[0, 0])
+            dx_buf.append(obs[0, 1])
+            u_buf.append(action)
+
+            # --! repeat
+            obs = next_obs
 
         # --! reshape lists as column vectors, concatenate them, unsqueeze at axis 0 and return
         sim_o = np.concatenate([np.array(buf).reshape(-1, 1) for buf in [x_buf, dx_buf, u_buf]], axis=-1)
         return np.expand_dims(sim_o, axis=0)
 
 
-def make_duffing(name):
+def make_duffing(name, reward):
 
     if name == 'ood':
-        d = duffing(20.0, 20.0)
+        d = duffing(20.0, 20.0, reward)
         d.ic = [2.5, 5.0]
         return d
     elif name == 'id':
-        d = duffing(1.0, 0.1)
+        d = duffing(1.0, 0.1, reward)
         d.ic = [0.2, 0.2]
         return d
     else:
         return None
+
+
+class lqr(util_dyna.policy):
+
+    def __init__(self, gain, noise=0.0):
+        self.gain = np.atleast_2d(gain)
+        self.noise = noise
+
+    def act(self, state):
+        u = -np.matmul(state, np.transpose(self.gain))
+        return u + self.noise * np.random.standard_normal(size=u.shape)
 
 
 def make_policy(duffing, q=[1.0, 0.1], r=[1.0]):
@@ -159,7 +213,7 @@ def make_policy(duffing, q=[1.0, 0.1], r=[1.0]):
     k = np.linalg.solve(lhs, rhs)
 
     # --! wrap the gain matrix in a callable policy strategy
-    return util_dyna.lqr(k, noise=0.0)    
+    return lqr(k, noise=0.0)    
 
 
 class dataset(util_data.dataset):
