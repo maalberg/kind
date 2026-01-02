@@ -7,11 +7,14 @@ import os
 
 import torch
 
+import random
 from scipy import signal
 from scipy.integrate import solve_ivp
+from collections import deque
 
 import util_data
 import util_dyna
+import reinforcement_learning as rl
 
 
 def duffing_update(t, state, sim, u):
@@ -118,7 +121,7 @@ class duffing(util_dyna.environment):
 
         return np.stack(next_state_buf, axis=0)
 
-    def simulate(self):
+    def simulate(self, skip_nsample=0):
         """Simulates this duffing oscillator from time equals 0 seconds till time specified in ``t_final``."""
 
         x_buf = []
@@ -150,7 +153,7 @@ class duffing(util_dyna.environment):
             obs = next_obs
 
         # --! reshape lists as column vectors, concatenate them, unsqueeze at axis 0 and return
-        sim_o = np.concatenate([np.array(buf).reshape(-1, 1) for buf in [x_buf, dx_buf, u_buf]], axis=-1)
+        sim_o = np.concatenate([np.array(buf[skip_nsample:]).reshape(-1, 1) for buf in [x_buf, dx_buf, u_buf]], axis=-1)
         return np.expand_dims(sim_o, axis=0)
 
 
@@ -179,8 +182,10 @@ class lqr(util_dyna.policy):
         return u + self.noise * np.random.standard_normal(size=u.shape)
 
 
-def make_policy(duffing, q=[1.0, 0.1], r=[1.0]):
-    """Makes a baseline LQR policy for a Duffing oscillator."""
+def make_policy(duffing, q, r, noise=0.0):
+    """Makes a baseline LQR policy for a Duffing oscillator.
+    Parameters ``q`` and ``r`` are diagonal numpy arrays for state and action costs, respectively.
+    Parameter ``noise`` defines the standard deviation of an additive Gaussian noise."""
 
     alpha = duffing.alpha
     delta = duffing.delta
@@ -203,7 +208,7 @@ def make_policy(duffing, q=[1.0, 0.1], r=[1.0]):
     a = sys.A
     b = sys.B
 
-    p = sp.linalg.solve_discrete_are(a, b, np.diag(q), np.diag(r))
+    p = sp.linalg.solve_discrete_are(a, b, q, r)
 
     # --! synthesize LQR gain matrix K = (B.T * P * B + R)^-1 * (B.T * P * A)
     bp = b.T.dot(p)
@@ -213,7 +218,7 @@ def make_policy(duffing, q=[1.0, 0.1], r=[1.0]):
     k = np.linalg.solve(lhs, rhs)
 
     # --! wrap the gain matrix in a callable policy strategy
-    return lqr(k, noise=0.0)    
+    return lqr(k, noise=noise)    
 
 
 class dataset(util_data.dataset):
@@ -285,6 +290,29 @@ class dataset(util_data.dataset):
 
         return window
 
+    def normalize_masked(self, window, mask):
+
+        if window.shape[-1]==self.state_ndim:
+            window_norm = torch.empty_like(window)
+
+            window_norm[mask] = (window[mask] - self.mean_nom) / self.std_nom
+            window_norm[~mask] = (window[~mask] - self.mean_exc) / self.std_exc
+
+            window = window_norm
+        else:
+            state_and_control, control_mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+            state_and_control_norm = torch.empty_like(state_and_control)
+
+            state_and_control_norm[mask] = (state_and_control[mask] - self.mean_nom) / self.std_nom
+            state_and_control_norm[~mask] = (state_and_control[~mask] - self.mean_exc) / self.std_exc
+
+            state, control = torch.split(state_and_control_norm, [self.state_ndim, self.control_ndim], dim=-1)
+            control = control * control_mask
+
+            window = torch.cat([state, control, control_mask], dim=-1)
+
+        return window
+
     def denormalize(self, window, data_type='nom'):
 
         # --! this method is not supposed to be called for mixed data
@@ -306,4 +334,73 @@ class dataset(util_data.dataset):
             window = torch.cat([state_and_control, mask], dim=-1)
 
         return window
+
+
+class duffing_normalizer(util_data.normalizer):
+
+    def __init__(self):
+        super().__init__()
+
+        self.mean_nom = 0.0
+        self.std_nom = self.std_min
+        self.mean_exc = 0.0
+        self.std_exc = self.std_min
+
+
+class replay_buffer(rl.replay_buffer):
+    def __init__(self, capacity=None):
+        self.buffer = deque(maxlen=capacity)
+
+    def add(self, lookback, reward, next_lookback, done):
+
+        # --! convert a bool flag to a float which is either 0.0 or 1.0
+        done = done.float()
+
+        # --! all entities must be shaped as 3D data
+        done = torch.atleast_3d(done)
+        reward = torch.atleast_3d(reward)
+
+        self.buffer.append((
+            lookback.detach(),
+            reward,
+            next_lookback.detach(),
+            done
+        ))
+
+    def random_batch(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        return map(torch.cat, zip(*batch))
+
+    def empty(self):
+        return len(self.buffer)==0
+
+    def encode_lookback(self, sa_window):
+        s, a = map(torch.cat, zip(*sa_window))
+        return torch.unsqueeze(torch.cat([s, a, torch.ones_like(a)], dim=-1), 0)
+
+    def encode_sa(self, s, a):
+        return torch.cat([s, a, torch.ones_like(a)], dim=-1)
+
+    def extract_current_state(self, lookback):
+        return lookback[:, [-1], :2]
+
+    def update_current_action(self, lookback, a):
+        lookback[:, -2:, [2]] = a
+
+    def update_lookback(self, lookback, s):
+
+        # --! make a dummy (zero) action
+        a = torch.zeros(s.shape[0], s.shape[1], 1)
+
+        sa = self.encode_sa(s, a)
+        return torch.cat([lookback[:, 1:], sa], dim=1)
+
+    def get_coarse_zeta(self, lookback):
+
+        # --! compute norms of states
+        state, _ = torch.split(lookback, [2, 1 + 1], dim=-1) # <- get the number of data dimensions !!!
+        return torch.mean(torch.linalg.norm(state, dim=-1, keepdim=True), dim=1, keepdim=True)
+
+    def coarse_zeta_threshold(self):
+        return 0.05
 

@@ -13,6 +13,20 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 
+class normalizer(interface):
+
+    # --! minimum standard deviation to avoid division by zero-like deviation values
+    std_min = torch.tensor(1e-3, dtype=torch.float32)
+
+    @abstractmethod
+    def normalize(self, data):
+        return
+
+    @abstractmethod
+    def denormalize(self, data):
+        return
+
+
 class dataset(interface):
 
     # --! minimum standard deviation to avoid division by zero-like deviation values
@@ -35,7 +49,7 @@ class dataset(interface):
         self.std_nom = self.min_std
         self.mean_exc = 0.0
         self.std_exc = self.min_std
-        self.init_normalization()
+        self.norm = self.init_normalization()
 
     def load(self, data_type='nom'):
         assert data_type in ['nom', 'exc', 'mixed']
