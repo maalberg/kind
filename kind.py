@@ -12,8 +12,6 @@ import json
 import util_data
 import util_nn
 
-from matplotlib import pyplot as plt
-
 
 def create_args_parser():
     """ Creates a command-line parser for KIND arguments. """
@@ -67,212 +65,108 @@ class model(torch.nn.Module):
 
         self.args = args
 
-        # --! declare KIND operators
-        self.stationary = operator_stationary(args)
-        self.transient = operator_transient(args)
+        self.model_nom = operator_nom(args)
+        self.model_exc = operator_exc(args)
 
-        # --! specify states, or modes, of this model that will define its behavior
-        self._mode_fit = model_fit(self)
-        self._mode_eval = model_eval(self)
-        self._mode = self._mode_fit
+    def forward(self, lookback):
 
-    def fit_next(self):
-        """ Advances this model to next fit state. Returns True if the model has been advanced, False if there is no next state. """
-        return self._get_mode().fit_next()
-
-    def fit(self, dataset):
-        """ Fits this KIND model to given ``dataset`` according to the model's current mode and fit state. """
-        return self._get_mode().fit(dataset)
-
-    def forward(self, dataset, timeseries):
-        """ Uses given ``timeseries`` to execute a forward pass of this model according to current mode. """
-        return self._get_mode().forward(dataset, timeseries)
-
-    def train(self, mode=True):
-        """ Switches this model mode according to ``mode``: True - go to fit, False - go to evaluation mode. """
-
-        if mode is True:
-            self._get_mode().train()
-        else:
-            self._get_mode().eval()
-
-        # --! according to the interface of torch.nn.Module, this method returns self
-        return self
-
-    def eval(self):
-        """ Sets this model into evaluation mode. """
-        return self.train(mode=False) # < delegate execution to train method
-
-    def _get_mode_fit(self):
-        return self._mode_fit
-
-    def _get_mode_eval(self):
-        return self._mode_eval
-
-    def _get_mode(self):
-        return self._mode
-
-    def _set_mode(self, mode):
-        self._mode = mode
-
-    def _train_module(self, mode=True):
-        """ Calls the super class of this PyTorch module to change the behavior of particular modules. """
-        super().train(mode)
-
-class model_mode(interface):
-    """ Represents current mode of a KIND model, e.g. fit or evaluate. """
-
-    def __init__(self, model):
-        super().__init__()
-
-        # --! keep reference to a KIND model
-        self.model = model
-
-    @abstractmethod
-    def train(self):
-        """ Sets this model into training mode. """
-        return
-
-    @abstractmethod
-    def eval(self):
-        """ Sets this model into evaluation mode. """
-        return
-
-    @abstractmethod
-    def fit_next(self):
-        """ Advances KIND model to next fit state. Returns True if the model has been advanced, False if there is no next state. """
-        return
-
-    @abstractmethod
-    def fit(self, dataset):
-        """ Fits this KIND model to given ``dataset`` according to the model's current mode and fit state. """
-        return
-
-    @abstractmethod
-    def forward(self, dataset, timeseries):
-        """ Executes a forward pass on given ``timeseries`` according to current mode of this KIND model. """
-        return
-
-    def _forward_norm(self, window):
-        """ Executes a forward pass through this model using normalized data ``window``. """
-
-        # --! execute both operators on given time series
-        timeseries_stat, timeseries_stat_var, fun_stat, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model.stationary(window)
-        timeseries_trans, timeseries_trans_var, fun_trans, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model.transient(window)
+        # --! execute both operators on the given lookback
+        mean_nom, zeta_nom, fun_nom, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model_nom(lookback)
+        mean_exc, zeta_exc, fun_exc, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model_exc(lookback)
 
         # --! derive alpha
-        alpha = timeseries_trans_var / (timeseries_trans_var + timeseries_stat_var)
+        alpha = zeta_exc / (zeta_exc + zeta_nom)
 
         # --! blend the two types of time series using the derived alpha to get the final prediction
-        timeseries_pred = alpha * timeseries_stat + (1 - alpha) * timeseries_trans
+        prediction = alpha * mean_nom + (1 - alpha) * mean_exc
 
-        output = (
-            timeseries_pred,
-            timeseries_stat, timeseries_stat_var,
-            timeseries_trans, timeseries_trans_var,
-            fun_stat, fun_stat_pred,
-            fun_trans, fun_trans_pred,
+        model_output = (
+            prediction,
+            mean_nom, zeta_nom,
+            mean_exc, zeta_exc,
+            fun_nom, fun_stat_pred,
+            fun_exc, fun_trans_pred,
             alpha,
             dfun_stat, dfun_stat_pred,
             dfun_trans, dfun_trans_pred
         )
 
-        return output
+        return model_output
 
 
-class model_eval(model_mode):
-    """ Represents an evaluation mode of a KIND model. """
+class adapter(interface):
+
+    @abstractmethod
+    def forward(self, lookback):
+        return
+
+    @abstractmethod
+    def train(self, mode=True):
+        return
+
+    @abstractmethod
+    def eval(self):
+        return
+
+    @property
+    @abstractmethod
+    def args(self):
+        return
+
+    @property
+    @abstractmethod
+    def model_nom(self):
+        return
+
+    @property
+    @abstractmethod
+    def model_exc(self):
+        return
+
+    @abstractmethod
+    def parameters(self):
+        return
+
+    @abstractmethod
+    def state_dict(self):
+        return
+
+    @abstractmethod
+    def load_state_dict(self, state_dict):
+        return
+
+    def __call__(self, lookback):
+        return self.forward(lookback)
+
+
+class training:
+    """Manages a phase-by-phase training of a KIND model."""
 
     def __init__(self, model):
-        super().__init__(model)
 
-    def train(self):
-        """ Sets this KIND model into fit mode. """
-        self.model._set_mode(self.model._get_mode_fit())
-        self.model._train_module(mode=True)
+        self.model = model
 
-    def eval(self):
-        """ Returns immediately as KIND model is already in evaluation mode. """
-        return
-    
-    def fit_next(self):
-        return False
+        # --! create internal states that denote training phases
+        self.phase_mean_nom = mean_training_nom(self)
+        self.phase_zeta_nom = zeta_training_nom(self)
+        self.phase_mean_exc = mean_training_exc(self)
+        self.phase_zeta_exc = zeta_training_exc(self)
 
-    def fit(self, dataset):
-        """ Returns immediately as KIND model is currently in evaluation mode. """
-        return
-
-    def forward(self, dataset, window):
-        """ Executes a forward pass through this model using denormalized ``window`` loaded from given ``dataset``. """
-
-        # --! normalize data
-        #timeseries = dataset.normalize(window)
-
-        # --! having normalized given data, call the normalized version of KIND forward method
-        model_output = self._forward_norm(window)
-
-        # --! extract to-be-unscaled timeseries from the forwarded result
-        timeseries_pred = model_output[0]
-        timeseries_stat = model_output[1]
-        timeseries_trans = model_output[3]
-
-        # --! denormalize predicted timeseries
-        #
-        # --! since the indeces of target dimensions must be present in above dictionaries,
-        # --! we use these indeces to directly access the dictionaries
-        #timeseries_pred = dataset.denormalize(timeseries_pred)
-        #timeseries_stat = dataset.denormalize(timeseries_stat)
-        #timeseries_trans = dataset.denormalize(timeseries_trans)
-
-        # --! put unscaled timeseries back to the result tuple and return the tuple
-        model_output = list(model_output)
-        model_output[0] = timeseries_pred
-        model_output[1] = timeseries_stat
-        model_output[3] = timeseries_trans
-
-        return tuple(model_output)
-
-
-class model_fit(model_mode):
-    """ Represents a fit mode of a KIND model. """
-
-    def __init__(self, model):
-        super().__init__(model)
-
-        # --! create states of this mode
-        self._state_stationary_mean          = fit_stationary_mean(self)
-        self._state_stationary_uncertainty   = fit_stationary_uncertainty(self)
-        self._state_transient_mean           = fit_transient_mean(self)
-        self._state_transient_uncertainty    = fit_transient_uncertainty(self)
-        self._state                          = self._state_stationary_mean
-
-    def train(self):
-        """ Returns immediately as this KIND model is already in fit mode. """
-        return
-
-    def eval(self):
-        """ Sets this KIND model into evaluation mode. """
-        self.model._set_mode(self.model._get_mode_eval())
-        self.model._train_module(mode=False)
+        # --! we start with the training of nominal mean
+        self.phase = self.phase_mean_nom
 
     def fit_next(self):
-        return self.get_state().next()
+        return self.get_phase().next()
 
     def fit(self, dataset):
-        """ Fits this KIND model to given ``dataset`` according to the model's current mode and fit state.
-
-        The implementation of this training algorithm resembles the Template pattern, because the method
-        defines a structure for training and then calls state classes
-        to carry out specific tasks that may vary.
-        """
 
         args = self.model.args
 
         # --! make model initializations, data loading, optimizer selection, etc.
         #
         # --! select optimizer after initializing this model!
-        self.get_state().init_model()
-        train_loader, valid_loader, test_loader = self.get_state().load_data(dataset)
+        self.get_phase().init_model()
+        train_loader, valid_loader, test_loader = self.get_phase().load_data(dataset)
         model_optim = self.select_optimizer()
         early_stopping = util_nn.early_stopping(patience=args.patience, checkpoint_path=args.checkpoints)
 
@@ -293,7 +187,7 @@ class model_fit(model_mode):
                 model_optim.zero_grad()
 
                 # --! forward pass
-                loss = self.get_state().compute_loss(dataset, truth, self.get_state().forward(dataset, back))
+                loss = self.get_phase().compute_loss(truth, self.get_phase().forward(back))
                 train_loss.append(loss.item())
 
                 # --! backward pass
@@ -319,27 +213,23 @@ class model_fit(model_mode):
         self.model.load_state_dict(torch.load(best_model_path, weights_only=True))
         return
 
-    def forward(self, dataset, timeseries):
-        """ Executes a forward pass on normalized ``timeseries`` in fit mode. """
-        return self._forward_norm(timeseries)
+    def get_phase_mean_nom(self):
+        return self.phase_mean_nom
 
-    def get_state_stationary_mean(self):
-        return self._state_stationary_mean
+    def get_phase_zeta_nom(self):
+        return self.phase_zeta_nom
 
-    def get_state_stationary_uncertainty(self):
-        return self._state_stationary_uncertainty
+    def get_phase_mean_exc(self):
+        return self.phase_mean_exc
 
-    def get_state_transient_mean(self):
-        return self._state_transient_mean
+    def get_phase_zeta_exc(self):
+        return self.phase_zeta_exc
 
-    def get_state_transient_uncertainty(self):
-        return self._state_transient_uncertainty
+    def get_phase(self):
+        return self.phase
 
-    def get_state(self):
-        return self._state
-
-    def set_state(self, state):
-        self._state = state
+    def set_phase(self, phase):
+        self.phase = phase
 
     def validate(self, dataset, data_loader):
 
@@ -359,7 +249,7 @@ class model_fit(model_mode):
                 # --! extract target dimensions
                 truth = dataset.extract_target(truth)
 
-                loss = self.get_state().compute_loss(dataset, truth, self.get_state().forward(dataset, back), validated=True)
+                loss = self.get_phase().compute_loss(truth, self.get_phase().forward(back))
                 total_loss.append(loss)
 
         # --! reset this model back to training mode
@@ -374,14 +264,14 @@ class model_fit(model_mode):
             weight_decay=self.model.args.weight_decay)
 
 
-class fit_state(interface):
-    """ Manages a state of a KIND model fit mode, e.g. when fitting a stationary mean, or transient uncertainty. """
+class training_phase(interface):
+    """Describes a KIND training phase."""
 
-    def __init__(self, mode):
+    def __init__(self, training):
         super().__init__()
 
-        # --! reference to a fit mode of a KIND model
-        self.mode = mode
+        # --! reference to the training procedure
+        self.training = training
 
     @abstractmethod
     def init_model(self):
@@ -394,12 +284,12 @@ class fit_state(interface):
         return
 
     @abstractmethod
-    def forward(self, dataset, timeseries):
+    def forward(self, lookback):
         """ Executes a forward pass of a KIND model. """
         return
 
     @abstractmethod
-    def compute_loss(self, dataset, true, pred, validated=False):
+    def compute_loss(self, true, pred):
         """ Computes loss based on ``true`` and ``pred``icted timeseries. """
         return
 
@@ -424,29 +314,30 @@ class fit_state(interface):
         return loss.mean()
 
 
-class fit_stationary_mean(fit_state):
+class mean_training_nom(training_phase):
 
-    def __init__(self, mode):
-        super().__init__(mode)
+    def __init__(self, training):
+        super().__init__(training)
 
     def init_model(self):
 
-        print('>>> train nominal mean >>>')
-        model = self.mode.model
+        print('>>> training nominal mean >>>')
 
-        model.transient.freeze_mean()
-        model.transient.freeze_var()
+        model = self.training.model
 
-        model.stationary.unfreeze()
-        model.stationary.freeze_var()
+        model.model_exc.freeze_mean()
+        model.model_exc.freeze_var()
+
+        model.model_nom.unfreeze()
+        model.model_nom.freeze_var()
 
     def load_data(self, dataset):
         return dataset.load(data_type='nom')
 
-    def forward(self, dataset, timeseries):
-        return self.mode.model(dataset, timeseries)
+    def forward(self, lookback):
+        return self.training.model(lookback)
 
-    def compute_loss(self, dataset, true, pred, validated=False):
+    def compute_loss(self, true, pred):
 
         timeseries = true
         timeseries_pred = pred[1] # < stationary prediction
@@ -461,33 +352,34 @@ class fit_stationary_mean(fit_state):
         return loss
 
     def next(self):
-        self.mode.set_state(self.mode.get_state_stationary_uncertainty())
+        self.training.set_phase(self.training.get_phase_zeta_nom())
         return True
 
 
-class fit_stationary_uncertainty(fit_state):
+class zeta_training_nom(training_phase):
 
-    def __init__(self, mode):
-        super().__init__(mode)
+    def __init__(self, training):
+        super().__init__(training)
 
     def init_model(self):
 
-        print('>>> train nominal uncertainty >>>')
-        model = self.mode.model
+        print('>>> training nominal uncertainty >>>')
 
-        model.transient.freeze_mean()
-        model.transient.freeze_var()
+        model = self.training.model
 
-        model.stationary.unfreeze()
-        model.stationary.freeze_mean()
+        model.model_exc.freeze_mean()
+        model.model_exc.freeze_var()
+
+        model.model_nom.unfreeze()
+        model.model_nom.freeze_mean()
 
     def load_data(self, dataset):
         return dataset.load(data_type='mixed')
 
-    def forward(self, dataset, timeseries):
-        return self.mode.model(dataset, timeseries)
+    def forward(self, lookback):
+        return self.training.model(lookback)
 
-    def compute_loss(self, dataset, true, pred, validated=False):
+    def compute_loss(self, true, pred):
 
         timeseries = true
         timeseries_pred_mean = pred[1]
@@ -502,7 +394,7 @@ class fit_stationary_uncertainty(fit_state):
         return loss
 
     def next(self):
-        self.mode.set_state(self.mode.get_state_transient_mean())
+        self.training.set_phase(self.training.get_phase_mean_exc())
         return True
 
     def apply_criterion_uncertain_test(self, true, pre, pre_u):
@@ -510,29 +402,30 @@ class fit_stationary_uncertainty(fit_state):
         return self.apply_criterion_mean(err, pre_u)
 
 
-class fit_transient_mean(fit_state):
+class mean_training_exc(training_phase):
 
-    def __init__(self, fit):
-        super().__init__(fit)
+    def __init__(self, training):
+        super().__init__(training)
 
     def init_model(self):
 
-        print('>>> train excursion mean >>>')
-        model = self.mode.model
+        print('>>> training excursion mean >>>')
 
-        model.transient.unfreeze()
-        model.transient.freeze_var()
+        model = self.training.model
 
-        model.stationary.freeze_mean()
-        model.stationary.freeze_var()
+        model.model_exc.unfreeze()
+        model.model_exc.freeze_var()
+
+        model.model_nom.freeze_mean()
+        model.model_nom.freeze_var()
 
     def load_data(self, dataset):
         return dataset.load(data_type='exc')
 
-    def forward(self, dataset, timeseries):
-        return self.mode.model(dataset, timeseries)
+    def forward(self, lookback):
+        return self.training.model(lookback)
 
-    def compute_loss(self, dataset, true, pred, validated=False):
+    def compute_loss(self, true, pred):
 
         timeseries = true
         timeseries_pred_mean = pred[3]
@@ -547,33 +440,34 @@ class fit_transient_mean(fit_state):
         return loss
 
     def next(self):
-        self.mode.set_state(self.mode.get_state_transient_uncertainty())
+        self.training.set_phase(self.training.get_phase_zeta_exc())
         return True
 
 
-class fit_transient_uncertainty(fit_state):
+class zeta_training_exc(training_phase):
 
-    def __init__(self, mode):
-        super().__init__(mode)
+    def __init__(self, training):
+        super().__init__(training)
 
     def init_model(self):
 
-        print('>>> train excursion uncertainty >>>')
-        model = self.mode.model
+        print('>>> training excursion uncertainty >>>')
 
-        model.transient.unfreeze()
-        model.transient.freeze_mean()
+        model = self.training.model
 
-        model.stationary.freeze_mean()
-        model.stationary.freeze_var()
+        model.model_exc.unfreeze()
+        model.model_exc.freeze_mean()
+
+        model.model_nom.freeze_mean()
+        model.model_nom.freeze_var()
 
     def load_data(self, dataset):
         return dataset.load(data_type='mixed')
 
-    def forward(self, dataset, timeseries):
-        return self.mode.model(dataset, timeseries)
+    def forward(self, lookback):
+        return self.training.model(lookback)
 
-    def compute_loss(self, dataset, true, pred, validated=False):
+    def compute_loss(self, true, pred):
 
         timeseries = true
         timeseries_pred_mean = pred[3]
@@ -709,8 +603,8 @@ class operator(torch.nn.Module, interface):
         return torch.exp(param)
 
 
-class operator_stationary(operator):
-    """ Models dynamics of stationary timeseries in a DMD-like manner. """
+class operator_nom(operator):
+    """ Models dynamics of nominal timeseries in a DMD-like manner. """
 
     def __init__(self, args):
 
@@ -1044,8 +938,8 @@ class operator_stationary(operator):
         util_nn.unfreeze_module(self.pre_u_dec)
 
 
-class operator_transient(operator):
-    """Models dynamics of transient timeseries using a Transformer-based attention mechanism."""
+class operator_exc(operator):
+    """Models dynamics of excursion timeseries using a Transformer-based attention mechanism."""
 
     def __init__(self, args):
 

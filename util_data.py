@@ -34,7 +34,7 @@ class dataset(interface):
 
     def __init__(self,
                  file_dir, file_name, file_ext,
-                 data_nsample, data_split_size, batch_size, window_nsample):
+                 data_nsample, data_split_size, batch_size, window_nsample, load_normalized=True):
 
         self.file_dir = file_dir
         self.file_name = file_name
@@ -43,13 +43,10 @@ class dataset(interface):
         self.split_size = data_split_size
         self.batch_size = batch_size
         self.window_nsample = window_nsample
+        self.load_normalized = load_normalized
 
-        # --! initialize dataset-wide normalization
-        self.mean_nom = 0.0
-        self.std_nom = self.min_std
-        self.mean_exc = 0.0
-        self.std_exc = self.min_std
-        self.norm = self.init_normalization()
+        # --! initialize a normalizer
+        self.normalizer = self.init_normalization()
 
     def load(self, data_type='nom'):
         assert data_type in ['nom', 'exc', 'mixed']
@@ -62,8 +59,20 @@ class dataset(interface):
             train_data = self._mix_data(train_data_nom, train_data_exc)
             valid_data = self._mix_data(valid_data_nom, valid_data_exc)
             test_data = self._mix_data(test_data_nom, test_data_exc)
+
+            # --! normalize data
+            train_data, _ = self.normalizer.normalize(train_data)
+            if self.load_normalized:
+                valid_data, _ = self.normalizer.normalize(valid_data)
+                test_data, _ = self.normalizer.normalize(test_data)
         else:
             train_data, valid_data, test_data = self._load_train_test_split(data_type)
+
+            # --! normalize data
+            train_data, _ = self.normalizer.normalize(train_data)
+            if self.load_normalized:
+                valid_data, _ = self.normalizer.normalize(valid_data)
+                test_data, _ = self.normalizer.normalize(test_data)
 
         train_loader = self._create_data_loader(train_data, shuffle=True)
         valid_loader = self._create_data_loader(valid_data, shuffle=False)
@@ -82,13 +91,6 @@ class dataset(interface):
         # --! split loaded windows into train, valid, test sets of data
         train_data, valid_test_data = train_test_split(window, train_size=self.split_size[0], shuffle=True)
         valid_data, test_data = train_test_split(valid_test_data, test_size=self.split_size[1], shuffle=True)
-
-        # --! normalize train data
-        train_data = self.normalize(train_data, data_type)
-
-        # --! test
-        valid_data = self.normalize(valid_data, data_type)
-        test_data = self.normalize(test_data, data_type)
 
         return train_data, valid_data, test_data
 
@@ -137,14 +139,6 @@ class dataset(interface):
 
     @abstractmethod
     def init_normalization(self, timeseries_nom, timeseries_exc):
-        return
-
-    @abstractmethod
-    def normalize(self, window, data_type='nom'):
-        return
-
-    @abstractmethod
-    def denormalize(self, window, data_type='nom'):
         return
 
     def extract_window(self, timeseries):
@@ -223,4 +217,9 @@ def write_datafile(name: str, data, delim: str = ','):
     """Writes ``data`` to a file named ``name``. The file is written using a comma-separated-value format."""
     filedata = np.reshape(data, (data.shape[0] * data.shape[1], data.shape[2]))
     np.savetxt(name + '.csv', filedata, fmt='%.14f', delimiter=delim)
+
+
+def ceil(data, decimals=1):
+    mul = 10 ** decimals
+    return torch.ceil(data * mul) / mul
 

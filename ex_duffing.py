@@ -12,9 +12,82 @@ from scipy import signal
 from scipy.integrate import solve_ivp
 from collections import deque
 
+import kind
 import util_data
 import util_dyna
 import reinforcement_learning as rl
+
+from matplotlib import pyplot as plt
+
+
+class kind_model(kind.adapter):
+
+    def __init__(self, model, normalizer):
+
+        self.model = model
+        self.normalizer = normalizer
+        self.trained = False
+
+    def forward(self, lookback):
+
+        # --! if required, normalize input data
+        if not self.trained:
+            lookback, mask = self.normalizer.normalize(lookback)
+
+        # --! pass normalized data to the model
+        model_output = self.model(lookback)
+
+        # --! if required, denormalize model output
+        if not self.trained:
+            # --! extract predictions that need to be denormalized
+            prediction = model_output[0]
+            prediction_nom = model_output[1]
+            prediction_exc = model_output[3]
+
+            # --! denormalize extracted predictions
+            prediction = self.normalizer.denormalize(prediction, mask)
+            prediction_nom = self.normalizer.denormalize(prediction_nom, mask)
+            prediction_exc = self.normalizer.denormalize(prediction_exc, mask)
+
+            # --! put unscaled timeseries back to the result tuple and return the tuple
+            model_output = list(model_output)
+            model_output[0] = prediction
+            model_output[1] = prediction_nom
+            model_output[3] = prediction_exc
+
+            model_output = tuple(model_output)
+
+        # --! return model output
+        return model_output
+
+    @property
+    def args(self):
+        return self.model.args
+
+    @property
+    def model_nom(self):
+        return self.model.model_nom
+
+    @property
+    def model_exc(self):
+        return self.model.model_exc
+
+    def parameters(self):
+        return self.model.parameters()
+
+    def state_dict(self):
+        return self.model.state_dict()
+
+    def load_state_dict(self, state_dict):
+        return self.model.load_state_dict(state_dict)
+
+    def train(self, mode=True):
+        self.trained = mode
+        return self.model.train(mode)
+
+    def eval(self):
+        self.trained = False
+        return self.model.eval()
 
 
 def duffing_update(t, state, sim, u):
@@ -221,6 +294,63 @@ def make_policy(duffing, q, r, noise=0.0):
     return lqr(k, noise=noise)    
 
 
+class normalizer(util_data.normalizer):
+
+    def __init__(self, timeseries_nom, timeseries_exc, state_ndim, control_ndim, mask_ndim):
+
+        # --! save data dimensions
+        self.state_ndim = state_ndim
+        self.control_ndim = control_ndim
+        self.mask_ndim = mask_ndim
+
+        # --! take nominal statistics
+        state_and_control, _ = torch.split(timeseries_nom, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+        self.mean_nom = state_and_control.mean()
+        self.std_nom = state_and_control.std()
+        self.std_nom = torch.maximum(self.std_nom, self.std_min)
+
+        # --! take excursion statistics
+        state_and_control, _ = torch.split(timeseries_exc, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+        self.mean_exc = state_and_control.mean()
+        self.std_exc = state_and_control.std()
+        self.std_exc = torch.maximum(self.std_exc, self.std_min)
+
+        # --! compute a separator between the two regimes based on state norm
+        self.regime_sep = util_data.ceil(self._compute_state_norm(timeseries_nom).mean(), decimals=2)
+
+    def normalize(self, data):
+
+        # --! determine a data mask that differentiates between nominal and excursion data
+        mask = self._compute_state_norm(data) < self.regime_sep
+        mask = torch.squeeze(mask)
+
+        state_and_control, control_mask = torch.split(data, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+        state_and_control_norm = torch.empty_like(state_and_control)
+
+        state_and_control_norm[mask] = (state_and_control[mask] - self.mean_nom) / self.std_nom
+        state_and_control_norm[~mask] = (state_and_control[~mask] - self.mean_exc) / self.std_exc
+
+        state, control = torch.split(state_and_control_norm, [self.state_ndim, self.control_ndim], dim=-1)
+        control = control * control_mask
+
+        return torch.cat([state, control, control_mask], dim=-1), mask
+
+    def denormalize(self, data, mask):
+
+        assert data.shape[-1]==self.state_ndim
+
+        denorm_data = torch.empty_like(data)
+
+        denorm_data[mask] = data[mask] * self.std_nom + self.mean_nom
+        denorm_data[~mask] = data[~mask] * self.std_exc + self.mean_exc
+
+        return denorm_data
+
+    def _compute_state_norm(self, data):
+        state, _ = torch.split(data, [self.state_ndim, self.control_ndim + self.mask_ndim], dim=-1)
+        return torch.mean(torch.linalg.norm(state, dim=-1, keepdim=True), dim=1, keepdim=True)
+
+
 class dataset(util_data.dataset):
     """Represents synthetic Duffing data, both nominal and excursion."""
 
@@ -232,10 +362,10 @@ class dataset(util_data.dataset):
                  file_dir, file_name, file_ext,
                  data_nsample,
                  data_split_size,
-                 batch_size, window_nsample):
+                 batch_size, window_nsample, load_normalized=True):
         super().__init__(file_dir, file_name, file_ext,
                          data_nsample, data_split_size,
-                         batch_size, window_nsample)
+                         batch_size, window_nsample, load_normalized)
 
     def make_path(self, data_type='nom'):
         file_name = self.file_name + '_' + data_type + self.file_ext
@@ -247,104 +377,81 @@ class dataset(util_data.dataset):
 
     def init_normalization(self):
 
-        # --! read nominal data
+        # --! read data
         timeseries_nom = self.read_timeseries(self.make_path(data_type='nom'))
-        state_and_control, _ = torch.split(timeseries_nom, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
-
-        # --! take nominal statistics
-        self.mean_nom = state_and_control.mean()
-        self.std_nom = state_and_control.std()
-        self.std_nom = torch.maximum(self.std_nom, self.min_std)
-
-        # --! read excursion data
         timeseries_exc = self.read_timeseries(self.make_path(data_type='exc'))
-        state_and_control, _ = torch.split(timeseries_exc, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-        # --! take excursion statistics
-        self.mean_exc = state_and_control.mean()
-        self.std_exc = state_and_control.std()
-        self.std_exc = torch.maximum(self.std_exc, self.min_std)
+        return normalizer(timeseries_nom, timeseries_exc, self.state_ndim, self.control_ndim, self.mask_ndim)
 
-    def normalize(self, window, data_type='nom'):
+    #def normalize(self, window, data_type='nom'):
 
         # --! this method is not supposed to be called for mixed data
-        assert data_type in ['nom', 'exc']
+        #assert data_type in ['nom', 'exc']
 
-        if data_type=='nom':
-            mean = self.mean_nom
-            std = self.std_nom
-        else:
-            mean = self.mean_exc
-            std = self.std_exc
+        #if data_type=='nom':
+            #mean = self.mean_nom
+            #std = self.std_nom
+        #else:
+            #mean = self.mean_exc
+            #std = self.std_exc
 
-        if window.shape[-1]==self.state_ndim:
-            window = (window - mean) / std
-        else:
-            state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+        #if window.shape[-1]==self.state_ndim:
+            #window = (window - mean) / std
+        #else:
+            #state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
 
-            state_and_control = (state_and_control - mean) / std
-            state, control = torch.split(state_and_control, [self.state_ndim, self.control_ndim], dim=-1)
-            control = control * mask
+            #state_and_control = (state_and_control - mean) / std
+            #state, control = torch.split(state_and_control, [self.state_ndim, self.control_ndim], dim=-1)
+            #control = control * mask
 
-            window = torch.cat([state, control, mask], dim=-1)
+            #window = torch.cat([state, control, mask], dim=-1)
 
-        return window
+        #return window
 
-    def normalize_masked(self, window, mask):
+    #def normalize_masked(self, window, mask):
 
-        if window.shape[-1]==self.state_ndim:
-            window_norm = torch.empty_like(window)
+        #if window.shape[-1]==self.state_ndim:
+            #window_norm = torch.empty_like(window)
 
-            window_norm[mask] = (window[mask] - self.mean_nom) / self.std_nom
-            window_norm[~mask] = (window[~mask] - self.mean_exc) / self.std_exc
+            #window_norm[mask] = (window[mask] - self.mean_nom) / self.std_nom
+            #window_norm[~mask] = (window[~mask] - self.mean_exc) / self.std_exc
 
-            window = window_norm
-        else:
-            state_and_control, control_mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
-            state_and_control_norm = torch.empty_like(state_and_control)
+            #window = window_norm
+        #else:
+            #state_and_control, control_mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+            #state_and_control_norm = torch.empty_like(state_and_control)
 
-            state_and_control_norm[mask] = (state_and_control[mask] - self.mean_nom) / self.std_nom
-            state_and_control_norm[~mask] = (state_and_control[~mask] - self.mean_exc) / self.std_exc
+            #state_and_control_norm[mask] = (state_and_control[mask] - self.mean_nom) / self.std_nom
+            #state_and_control_norm[~mask] = (state_and_control[~mask] - self.mean_exc) / self.std_exc
 
-            state, control = torch.split(state_and_control_norm, [self.state_ndim, self.control_ndim], dim=-1)
-            control = control * control_mask
+            #state, control = torch.split(state_and_control_norm, [self.state_ndim, self.control_ndim], dim=-1)
+            #control = control * control_mask
 
-            window = torch.cat([state, control, control_mask], dim=-1)
+            #window = torch.cat([state, control, control_mask], dim=-1)
 
-        return window
+        #return window
 
-    def denormalize(self, window, data_type='nom'):
+    #def denormalize(self, window, data_type='nom'):
 
         # --! this method is not supposed to be called for mixed data
-        assert data_type in ['nom', 'exc']
+        #assert data_type in ['nom', 'exc']
 
-        if data_type=='nom':
-            mean = self.mean_nom
-            std = self.std_nom
-        else:
-            mean = self.mean_exc
-            std = self.std_exc
+        #if data_type=='nom':
+            #mean = self.mean_nom
+            #std = self.std_nom
+        #else:
+            #mean = self.mean_exc
+            #std = self.std_exc
 
-        if window.shape[-1]==self.state_ndim:
-            window = window * std + mean
-        else:
-            state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
-            state_and_control = state_and_control * std + mean
+        #if window.shape[-1]==self.state_ndim:
+            #window = window * std + mean
+        #else:
+            #state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+            #state_and_control = state_and_control * std + mean
 
-            window = torch.cat([state_and_control, mask], dim=-1)
+            #window = torch.cat([state_and_control, mask], dim=-1)
 
-        return window
-
-
-class duffing_normalizer(util_data.normalizer):
-
-    def __init__(self):
-        super().__init__()
-
-        self.mean_nom = 0.0
-        self.std_nom = self.std_min
-        self.mean_exc = 0.0
-        self.std_exc = self.std_min
+        #return window
 
 
 class replay_buffer(rl.replay_buffer):
