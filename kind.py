@@ -94,49 +94,16 @@ class model(torch.nn.Module):
         return model_output
 
 
-class adapter(interface):
+class norm_adapter(interface):
+    """Adapts a KIND model to real-world unnormalized inputs."""
 
     @abstractmethod
     def forward(self, lookback):
+        """Forwards an unnormalized ``lookback`` window to a KIND model."""
         return
 
-    @abstractmethod
-    def train(self, mode=True):
-        return
-
-    @abstractmethod
-    def eval(self):
-        return
-
-    @property
-    @abstractmethod
-    def args(self):
-        return
-
-    @property
-    @abstractmethod
-    def model_nom(self):
-        return
-
-    @property
-    @abstractmethod
-    def model_exc(self):
-        return
-
-    @abstractmethod
-    def parameters(self):
-        return
-
-    @abstractmethod
-    def state_dict(self):
-        return
-
-    @abstractmethod
-    def load_state_dict(self, state_dict):
-        return
-
-    def __call__(self, lookback):
-        return self.forward(lookback)
+    def __call__(self, back):
+        return self.forward(back)
 
 
 class training:
@@ -238,6 +205,7 @@ class training:
         # --! set this model into evaluation mode
         self.model.eval()
 
+        # --! with gradients stopped, run validation loop
         with torch.no_grad():
             for back, fore in data_loader:
 

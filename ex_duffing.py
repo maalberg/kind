@@ -17,77 +17,44 @@ import util_data
 import util_dyna
 import reinforcement_learning as rl
 
-from matplotlib import pyplot as plt
 
-
-class kind_model(kind.adapter):
+class model(kind.norm_adapter):
 
     def __init__(self, model, normalizer):
 
         self.model = model
         self.normalizer = normalizer
-        self.trained = False
 
     def forward(self, lookback):
 
-        # --! if required, normalize input data
-        if not self.trained:
-            lookback, mask = self.normalizer.normalize(lookback)
+        # --! normalize input data
+        lookback, mask = self.normalizer.normalize(lookback)
 
         # --! pass normalized data to the model
         model_output = self.model(lookback)
 
-        # --! if required, denormalize model output
-        if not self.trained:
-            # --! extract predictions that need to be denormalized
-            prediction = model_output[0]
-            prediction_nom = model_output[1]
-            prediction_exc = model_output[3]
+        # --! denormalize model output
+        #
+        # --! extract predictions that need to be denormalized
+        prediction = model_output[0]
+        prediction_nom = model_output[1]
+        prediction_exc = model_output[3]
 
-            # --! denormalize extracted predictions
-            prediction = self.normalizer.denormalize(prediction, mask)
-            prediction_nom = self.normalizer.denormalize(prediction_nom, mask)
-            prediction_exc = self.normalizer.denormalize(prediction_exc, mask)
+        # --! denormalize extracted predictions
+        prediction = self.normalizer.denormalize(prediction, mask)
+        prediction_nom = self.normalizer.denormalize(prediction_nom, mask)
+        prediction_exc = self.normalizer.denormalize(prediction_exc, mask)
 
-            # --! put unscaled timeseries back to the result tuple and return the tuple
-            model_output = list(model_output)
-            model_output[0] = prediction
-            model_output[1] = prediction_nom
-            model_output[3] = prediction_exc
+        # --! put unscaled timeseries back to the result tuple and return the tuple
+        model_output = list(model_output)
+        model_output[0] = prediction
+        model_output[1] = prediction_nom
+        model_output[3] = prediction_exc
 
-            model_output = tuple(model_output)
+        model_output = tuple(model_output)
 
         # --! return model output
         return model_output
-
-    @property
-    def args(self):
-        return self.model.args
-
-    @property
-    def model_nom(self):
-        return self.model.model_nom
-
-    @property
-    def model_exc(self):
-        return self.model.model_exc
-
-    def parameters(self):
-        return self.model.parameters()
-
-    def state_dict(self):
-        return self.model.state_dict()
-
-    def load_state_dict(self, state_dict):
-        return self.model.load_state_dict(state_dict)
-
-    def train(self, mode=True):
-        self.trained = mode
-        return self.model.train(mode)
-
-    def eval(self):
-        self.trained = False
-        return self.model.eval()
 
 
 def duffing_update(t, state, sim, u):
@@ -382,76 +349,6 @@ class dataset(util_data.dataset):
         timeseries_exc = self.read_timeseries(self.make_path(data_type='exc'))
 
         return normalizer(timeseries_nom, timeseries_exc, self.state_ndim, self.control_ndim, self.mask_ndim)
-
-    #def normalize(self, window, data_type='nom'):
-
-        # --! this method is not supposed to be called for mixed data
-        #assert data_type in ['nom', 'exc']
-
-        #if data_type=='nom':
-            #mean = self.mean_nom
-            #std = self.std_nom
-        #else:
-            #mean = self.mean_exc
-            #std = self.std_exc
-
-        #if window.shape[-1]==self.state_ndim:
-            #window = (window - mean) / std
-        #else:
-            #state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
-
-            #state_and_control = (state_and_control - mean) / std
-            #state, control = torch.split(state_and_control, [self.state_ndim, self.control_ndim], dim=-1)
-            #control = control * mask
-
-            #window = torch.cat([state, control, mask], dim=-1)
-
-        #return window
-
-    #def normalize_masked(self, window, mask):
-
-        #if window.shape[-1]==self.state_ndim:
-            #window_norm = torch.empty_like(window)
-
-            #window_norm[mask] = (window[mask] - self.mean_nom) / self.std_nom
-            #window_norm[~mask] = (window[~mask] - self.mean_exc) / self.std_exc
-
-            #window = window_norm
-        #else:
-            #state_and_control, control_mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
-            #state_and_control_norm = torch.empty_like(state_and_control)
-
-            #state_and_control_norm[mask] = (state_and_control[mask] - self.mean_nom) / self.std_nom
-            #state_and_control_norm[~mask] = (state_and_control[~mask] - self.mean_exc) / self.std_exc
-
-            #state, control = torch.split(state_and_control_norm, [self.state_ndim, self.control_ndim], dim=-1)
-            #control = control * control_mask
-
-            #window = torch.cat([state, control, control_mask], dim=-1)
-
-        #return window
-
-    #def denormalize(self, window, data_type='nom'):
-
-        # --! this method is not supposed to be called for mixed data
-        #assert data_type in ['nom', 'exc']
-
-        #if data_type=='nom':
-            #mean = self.mean_nom
-            #std = self.std_nom
-        #else:
-            #mean = self.mean_exc
-            #std = self.std_exc
-
-        #if window.shape[-1]==self.state_ndim:
-            #window = window * std + mean
-        #else:
-            #state_and_control, mask = torch.split(window, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
-            #state_and_control = state_and_control * std + mean
-
-            #window = torch.cat([state_and_control, mask], dim=-1)
-
-        #return window
 
 
 class replay_buffer(rl.replay_buffer):

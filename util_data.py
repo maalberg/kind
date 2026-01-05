@@ -59,20 +59,14 @@ class dataset(interface):
             train_data = self._mix_data(train_data_nom, train_data_exc)
             valid_data = self._mix_data(valid_data_nom, valid_data_exc)
             test_data = self._mix_data(test_data_nom, test_data_exc)
-
-            # --! normalize data
-            train_data, _ = self.normalizer.normalize(train_data)
-            if self.load_normalized:
-                valid_data, _ = self.normalizer.normalize(valid_data)
-                test_data, _ = self.normalizer.normalize(test_data)
         else:
             train_data, valid_data, test_data = self._load_train_test_split(data_type)
 
-            # --! normalize data
+        # --! if requested, normalize data
+        if self.load_normalized:
             train_data, _ = self.normalizer.normalize(train_data)
-            if self.load_normalized:
-                valid_data, _ = self.normalizer.normalize(valid_data)
-                test_data, _ = self.normalizer.normalize(test_data)
+            valid_data, _ = self.normalizer.normalize(valid_data)
+            test_data, _ = self.normalizer.normalize(test_data)
 
         train_loader = self._create_data_loader(train_data, shuffle=True)
         valid_loader = self._create_data_loader(valid_data, shuffle=False)
