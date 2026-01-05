@@ -94,18 +94,6 @@ class model(torch.nn.Module):
         return model_output
 
 
-class norm_adapter(interface):
-    """Adapts a KIND model to real-world unnormalized inputs."""
-
-    @abstractmethod
-    def forward(self, lookback):
-        """Forwards an unnormalized ``lookback`` window to a KIND model."""
-        return
-
-    def __call__(self, back):
-        return self.forward(back)
-
-
 class training:
     """Manages a phase-by-phase training of a KIND model."""
 

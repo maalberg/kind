@@ -23,6 +23,10 @@ class normalizer(interface):
         return
 
     @abstractmethod
+    def normalize_state(self, state):
+        return
+
+    @abstractmethod
     def denormalize(self, data):
         return
 

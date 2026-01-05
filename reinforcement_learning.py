@@ -13,24 +13,26 @@ from matplotlib import pyplot as plt
 
 
 class policy_iteration:
-    def __init__(self, model, base_policy):
+    """Implements a model-based policy iteration."""
+
+    def __init__(self, model, base_policy, normalizer):
 
         self.model = model
 
         self.base_policy = base_policy
-        self.res_policy = residual_policy()
+        self.res_policy = residual_policy(normalizer)
 
-        value_fn_ni = model.args.target_ndim
-        value_fn_no = 1
-        self.value_fn_nom = util_nn.fcnn(feat=[value_fn_ni, 64, 64, value_fn_no], actfun_hid='relu')
-        self.value_fn_exc = util_nn.fcnn(feat=[value_fn_ni, 64, 64, value_fn_no], actfun_hid='relu')
+        # --! we use two separate value functions: one for nominal and another for excursion regimes
+        self.value_fn_nom = value_fn(normalizer)
+        self.value_fn_exc = value_fn(normalizer)
 
+        # --! state machine
         self.state_evaluate = iteration_evaluate(self)
         self.state_improve = iteration_improve(self)
         self.state = self.state_evaluate
 
     def iterate(self, replay_nom, replay_exc, dataset):
-        self._get_state().iterate(replay_nom, replay_exc, dataset)
+        return self._get_state().iterate(replay_nom, replay_exc, dataset)
 
     def _get_state_evaluate(self):
         return self.state_evaluate
@@ -62,51 +64,9 @@ class iteration_evaluate(iteration_state):
         loss_nom = self._evaluate_policy(self.iter.value_fn_nom, replay_nom, dataset)
         loss_exc = self._evaluate_policy(self.iter.value_fn_exc, replay_exc, dataset)
 
-        self.iter.value_fn_nom.eval()
-        self.iter.value_fn_exc.eval()
-
-        lookback, reward, next_state, done = map(torch.cat, zip(*replay_nom.buffer))
-        lookback = dataset.normalize(lookback, data_type='nom')
-        obs = replay_nom.extract_current_state(lookback)
-        obs_norm_nom = torch.squeeze(torch.linalg.norm(obs, dim=-1, ord=2))
-        value_nom = torch.squeeze(self.iter.value_fn_nom(obs))
-
-        lookback, reward, next_state, done = map(torch.cat, zip(*replay_exc.buffer))
-        lookback = dataset.normalize(lookback, data_type='exc')
-        obs = replay_exc.extract_current_state(lookback)
-        obs_norm_exc = torch.squeeze(torch.linalg.norm(obs, dim=-1, ord=2))
-        value_exc = torch.squeeze(self.iter.value_fn_exc(obs))
-
-        with torch.no_grad():
-
-            plt.figure(figsize=(6,10))
-
-            plt.subplot(4,1,1)
-            plt.plot(loss_nom)
-            plt.xlabel('epochs')
-            plt.ylabel('nominal loss')
-
-            plt.subplot(4,1,2)
-            plt.scatter(obs_norm_nom, value_nom)
-            plt.scatter(obs_norm_nom[0], value_nom[0])
-            plt.xlabel('state norm')
-            plt.ylabel('nominal value')
-
-            plt.subplot(4,1,3)
-            plt.plot(loss_exc)
-            plt.xlabel('epochs')
-            plt.ylabel('excursion loss')
-
-            plt.subplot(4,1,4)
-            plt.scatter(obs_norm_exc, value_exc)
-            plt.scatter(obs_norm_exc[0], value_exc[0])
-            plt.xlabel('state norm')
-            plt.ylabel('excursion value')
-
-            plt.tight_layout()
-            plt.show()
-
         self.iter._set_state(self.iter._get_state_improve())
+
+        return loss_nom, loss_exc
 
     def _evaluate_policy(self, value_fn, replay, dataset):
 
@@ -128,26 +88,16 @@ class iteration_evaluate(iteration_state):
             # --! sample a random batch
             lookback, reward, next_lookback, done = replay.random_batch(batch_size)
 
-            # --! determine a data mask that differentiates between nominal and excursion batch elements
-            with torch.no_grad():
-                mask_nom = replay.get_coarse_zeta(lookback) < replay.coarse_zeta_threshold()
-                mask_nom = torch.squeeze(mask_nom)
-
-            # --! prepare data: normalize current states
-            with torch.no_grad():
-                obs = replay.extract_current_state(lookback)
-                next_obs = replay.extract_current_state(next_lookback)
-
-                obs = dataset.normalize_masked(obs, mask_nom)
-                next_obs = dataset.normalize_masked(next_obs, mask_nom)
-
             # --! target must be treated as a constant, so restrict any gradient flow during target calculation
             with torch.no_grad():
-                target = reward + gamma * (1.0 - done) * value_fn(next_obs)
+                next_state = replay.extract_current_state(next_lookback)
+                target = reward + gamma * (1.0 - done) * value_fn(next_state)
 
-            # --! compute the value of the current state (observation)
-            value = value_fn(obs)
+            # --! compute the value of the current state
+            state = replay.extract_current_state(lookback)
+            value = value_fn(state)
 
+            # --! compute loss
             criterion = torch.nn.MSELoss()
             loss = criterion(value, target)
 
@@ -326,23 +276,59 @@ class iteration_improve(iteration_state):
             policy_optim.step()
 
 
-class residual_policy(torch.nn.Module):
+class value_fn:
+    """Wraps a learned value function to add the capability of internal state normalization."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, state_normalizer):
+        self.state_normalizer = state_normalizer
+
+        value_fn_ni = 2
+        value_fn_no = 1
+        self.value_fn = util_nn.fcnn(feat=[value_fn_ni, 64, 64, value_fn_no], actfun_hid='relu')
+
+    def __call__(self, state):
+        return self.forward(state)
+
+    def forward(self, state):
+
+        # --! normalize the state, but do not save the normalization mask (see below)
+        state, _ = self.state_normalizer.normalize_state(state)
+
+        # --! get a value from the normalized state
+        value = self.value_fn(state)
+
+        # --! it makes no physical sense to denormalize the state value, so simply return the value
+        return value
+
+    def train(self, mode=True):
+        return self.value_fn.train(mode)
+
+    def eval(self):
+        return self.value_fn.eval()
+
+    def parameters(self):
+        return self.value_fn.parameters()
+
+
+class residual_policy:
+    """Wraps a learned residual policy to add the capability of internal state, action (de)normalization."""
+
+    def __init__(self, state_normalizer):
+
+        self.state_normalizer = state_normalizer
 
         policy_ni = 2
         policy_no = 1
         self.net = util_nn.fcnn(feat=[policy_ni, 64, 64, policy_no], actfun_hid='relu', actfun_o='linear')
 
-    def action(self, observation, uncertainty):
+    def forward(self, observation, uncertainty):
         """Returns an action for given ``observation``, while taking into account ``uncertainty``."""
 
         a = self.net(observation)
         return self._authorize_control(uncertainty) * torch.tanh(a)
 
     def __call__(self, obs, zeta):
-        return self.action(obs, zeta)
+        return self.forward(obs, zeta)
 
     def _authorize_control(self, zeta,
                            u_min=0.01,

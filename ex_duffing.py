@@ -18,12 +18,16 @@ import util_dyna
 import reinforcement_learning as rl
 
 
-class model(kind.norm_adapter):
+class model:
+    """Wraps a KIND model in a data-normalizing adapter."""
 
     def __init__(self, model, normalizer):
 
         self.model = model
         self.normalizer = normalizer
+
+    def __call__(self, lookback):
+        return self.forward(lookback)
 
     def forward(self, lookback):
 
@@ -283,15 +287,19 @@ class normalizer(util_data.normalizer):
         self.std_exc = torch.maximum(self.std_exc, self.std_min)
 
         # --! compute a separator between the two regimes based on state norm
-        self.regime_sep = util_data.ceil(self._compute_state_norm(timeseries_nom).mean(), decimals=2)
+        #
+        # --! note that the ceil operation is supposed to push the resulting separator slightly above the
+        # --! actual maximum state norms, so that later a simple 'less-then'
+        # --! operator could be used
+        self.regime_sep = util_data.ceil(self._compute_state_norm_max(self._extract_state(timeseries_nom)).max(), decimals=2)
 
-    def normalize(self, data):
+    def normalize(self, timeseries):
 
         # --! determine a data mask that differentiates between nominal and excursion data
-        mask = self._compute_state_norm(data) < self.regime_sep
+        mask = self._compute_state_norm_max(self._extract_state(timeseries)) < self.regime_sep
         mask = torch.squeeze(mask)
 
-        state_and_control, control_mask = torch.split(data, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
+        state_and_control, control_mask = torch.split(timeseries, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
         state_and_control_norm = torch.empty_like(state_and_control)
 
         state_and_control_norm[mask] = (state_and_control[mask] - self.mean_nom) / self.std_nom
@@ -301,6 +309,18 @@ class normalizer(util_data.normalizer):
         control = control * control_mask
 
         return torch.cat([state, control, control_mask], dim=-1), mask
+
+    def normalize_state(self, state):
+        assert state.shape[-1]==self.state_ndim
+
+        mask = self._compute_state_norm_max(state) < self.regime_sep
+        mask = torch.squeeze(mask)
+
+        norm_state = torch.empty_like(state)
+        norm_state[mask] = (state[mask] - self.mean_nom) / self.std_nom
+        norm_state[~mask] = (state[~mask] - self.mean_exc) / self.std_exc
+
+        return norm_state, mask
 
     def denormalize(self, data, mask):
 
@@ -313,9 +333,12 @@ class normalizer(util_data.normalizer):
 
         return denorm_data
 
-    def _compute_state_norm(self, data):
-        state, _ = torch.split(data, [self.state_ndim, self.control_ndim + self.mask_ndim], dim=-1)
-        return torch.mean(torch.linalg.norm(state, dim=-1, keepdim=True), dim=1, keepdim=True)
+    def _extract_state(self, timeseries):
+        state, _ = torch.split(timeseries, [self.state_ndim, self.control_ndim + self.mask_ndim], dim=-1)
+        return state
+
+    def _compute_state_norm_max(self, state):
+        return torch.max(torch.linalg.norm(state, dim=-1, keepdim=True), dim=1, keepdim=True)[0]
 
 
 class dataset(util_data.dataset):
