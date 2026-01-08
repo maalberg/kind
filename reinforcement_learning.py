@@ -15,7 +15,7 @@ from matplotlib import pyplot as plt
 class policy_iteration:
     """Implements a model-based policy iteration."""
 
-    def __init__(self, model, base_policy, normalizer):
+    def __init__(self, model, base_policy, normalizer, reward_fn):
 
         self.model = model
 
@@ -25,6 +25,8 @@ class policy_iteration:
         # --! we use two separate value functions: one for nominal and another for excursion regimes
         self.value_fn_nom = value_fn(normalizer)
         self.value_fn_exc = value_fn(normalizer)
+
+        self.reward_fn = reward_fn
 
         # --! state machine
         self.state_evaluate = iteration_evaluate(self)
@@ -114,10 +116,12 @@ class iteration_improve(iteration_state):
         self.iter = iteration
 
     def iterate(self, replay_nom, replay_exc, dataset):
-        self._improve_policy(dataset, replay_nom)
+        loss = self._improve_policy(dataset, replay_nom + replay_exc, self.iter.reward_fn)
         self.iter._set_state(self.iter._get_state_evaluate())
 
-    def _improve_policy(self, dataset, replay):
+        return loss
+
+    def _improve_policy(self, dataset, replay, reward_fn):
 
         value_fn_nom = self.iter.value_fn_nom
         value_fn_exc = self.iter.value_fn_exc
@@ -128,17 +132,12 @@ class iteration_improve(iteration_state):
         model = self.iter.model
 
         gamma = 0.96
-        batch_size = 16
+        batch_size = 128
         learning_rate = 1e-3
         weight_decay = 1e-5
         policy_optim = torch.optim.Adam(res_policy.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
         losses = []
-
-        # --! freeze KIND
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad = False
 
         # --! freeze value functions
         value_fn_nom.eval()
@@ -155,8 +154,8 @@ class iteration_improve(iteration_state):
         # --! policy_lqr fixed
 
         # --! now, model rollout horizon
-        horizon = 30
-        nepoch = 10
+        horizon = 50
+        nepoch = 20
 
         for epoch in range(nepoch):
             policy_optim.zero_grad()
@@ -165,115 +164,112 @@ class iteration_improve(iteration_state):
             lookback, reward, next_lookback, done = replay.random_batch(batch_size)
 
             # --! determine a data mask that differentiates between nominal and excursion batch elements
-            with torch.no_grad():
-                mask_nom = replay.get_coarse_zeta(lookback) < replay.coarse_zeta_threshold()
-                mask_nom = torch.squeeze(mask_nom)
+            mask = dataset.normalizer.mask(lookback)
 
-            # --! knowing the data mask, normalize lookbacks
-            with torch.no_grad():
-                lookback_norm = dataset.normalize_masked(lookback, mask_nom)
-
-            # --! compute the value of the current observation (state)
+            # --! restrict any gradient flow while computing the value of the current state
             with torch.no_grad():
 
-                # --! extract a normalized current observation (state)
-                state = replay.extract_current_state(lookback_norm)
+                # --! extract the current state
+                state = replay.extract_current_state(lookback)
 
-                value = torch.empty_like(state)
+                current_value = torch.empty_like(state)
 
                 # --! compute the current state value
-                value[mask_nom] = value_fn_nom(state[mask_nom])
-                value[~mask_nom] = value_fn_exc(state[~mask_nom])
+                current_value[mask] = value_fn_nom(state[mask])
+                current_value[~mask] = value_fn_exc(state[~mask])
 
             # --! compute current uncertainty: zeta(x, u)
             with torch.no_grad():
 
                 # --! compute the uncertainty of a nominal KIND operator
-                zeta = model(dataset, lookback_norm)[2]
+                zeta = model(lookback)[2]
 
                 # --! uncertainty zeta is represented by the mean of batch elements
                 zeta = torch.mean(zeta, dim=tuple(range(1, zeta.dim())), keepdim=True)
 
-            print(zeta.mean())
-            print(tata.shape)
             # --! make a working copy of the current lookback to perform model rollouts
-            rollout_lookback = lookback.clone()
+            rollout = lookback.clone()
 
             rollout_return = 0.0
 
-            # --! perform model rollouts upto a spefified horizon
+            deltas = []
+
+            # --! perform model rollouts up to a spefified horizon
             for k in range(horizon):
-                rollout_obs = replay.extract_current_state(rollout_lookback)
+                state = replay.extract_current_state(rollout)
 
                 # --! compute action
-                delta_u = res_policy(rollout_obs, zeta)
-                rollout_u = base_policy(rollout_obs) + delta_u
+                delta_u = res_policy(state, zeta)
+                u = base_policy(state) + delta_u
 
-                rollout_reward = reward_fn_torch(torch.cat([rollout_obs, rollout_u], dim=-1))
+                deltas.append(delta_u.mean().item())
+
+                rollout_reward = reward_fn(torch.cat([state, u], dim=-1))
                 rollout_return += gamma**k * rollout_reward
 
-                replay.update_current_action(rollout_lookback, rollout_u)
+                replay.update_current_action(rollout, u)
 
                 # --! KIND predicts next state
-                #
-                # --! we need to manually normalize data here
-                rollout_lookback = dataset.normalize(rollout_lookback, data_type='nom') # <- data_type !!!
-                rollout = model(dataset, rollout_lookback) # < gradients flow here
+                model_output = model(rollout) # < gradients flow here
 
                 #if k==horizon - 1:
                     #with torch.no_grad():
-                        #plt.figure(figsize=(6,12))
+                        #plt.figure(figsize=(6,16))
 
-                        #plt.subplot(7,1,1)
-                        #plt.plot(rollout_lookback[0, :, :2])
-                        #plt.plot(rollout[0][0, :, :], linestyle='dashed')
+                        #plt.subplot(8,1,1)
+                        #plt.plot(rollout[0, :, :2])
+                        #plt.plot(model_output[0][0, :, :], linestyle='dashed')
 
-                        #plt.subplot(7,1,2)
-                        #plt.plot(rollout_lookback[0, :, :2])
-                        #plt.plot(rollout[1][0, :, :], linestyle='dashed')
+                        #plt.subplot(8,1,2)
+                        #plt.plot(rollout[0, :, :2])
+                        #plt.plot(model_output[1][0, :, :], linestyle='dashed')
 
-                        #plt.subplot(7,1,3)
-                        #plt.plot(rollout[2][0, :, :])
+                        #plt.subplot(8,1,3)
+                        #plt.plot(model_output[2][0, :, :])
 
-                        #plt.subplot(7,1,4)
-                        #plt.plot(rollout_lookback[0, :, :2])
-                        #plt.plot(rollout[3][0, :, :], linestyle='dashed')
+                        #plt.subplot(8,1,4)
+                        #plt.plot(rollout[0, :, :2])
+                        #plt.plot(model_output[3][0, :, :], linestyle='dashed')
 
-                        #plt.subplot(7,1,5)
-                        #plt.plot(rollout[4][0, :, :])
+                        #plt.subplot(8,1,5)
+                        #plt.plot(model_output[4][0, :, :])
 
-                        #plt.subplot(7,1,6)
-                        #plt.plot(rollout[9][0, :, :])
+                        #plt.subplot(8,1,6)
+                        #plt.plot(model_output[9][0, :, :])
 
-                        #plt.subplot(7,1,7)
-                        #plt.plot(rollout_lookback[0, :, 2])
+                        #plt.subplot(8,1,7)
+                        #plt.plot(rollout[0, :, 2])
                         #plt.xlabel('samples')
+
+                        #plt.subplot(8,1,8)
+                        #plt.plot(deltas)
 
                         #plt.tight_layout()
                         #plt.show()
+                        #print(tata.shape)
 
                 # --! having a prediction, take its forecast part
-                #
-                # --! we need to manually denormalize data here
-                rollout_lookback = dataset.denormalize(rollout_lookback, data_type='nom')
-                rollout_pre = dataset.denormalize(rollout[0], data_type='nom')
-                forecast = rollout_pre[:, model.args.lookback_nsample:]
+                forecast = model_output[0][:, 384:]
 
                 # --! take the first observation from the forecast
-                rollout_next_obs = forecast[:, :1, :]
+                next_state = forecast[:, :1, :]
 
                 # --! shift/update lookback using next observation
-                rollout_lookback = replay.update_lookback(rollout_lookback, rollout_next_obs)
+                rollout = replay.update_lookback(rollout, next_state)
 
+            # --! compute the terminal value
             with torch.no_grad():
-                terminal_value = value_fn(rollout_next_obs)
-                current_value = value_fn(rollout_obs0)
+                terminal_value = torch.empty_like(next_state)
+                terminal_value[mask] = value_fn_nom(next_state[mask])
+                terminal_value[~mask] = value_fn_exc(next_state[~mask])
 
             advantage = rollout_return + gamma**horizon * terminal_value - current_value
             policy_loss = -advantage.mean()
             losses.append(policy_loss.item())
             policy_loss.backward()
             policy_optim.step()
+
+        return losses
 
 
 class value_fn:
@@ -290,6 +286,7 @@ class value_fn:
         return self.forward(state)
 
     def forward(self, state):
+        """Normalizes the given ``state`` and computes the corresponding value."""
 
         # --! normalize the state, but do not save the normalization mask (see below)
         state, _ = self.state_normalizer.normalize_state(state)
@@ -319,38 +316,42 @@ class residual_policy:
 
         policy_ni = 2
         policy_no = 1
-        self.net = util_nn.fcnn(feat=[policy_ni, 64, 64, policy_no], actfun_hid='relu', actfun_o='linear')
+        self.policy = util_nn.fcnn(feat=[policy_ni, 64, 64, policy_no], actfun_hid='relu', actfun_o='linear')
 
-    def forward(self, observation, uncertainty):
-        """Returns an action for given ``observation``, while taking into account ``uncertainty``."""
+    def __call__(self, state, zeta):
+        return self.forward(state, zeta)
 
-        a = self.net(observation)
-        return self._authorize_control(uncertainty) * torch.tanh(a)
+    def forward(self, state, zeta):
+        """Returns an authorized action for the given ``state``, while taking into account uncertainty ``zeta``."""
 
-    def __call__(self, obs, zeta):
-        return self.forward(obs, zeta)
+        state, mask = self.state_normalizer.normalize_state(state)
+
+        a = self.policy(state)
+        a = self._authorize_control(zeta) * torch.tanh(a)
+
+        return self.state_normalizer.denormalize(a, mask)
+
+    def train(self, mode=True):
+        return self.policy.train(mode)
+
+    def eval(self):
+        return self.policy.eval()
+
+    def parameters(self):
+        return self.policy.parameters()
 
     def _authorize_control(self, zeta,
-                           u_min=0.01,
-                           u_max_exc=0.05,
-                           zeta_star=0.02,
-                           zeta_exc=0.2):
-        """
-        zeta:        Tensor of shape (B, 1) or (B,)
-        u_min:       float or Tensor
-        u_max_exc:   float or Tensor
-        zeta_star:   float
-        zeta_exc:    float
-        """
+                           u_min=0.001, u_max_exc=0.05,
+                           zeta_star=0.002, zeta_exc=0.22):
 
         # --! normalize zeta into [0, 1]
-        alpha = (zeta - zeta_star) / (zeta_exc - zeta_star)
+        beta = (zeta - zeta_star) / (zeta_exc - zeta_star)
 
         # --! clamp to [0, 1]
-        alpha = torch.clamp(alpha, 0.0, 1.0)
+        beta = torch.clamp(beta, 0.0, 1.0)
 
         # --! linear ramp
-        u_max = u_min + alpha * (u_max_exc - u_min)
+        u_max = u_min + beta * (u_max_exc - u_min)
 
         return u_max
 

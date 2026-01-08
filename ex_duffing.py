@@ -11,10 +11,12 @@ import random
 from scipy import signal
 from scipy.integrate import solve_ivp
 from collections import deque
+from itertools import chain
 
 import kind
 import util_data
 import util_dyna
+import util_nn
 import reinforcement_learning as rl
 
 
@@ -22,6 +24,10 @@ class model:
     """Wraps a KIND model in a data-normalizing adapter."""
 
     def __init__(self, model, normalizer):
+
+        # --! freeze model
+        model.eval()
+        util_nn.freeze_module(model)
 
         self.model = model
         self.normalizer = normalizer
@@ -293,11 +299,14 @@ class normalizer(util_data.normalizer):
         # --! operator could be used
         self.regime_sep = util_data.ceil(self._compute_state_norm_max(self._extract_state(timeseries_nom)).max(), decimals=2)
 
+    def mask(self, timeseries):
+        """Determines a data mask that differentiates between nominal and excursion data."""
+        mask = self._compute_state_norm_max(self._extract_state(timeseries)) < self.regime_sep
+        return torch.squeeze(mask)
+
     def normalize(self, timeseries):
 
-        # --! determine a data mask that differentiates between nominal and excursion data
-        mask = self._compute_state_norm_max(self._extract_state(timeseries)) < self.regime_sep
-        mask = torch.squeeze(mask)
+        mask = self.mask(timeseries)
 
         state_and_control, control_mask = torch.split(timeseries, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
         state_and_control_norm = torch.empty_like(state_and_control)
@@ -313,8 +322,7 @@ class normalizer(util_data.normalizer):
     def normalize_state(self, state):
         assert state.shape[-1]==self.state_ndim
 
-        mask = self._compute_state_norm_max(state) < self.regime_sep
-        mask = torch.squeeze(mask)
+        mask = self.mask(state)
 
         norm_state = torch.empty_like(state)
         norm_state[mask] = (state[mask] - self.mean_nom) / self.std_nom
@@ -322,22 +330,28 @@ class normalizer(util_data.normalizer):
 
         return norm_state, mask
 
-    def denormalize(self, data, mask):
+    def denormalize(self, timeseries, mask):
 
-        assert data.shape[-1]==self.state_ndim
+        assert timeseries.shape[-1]==self.state_ndim or timeseries.shape[-1]==self.control_ndim
 
-        denorm_data = torch.empty_like(data)
+        denorm_timeseries = torch.empty_like(timeseries)
 
-        denorm_data[mask] = data[mask] * self.std_nom + self.mean_nom
-        denorm_data[~mask] = data[~mask] * self.std_exc + self.mean_exc
+        denorm_timeseries[mask] = timeseries[mask] * self.std_nom + self.mean_nom
+        denorm_timeseries[~mask] = timeseries[~mask] * self.std_exc + self.mean_exc
 
-        return denorm_data
+        return denorm_timeseries
 
     def _extract_state(self, timeseries):
+        """Extracts state dimensions from the given ``timeseries``."""
+
+        if timeseries.shape[-1]==self.state_ndim:
+            return timeseries
+
         state, _ = torch.split(timeseries, [self.state_ndim, self.control_ndim + self.mask_ndim], dim=-1)
         return state
 
     def _compute_state_norm_max(self, state):
+        """Computes the maximum ``state`` norm along the time steps dimension. All dimensions are preserved."""
         return torch.max(torch.linalg.norm(state, dim=-1, keepdim=True), dim=1, keepdim=True)[0]
 
 
@@ -375,8 +389,17 @@ class dataset(util_data.dataset):
 
 
 class replay_buffer(rl.replay_buffer):
-    def __init__(self, capacity=None):
-        self.buffer = deque(maxlen=capacity)
+    def __init__(self, buffer=None):
+        self.buffer = buffer if buffer is not None else []
+
+    def __add__(self, other):
+        a = self.buffer
+        b = other.buffer
+
+        # --! interleave both buffers, such that the new buffer has elements: a[0], b[0], a[1], b[1], etc.
+        c = list(chain.from_iterable(zip(a, b)))
+
+        return replay_buffer(buffer=c)
 
     def add(self, lookback, reward, next_lookback, done):
 
@@ -387,6 +410,7 @@ class replay_buffer(rl.replay_buffer):
         done = torch.atleast_3d(done)
         reward = torch.atleast_3d(reward)
 
+        # --! pack all elements as a tuple and put the tuple into the buffer
         self.buffer.append((
             lookback.detach(),
             reward,
@@ -410,6 +434,9 @@ class replay_buffer(rl.replay_buffer):
 
     def extract_current_state(self, lookback):
         return lookback[:, [-1], :2]
+
+    def extract_current_action(self, lookback):
+        return lookback[:, [-1], 2:3]
 
     def update_current_action(self, lookback, a):
         lookback[:, -2:, [2]] = a
