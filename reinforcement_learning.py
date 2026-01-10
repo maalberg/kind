@@ -154,8 +154,8 @@ class iteration_improve(iteration_state):
         # --! policy_lqr fixed
 
         # --! now, model rollout horizon
-        horizon = 50
-        nepoch = 20
+        horizon = 200
+        nepoch = 60
 
         for epoch in range(nepoch):
             policy_optim.zero_grad()
@@ -199,7 +199,7 @@ class iteration_improve(iteration_state):
                 state = replay.extract_current_state(rollout)
 
                 # --! compute action
-                delta_u = res_policy(state, zeta)
+                delta_u = res_policy.forward_train(state, zeta, epoch)
                 u = base_policy(state) + delta_u
 
                 deltas.append(delta_u.mean().item())
@@ -326,10 +326,18 @@ class residual_policy:
 
         state, mask = self.state_normalizer.normalize_state(state)
 
-        a = self.policy(state)
-        a = self._authorize_control(zeta) * torch.tanh(a)
+        action = self._ramp_action(zeta) * torch.tanh(self.policy(state))
 
-        return self.state_normalizer.denormalize(a, mask)
+        return self.state_normalizer.denormalize(action, mask)
+
+    def forward_train(self, state, zeta, epoch):
+        state, mask = self.state_normalizer.normalize_state(state)
+
+        u_max_exc = self._schedule(epoch)
+
+        action = self._ramp_action(zeta, u_max_exc=u_max_exc) * torch.tanh(self.policy(state))
+
+        return self.state_normalizer.denormalize(action, mask)
 
     def train(self, mode=True):
         return self.policy.train(mode)
@@ -340,9 +348,10 @@ class residual_policy:
     def parameters(self):
         return self.policy.parameters()
 
-    def _authorize_control(self, zeta,
-                           u_min=0.001, u_max_exc=0.05,
-                           zeta_star=0.002, zeta_exc=0.22):
+    def _schedule(self, epoch, u_max_init=0.1, u_max_final=0.7):
+        return min(u_max_final, u_max_init + 0.05 * epoch)
+
+    def _ramp_action(self, zeta, u_min=0.005, u_max_exc=0.7, zeta_star=0.003, zeta_exc=0.24):
 
         # --! normalize zeta into [0, 1]
         beta = (zeta - zeta_star) / (zeta_exc - zeta_star)

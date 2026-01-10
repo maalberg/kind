@@ -79,7 +79,7 @@ def duffing_update(t, state, sim, u):
 class duffing(util_dyna.environment):
     """Simulates a Duffing oscillator. Implements Dyna environment interface."""
 
-    def __init__(self, beta, gamma, reward, alpha=-1.0, delta=0.2, omega=1.2, dt_sim=1e-4, dt_control=1e-2, t_final=100.0):
+    def __init__(self, beta, gamma, reward, alpha=-1.0, delta=0.2, omega=1.2, dt_sim=1e-4, dt_control=2e-2, t_final=100.0):
 
         self.alpha = alpha
         self.beta  = beta
