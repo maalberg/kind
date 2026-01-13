@@ -38,7 +38,7 @@ class dataset(interface):
 
     def __init__(self,
                  file_dir, file_name, file_ext,
-                 data_nsample, data_split_size, batch_size, window_nsample, load_normalized=True):
+                 data_nsample, data_split_size, batch_size, window_nsample, setpoint, load_normalized=True):
 
         self.file_dir = file_dir
         self.file_name = file_name
@@ -47,6 +47,7 @@ class dataset(interface):
         self.split_size = data_split_size
         self.batch_size = batch_size
         self.window_nsample = window_nsample
+        self.setpoint = torch.unsqueeze(torch.unsqueeze(torch.tensor(setpoint), 0), 0) # <-- converting a 1d list into a 3d tensor
         self.load_normalized = load_normalized
 
         # --! initialize a normalizer
@@ -68,6 +69,7 @@ class dataset(interface):
 
         # --! if requested, normalize data
         if self.load_normalized:
+
             train_data, _ = self.normalizer.normalize(train_data)
             valid_data, _ = self.normalizer.normalize(valid_data)
             test_data, _ = self.normalizer.normalize(test_data)
@@ -136,7 +138,7 @@ class dataset(interface):
         return torch.reshape(data, (ntimeseries, self.data_nsample, data.shape[1]))
 
     @abstractmethod
-    def init_normalization(self, timeseries_nom, timeseries_exc):
+    def init_normalization(self):
         return
 
     def extract_window(self, timeseries):

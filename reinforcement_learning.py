@@ -15,7 +15,7 @@ from matplotlib import pyplot as plt
 class policy_iteration:
     """Implements a model-based policy iteration."""
 
-    def __init__(self, model, base_policy, normalizer, reward_fn):
+    def __init__(self, model, base_policy, normalizer, reward_fn_nom, reward_fn_exc):
 
         self.model = model
 
@@ -26,7 +26,8 @@ class policy_iteration:
         self.value_fn_nom = value_fn(normalizer)
         self.value_fn_exc = value_fn(normalizer)
 
-        self.reward_fn = reward_fn
+        self.reward_fn_nom = reward_fn_nom
+        self.reward_fn_exc = reward_fn_exc
 
         # --! state machine
         self.state_evaluate = iteration_evaluate(self)
@@ -72,7 +73,7 @@ class iteration_evaluate(iteration_state):
 
     def _evaluate_policy(self, value_fn, replay, dataset):
 
-        nepoch = 100
+        nepoch = 350
         batch_size = 128
         gamma = 0.96
 
@@ -116,12 +117,12 @@ class iteration_improve(iteration_state):
         self.iter = iteration
 
     def iterate(self, replay_nom, replay_exc, dataset):
-        loss = self._improve_policy(dataset, replay_nom + replay_exc, self.iter.reward_fn)
+        loss = self._improve_policy(dataset, replay_nom + replay_exc, self.iter.reward_fn_nom, self.iter.reward_fn_exc)
         self.iter._set_state(self.iter._get_state_evaluate())
 
         return loss
 
-    def _improve_policy(self, dataset, replay, reward_fn):
+    def _improve_policy(self, dataset, replay, reward_fn_nom, reward_fn_exc):
 
         value_fn_nom = self.iter.value_fn_nom
         value_fn_exc = self.iter.value_fn_exc
@@ -172,7 +173,9 @@ class iteration_improve(iteration_state):
                 # --! extract the current state
                 state = replay.extract_current_state(lookback)
 
-                current_value = torch.empty_like(state)
+                # --! we cannot use empty_like here, because state and value have different dimensions,
+                # --! therefore, ensure proper size of value manually
+                current_value = torch.empty(state.shape[0], 1, 1)
 
                 # --! compute the current state value
                 current_value[mask] = value_fn_nom(state[mask])
@@ -192,9 +195,7 @@ class iteration_improve(iteration_state):
 
             rollout_return = 0.0
 
-            deltas = []
-
-            # --! perform model rollouts up to a spefified horizon
+            # --! perform model rollouts up to a spefified horizon - 1
             for k in range(horizon):
                 state = replay.extract_current_state(rollout)
 
@@ -202,47 +203,52 @@ class iteration_improve(iteration_state):
                 delta_u = res_policy.forward_train(state, zeta, epoch)
                 u = base_policy(state) + delta_u
 
-                deltas.append(delta_u.mean().item())
-
-                rollout_reward = reward_fn(torch.cat([state, u], dim=-1))
-                rollout_return += gamma**k * rollout_reward
-
+                # --! update action in replay buffer with newly computed action
                 replay.update_current_action(rollout, u)
+
+                # --! allocate reward
+                #
+                # --! note that we cannot use empty_like here, because reward and state-action pair
+                # --! have different dimensions, so we need to ensure dimensions manually
+                rollout_reward = torch.empty(state.shape[0], 1, 1)
+
+                # --! calculate reward for nominal or excursion timeseries present in current batch
+                rollout_reward[mask] = reward_fn_nom(state[mask], u[mask])
+                rollout_reward[~mask] = reward_fn_exc(state[~mask], u[~mask])
+
+                rollout_return += gamma**k * rollout_reward
 
                 # --! KIND predicts next state
                 model_output = model(rollout) # < gradients flow here
 
                 #if k==horizon - 1:
                     #with torch.no_grad():
-                        #plt.figure(figsize=(6,16))
+                        #plt.figure(figsize=(6,14))
 
-                        #plt.subplot(8,1,1)
+                        #plt.subplot(7,1,1)
                         #plt.plot(rollout[0, :, :2])
                         #plt.plot(model_output[0][0, :, :], linestyle='dashed')
 
-                        #plt.subplot(8,1,2)
+                        #plt.subplot(7,1,2)
                         #plt.plot(rollout[0, :, :2])
                         #plt.plot(model_output[1][0, :, :], linestyle='dashed')
 
-                        #plt.subplot(8,1,3)
+                        #plt.subplot(7,1,3)
                         #plt.plot(model_output[2][0, :, :])
 
-                        #plt.subplot(8,1,4)
+                        #plt.subplot(7,1,4)
                         #plt.plot(rollout[0, :, :2])
                         #plt.plot(model_output[3][0, :, :], linestyle='dashed')
 
-                        #plt.subplot(8,1,5)
+                        #plt.subplot(7,1,5)
                         #plt.plot(model_output[4][0, :, :])
 
-                        #plt.subplot(8,1,6)
+                        #plt.subplot(7,1,6)
                         #plt.plot(model_output[9][0, :, :])
 
-                        #plt.subplot(8,1,7)
+                        #plt.subplot(7,1,7)
                         #plt.plot(rollout[0, :, 2])
                         #plt.xlabel('samples')
-
-                        #plt.subplot(8,1,8)
-                        #plt.plot(deltas)
 
                         #plt.tight_layout()
                         #plt.show()
@@ -259,7 +265,10 @@ class iteration_improve(iteration_state):
 
             # --! compute the terminal value
             with torch.no_grad():
-                terminal_value = torch.empty_like(next_state)
+
+                # --! we cannot use empty_like here, because state and value have different dimensions,
+                # --! therefore, ensure proper size of value manually
+                terminal_value = torch.empty(next_state.shape[0], 1, 1)
                 terminal_value[mask] = value_fn_nom(next_state[mask])
                 terminal_value[~mask] = value_fn_exc(next_state[~mask])
 
@@ -328,7 +337,7 @@ class residual_policy:
 
         action = self._ramp_action(zeta) * torch.tanh(self.policy(state))
 
-        return self.state_normalizer.denormalize(action, mask)
+        return self.state_normalizer.denormalize_action(action, mask)
 
     def forward_train(self, state, zeta, epoch):
         state, mask = self.state_normalizer.normalize_state(state)
@@ -337,7 +346,7 @@ class residual_policy:
 
         action = self._ramp_action(zeta, u_max_exc=u_max_exc) * torch.tanh(self.policy(state))
 
-        return self.state_normalizer.denormalize(action, mask)
+        return self.state_normalizer.denormalize_action(action, mask)
 
     def train(self, mode=True):
         return self.policy.train(mode)
@@ -348,10 +357,10 @@ class residual_policy:
     def parameters(self):
         return self.policy.parameters()
 
-    def _schedule(self, epoch, u_max_init=0.1, u_max_final=0.7):
+    def _schedule(self, epoch, u_max_init=0.1, u_max_final=0.5):
         return min(u_max_final, u_max_init + 0.05 * epoch)
 
-    def _ramp_action(self, zeta, u_min=0.005, u_max_exc=0.7, zeta_star=0.003, zeta_exc=0.24):
+    def _ramp_action(self, zeta, u_min=0.005, u_max_exc=0.5, zeta_star=0.002, zeta_exc=0.44):
 
         # --! normalize zeta into [0, 1]
         beta = (zeta - zeta_star) / (zeta_exc - zeta_star)

@@ -20,6 +20,77 @@ import util_nn
 import reinforcement_learning as rl
 
 
+def duffing_energy_torch(state, alpha=-1.0, beta=20.0):
+    q = state[..., [0]]
+    qdot = state[..., [1]]
+    return 0.5 * qdot**2 + 0.5 * alpha * q**2 + 0.25 * beta * q**4
+
+
+class DuffingRewardTorch:
+    def __init__(self, Q, R, setpoint,
+                 alpha=-1.0, beta=20.0,
+                 lambda_E=0.1,
+                 device=None,
+                 dtype=torch.float32):
+
+        self.Q = torch.atleast_2d(torch.as_tensor(Q, dtype=dtype, device=device))
+        self.R = torch.atleast_2d(torch.as_tensor(R, dtype=dtype, device=device))
+        self.setpoint = torch.atleast_2d(torch.as_tensor(setpoint, dtype=dtype, device=device))
+
+        self.alpha = alpha
+        self.beta = beta
+        self.lambda_E = lambda_E
+
+    def __call__(self, state, action):
+
+        state = torch.atleast_2d(state)
+        action = torch.atleast_2d(action)
+
+        x_err = state - self.setpoint
+
+        state_cost = x_err @ self.Q @ x_err.transpose(-1, -2)
+        action_cost = action @ self.R @ action.transpose(-1, -2)
+
+        # Duffing energy
+        energy_cost = duffing_energy_torch(
+            state,
+            alpha=self.alpha,
+            beta=self.beta
+        )
+
+        reward = -(state_cost + action_cost + self.lambda_E * energy_cost)
+        return reward
+
+
+def duffing_energy(state, alpha=-1.0, beta=20.0):
+    q = state[..., 0]
+    qdot = state[..., 1]
+    return 0.5 * qdot**2 + 0.5 * alpha * q**2 + 0.25 * beta * q**4
+
+
+class duffing_reward:
+    def __init__(self, Q, R, setpoint,
+                 alpha=-1.0, beta=20.0,
+                 lambda_E=0.1):
+        self.Q = np.atleast_2d(Q)
+        self.R = np.atleast_2d(R)
+        self.setpoint = np.atleast_2d(setpoint)
+        self.alpha = alpha
+        self.beta = beta
+        self.lambda_E = lambda_E
+
+    def __call__(self, state, action):
+        x_err = state - self.setpoint
+
+        state_cost = x_err @ self.Q @ x_err.T
+        action_cost = action @ self.R @ action.T
+        energy_cost = duffing_energy(state,
+                                     alpha=self.alpha,
+                                     beta=self.beta)
+
+        return -(state_cost + action_cost + self.lambda_E * energy_cost)
+
+
 class model:
     """Wraps a KIND model in a data-normalizing adapter."""
 
@@ -116,7 +187,7 @@ class duffing(util_dyna.environment):
         # --! based on current state and action, calculate reward 
         obs = np.array([[self.x, self.dx]])
         action = np.array([[u]])
-        reward = self.reward(np.concatenate([obs, action], axis=-1))
+        reward = self.reward(obs, action)
 
         # --! for integration below, define step timing
         t_start = self.jstep * self.dt_control
@@ -223,16 +294,18 @@ def make_duffing(name, reward):
 
 class lqr(util_dyna.policy):
 
-    def __init__(self, gain, noise=0.0):
+    def __init__(self, gain, setpoint=[0.0, 0.0], noise=0.0):
         self.gain = np.atleast_2d(gain)
+        self.setpoint = np.atleast_2d(setpoint)
         self.noise = noise
 
     def act(self, state):
+        state = state - self.setpoint
         u = -np.matmul(state, np.transpose(self.gain))
         return u + self.noise * np.random.standard_normal(size=u.shape)
 
 
-def make_policy(duffing, q, r, noise=0.0):
+def make_policy(duffing, q, r, setpoint=[0.0, 0.0], noise=0.0):
     """Makes a baseline LQR policy for a Duffing oscillator.
     Parameters ``q`` and ``r`` are diagonal numpy arrays for state and action costs, respectively.
     Parameter ``noise`` defines the standard deviation of an additive Gaussian noise."""
@@ -268,17 +341,32 @@ def make_policy(duffing, q, r, noise=0.0):
     k = np.linalg.solve(lhs, rhs)
 
     # --! wrap the gain matrix in a callable policy strategy
-    return lqr(k, noise=noise)    
+    return lqr(k, setpoint=setpoint, noise=noise)    
 
 
 class normalizer(util_data.normalizer):
 
-    def __init__(self, timeseries_nom, timeseries_exc, state_ndim, control_ndim, mask_ndim):
+    def __init__(self, timeseries_nom, timeseries_exc, setpoint, state_ndim, control_ndim, mask_ndim):
 
         # --! save data dimensions
         self.state_ndim = state_ndim
         self.control_ndim = control_ndim
         self.mask_ndim = mask_ndim
+
+        # --! save setpoint before calling subtracting method
+        self.setpoint = setpoint
+
+        # --! compute a separator between the two regimes based on state norm
+        #
+        # --! note that the ceil operation is supposed to push the resulting separator slightly above the
+        # --! actual maximum state norms, so that later a simple 'less-then'
+        # --! operator could be used
+        state_norm_max = self._compute_state_norm_max(self._extract_state(timeseries_nom) - self.setpoint).max()
+        self.regime_sep = util_data.ceil(state_norm_max, decimals=2)
+
+        # --! to take stats more efficiently below - subtract setpoint from data
+        timeseries_nom = self._subtract_setpoint(timeseries_nom)
+        timeseries_exc = self._subtract_setpoint(timeseries_exc)
 
         # --! take nominal statistics
         state_and_control, _ = torch.split(timeseries_nom, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
@@ -292,22 +380,19 @@ class normalizer(util_data.normalizer):
         self.std_exc = state_and_control.std()
         self.std_exc = torch.maximum(self.std_exc, self.std_min)
 
-        # --! compute a separator between the two regimes based on state norm
-        #
-        # --! note that the ceil operation is supposed to push the resulting separator slightly above the
-        # --! actual maximum state norms, so that later a simple 'less-then'
-        # --! operator could be used
-        self.regime_sep = util_data.ceil(self._compute_state_norm_max(self._extract_state(timeseries_nom)).max(), decimals=2)
-
     def mask(self, timeseries):
         """Determines a data mask that differentiates between nominal and excursion data."""
-        mask = self._compute_state_norm_max(self._extract_state(timeseries)) < self.regime_sep
+
+        # --! note that there is temporary setpoint subtraction from given time series
+        mask = self._compute_state_norm_max(self._extract_state(timeseries) - self.setpoint) < self.regime_sep
         return torch.squeeze(mask)
 
     def normalize(self, timeseries):
+        assert timeseries.shape[-1]==(self.state_ndim + self.control_ndim + self.mask_ndim)
 
         mask = self.mask(timeseries)
 
+        timeseries = self._subtract_setpoint(timeseries)
         state_and_control, control_mask = torch.split(timeseries, [self.state_ndim + self.control_ndim, self.mask_ndim], dim=-1)
         state_and_control_norm = torch.empty_like(state_and_control)
 
@@ -324,6 +409,7 @@ class normalizer(util_data.normalizer):
 
         mask = self.mask(state)
 
+        state = state - self.setpoint
         norm_state = torch.empty_like(state)
         norm_state[mask] = (state[mask] - self.mean_nom) / self.std_nom
         norm_state[~mask] = (state[~mask] - self.mean_exc) / self.std_exc
@@ -332,14 +418,33 @@ class normalizer(util_data.normalizer):
 
     def denormalize(self, timeseries, mask):
 
-        assert timeseries.shape[-1]==self.state_ndim or timeseries.shape[-1]==self.control_ndim
+        assert timeseries.shape[-1]==self.state_ndim
 
         denorm_timeseries = torch.empty_like(timeseries)
 
         denorm_timeseries[mask] = timeseries[mask] * self.std_nom + self.mean_nom
         denorm_timeseries[~mask] = timeseries[~mask] * self.std_exc + self.mean_exc
 
+        denorm_timeseries = denorm_timeseries + self.setpoint
+
         return denorm_timeseries
+
+    def denormalize_action(self, action, mask):
+
+        assert action.shape[-1]==self.control_ndim
+
+        denorm_action = torch.empty_like(action)
+
+        denorm_action[mask] = action[mask] * self.std_nom + self.mean_nom
+        denorm_action[~mask] = action[~mask] * self.std_exc + self.mean_exc
+
+        return denorm_action
+
+    def _subtract_setpoint(self, timeseries):
+        state, other = torch.split(timeseries, [self.state_ndim, self.control_ndim + self.mask_ndim], dim=-1)
+        state = state - self.setpoint
+
+        return torch.cat([state, other], dim=-1)
 
     def _extract_state(self, timeseries):
         """Extracts state dimensions from the given ``timeseries``."""
@@ -366,10 +471,10 @@ class dataset(util_data.dataset):
                  file_dir, file_name, file_ext,
                  data_nsample,
                  data_split_size,
-                 batch_size, window_nsample, load_normalized=True):
+                 batch_size, window_nsample, setpoint, load_normalized=True):
         super().__init__(file_dir, file_name, file_ext,
                          data_nsample, data_split_size,
-                         batch_size, window_nsample, load_normalized)
+                         batch_size, window_nsample, setpoint, load_normalized)
 
     def make_path(self, data_type='nom'):
         file_name = self.file_name + '_' + data_type + self.file_ext
@@ -385,7 +490,7 @@ class dataset(util_data.dataset):
         timeseries_nom = self.read_timeseries(self.make_path(data_type='nom'))
         timeseries_exc = self.read_timeseries(self.make_path(data_type='exc'))
 
-        return normalizer(timeseries_nom, timeseries_exc, self.state_ndim, self.control_ndim, self.mask_ndim)
+        return normalizer(timeseries_nom, timeseries_exc, self.setpoint, self.state_ndim, self.control_ndim, self.mask_ndim)
 
 
 class replay_buffer(rl.replay_buffer):
