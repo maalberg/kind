@@ -147,7 +147,7 @@ def duffing_update(t, state, sim, u):
     return [dx1, dx2]
 
 
-class duffing(util_dyna.environment):
+class duffing(rl.environment):
     """Simulates a Duffing oscillator. Implements Dyna environment interface."""
 
     def __init__(self, beta, gamma, reward, alpha=-1.0, delta=0.2, omega=1.2, dt_sim=1e-4, dt_control=2e-2, t_final=100.0):
@@ -162,7 +162,8 @@ class duffing(util_dyna.environment):
         self.x = self.ic[0]
         self.dx = self.ic[1]
 
-        self.policy = None
+        self.base_policy = None
+        self.residual_policy = None
         self.reward = reward
 
         # --! define simulation timing
@@ -182,12 +183,11 @@ class duffing(util_dyna.environment):
 
         return np.array([[self.x, self.dx]])
 
-    def step(self, u):
+    def step(self, action):
 
         # --! based on current state and action, calculate reward 
-        obs = np.array([[self.x, self.dx]])
-        action = np.array([[u]])
-        reward = self.reward(obs, action)
+        state = np.array([[self.x, self.dx]])
+        reward = self.reward(state, np.array([[action]]))
 
         # --! for integration below, define step timing
         t_start = self.jstep * self.dt_control
@@ -200,47 +200,18 @@ class duffing(util_dyna.environment):
             t_span,
             [self.x, self.dx],
             t_eval=t,
-            args=(self, u))
+            args=(self, action))
 
         # --! save the last integrated value as the next observation
         self.x = solution.y[0, -1]
         self.dx = solution.y[1, -1]
 
-        next_obs = np.array([[self.x, self.dx]])
+        next_state = np.array([[self.x, self.dx]])
 
         self.jstep += 1
         done = self.jstep == self.nstep
 
-        return next_obs, reward, done
-
-    def step_batch(self, state, action):
-        """Steps one time step for every ``state`` under corresponding ``action`` and returns the next states."""
-
-        # --! for integration below, define step timing
-        t_start = 0 * self.dt_control
-        t = t_start + np.arange(0, self.dt_control, self.dt_sim)
-        t_span = (t[0], t[-1])
-
-        next_state_buf = []
-
-        for s, a in zip(state, action):
-
-            # --! solve current initial value problem
-            solution = solve_ivp(
-                duffing_update,
-                t_span,
-                [s[0], s[1]],
-                t_eval=t,
-                args=(self, a))
-
-            # --! save the last integrated value as the next state
-            next_x1 = solution.y[0, -1]
-            next_x2 = solution.y[1, -1]
-
-            next_state = np.array([[next_x1, next_x2]])
-            next_state_buf.append(next_state)
-
-        return np.stack(next_state_buf, axis=0)
+        return next_state, reward, done
 
     def simulate(self, skip_nsample=0):
         """Simulates this duffing oscillator from time equals 0 seconds till time specified in ``t_final``."""
@@ -257,8 +228,10 @@ class duffing(util_dyna.environment):
         while not done:
 
             # --! derive control input
-            if self.policy is not None:
-                action = np.squeeze(self.policy(obs))
+            if self.base_policy is not None:
+                action = np.squeeze(self.base_policy(obs))
+                if self.residual_policy is not None:
+                    tata
             else:
                 action = 0.0
 
@@ -562,4 +535,103 @@ class replay_buffer(rl.replay_buffer):
 
     def coarse_zeta_threshold(self):
         return 0.05
+
+
+class replay_factory(rl.replay_factory):
+
+    state_ndim = 2
+    action_ndim = 1
+    mask_ndim = 1
+
+    def __init__(self):
+        pass
+
+    def create(self, env, policy, zeta, state_nsample, skip_nsample):
+
+        # --! create an empty replay buffer
+        buf = rl.replay()
+
+        # --! state is represented by a window of recent observations and actions
+        #
+        # --! a deque allows to push new data in,
+        # --! which automatically pops out old data once deque's capacity is filled
+        sa_window = deque(maxlen=state_nsample)
+
+        # --! reset environment to begin replay from the first observation
+        s = env.reset()
+
+        # --! skip specified number of samples
+        for _ in range(skip_nsample):
+            a = policy.base(s)
+            sa_window.append((s, a))
+            s, reward, done = env.step(a)
+
+        # --! fill replay with observations, rewards, etc.
+        while not done:
+
+            # --! encode state at time t from a window of recent observations
+            state = self.encode_state(sa_window)
+
+            # --! based on observation at time t + 1, compute action at time t + 1
+            a = policy.base(s)
+
+            # --! provided residual policy is available, add residual action to the base one
+            if policy.residual is not None:
+                a = a + torch.squeeze(policy.residual(s, zeta=zeta), 0)
+
+            # --! update window with observation and action at time t + 1, and encode next state
+            sa_window.append((s, a))
+            next_state = self.encode_state(sa_window)
+
+            # --! replay buffer receives:
+            #
+            # --! state at time t
+            # --! reward at time t
+            # --! state at time t + 1
+            # --! done flag at time t
+            buf.add(
+                state,
+                reward,
+                next_state,
+                done
+            )
+
+            # --! make environment step to get next observations, rewards, etc.
+            s, reward, done = env.step(a)
+
+        return buf
+
+    def encode_state(self, sa_window):
+
+        # --! unpack given deque into sa tuples, and then zip all s's together and all a's together
+        s, a = zip(*sa_window)
+
+        # --! concatenate zipped s tuples into torch tensor, do the same for a
+        s = torch.cat(s, dim=0)
+        a = torch.cat(a, dim=0)
+
+        # --! concatenate s, a and mask tensors and return result as a 3D tensor
+        return torch.unsqueeze(torch.cat([s, a, torch.ones_like(a)], dim=-1), 0)
+
+    def extract_current_s(self, state):
+        s, other = torch.split(state, [self.state_ndim, self.action_ndim + self.mask_ndim], dim=-1)
+        return s[:, [-1]]
+
+    def extract_current_a(self, state):
+        s, a, mask = torch.split(state, [self.state_ndim, self.action_ndim, self.mask_ndim], dim=-1)
+        return a[:, [-1]]
+
+    def update_current_a(self, state, a):
+        state[:, -2:, [2]] = a
+
+    def update_state(self, state, s):
+
+        # --! make a dummy (zero) action
+        a = torch.zeros(s.shape[0], s.shape[1], 1)
+
+        # --! concatenate state-action pair and mask
+        sa = torch.cat([s, a, torch.ones_like(a)], dim=-1)
+
+        # --! shift in new state-action pair from the right
+        return torch.cat([state[:, 1:], sa], dim=1)
 
