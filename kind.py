@@ -94,6 +94,53 @@ class model(torch.nn.Module):
         return model_output
 
 
+class model_adapter:
+    """Adapts a KIND model to data normalization."""
+
+    def __init__(self, model, normalizer):
+
+        # --! freeze model
+        model.eval()
+        util_nn.freeze_module(model)
+
+        self.model = model
+        self.normalizer = normalizer
+
+    def __call__(self, lookback):
+        return self.forward(lookback)
+
+    def forward(self, lookback):
+
+        # --! normalize input data
+        lookback, mask = self.normalizer.normalize(lookback)
+
+        # --! pass normalized data to the model
+        model_output = self.model(lookback)
+
+        # --! denormalize model output
+        #
+        # --! extract predictions that need to be denormalized
+        prediction = model_output[0]
+        prediction_nom = model_output[1]
+        prediction_exc = model_output[3]
+
+        # --! denormalize extracted predictions
+        prediction = self.normalizer.denormalize(prediction, mask)
+        prediction_nom = self.normalizer.denormalize(prediction_nom, mask)
+        prediction_exc = self.normalizer.denormalize(prediction_exc, mask)
+
+        # --! put unscaled timeseries back to the result tuple and return the tuple
+        model_output = list(model_output)
+        model_output[0] = prediction
+        model_output[1] = prediction_nom
+        model_output[3] = prediction_exc
+
+        model_output = tuple(model_output)
+
+        # --! return model output
+        return model_output
+
+
 class training:
     """Manages a phase-by-phase training of a KIND model."""
 

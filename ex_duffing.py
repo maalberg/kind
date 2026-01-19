@@ -13,9 +13,7 @@ from scipy.integrate import solve_ivp
 from collections import deque
 from itertools import chain
 
-import kind
 import util_data
-import util_dyna
 import util_nn
 import reinforcement_learning as rl
 
@@ -89,53 +87,6 @@ class duffing_reward:
                                      beta=self.beta)
 
         return -(state_cost + action_cost + self.lambda_E * energy_cost)
-
-
-class model:
-    """Wraps a KIND model in a data-normalizing adapter."""
-
-    def __init__(self, model, normalizer):
-
-        # --! freeze model
-        model.eval()
-        util_nn.freeze_module(model)
-
-        self.model = model
-        self.normalizer = normalizer
-
-    def __call__(self, lookback):
-        return self.forward(lookback)
-
-    def forward(self, lookback):
-
-        # --! normalize input data
-        lookback, mask = self.normalizer.normalize(lookback)
-
-        # --! pass normalized data to the model
-        model_output = self.model(lookback)
-
-        # --! denormalize model output
-        #
-        # --! extract predictions that need to be denormalized
-        prediction = model_output[0]
-        prediction_nom = model_output[1]
-        prediction_exc = model_output[3]
-
-        # --! denormalize extracted predictions
-        prediction = self.normalizer.denormalize(prediction, mask)
-        prediction_nom = self.normalizer.denormalize(prediction_nom, mask)
-        prediction_exc = self.normalizer.denormalize(prediction_exc, mask)
-
-        # --! put unscaled timeseries back to the result tuple and return the tuple
-        model_output = list(model_output)
-        model_output[0] = prediction
-        model_output[1] = prediction_nom
-        model_output[3] = prediction_exc
-
-        model_output = tuple(model_output)
-
-        # --! return model output
-        return model_output
 
 
 def duffing_update(t, state, sim, u):
@@ -251,6 +202,28 @@ class duffing(rl.environment):
         return np.expand_dims(sim_o, axis=0)
 
 
+class duffing_adapter(rl.environment):
+    """Adapts a NumPy-based Duffing environment to PyTorch."""
+
+    def __init__(self, env):
+        self.env = env
+
+    def reset(self):
+        obs = self.env.reset()
+        return torch.from_numpy(obs).to(dtype=torch.float32)
+
+    def step(self, action):
+        action = action.detach().cpu().numpy()
+
+        next_state, reward, done = self.env.step(np.squeeze(action))
+
+        next_state = torch.from_numpy(next_state).to(dtype=torch.float32)
+        reward = torch.tensor(reward).to(dtype=torch.float32)
+        done = torch.tensor(done)
+
+        return next_state, reward, done
+
+
 def make_duffing(name, reward):
 
     if name == 'ood':
@@ -265,7 +238,7 @@ def make_duffing(name, reward):
         return None
 
 
-class lqr(util_dyna.policy):
+class lqr:
 
     def __init__(self, gain, setpoint=[0.0, 0.0], noise=0.0):
         self.gain = np.atleast_2d(gain)
@@ -313,8 +286,8 @@ def make_policy(duffing, q, r, setpoint=[0.0, 0.0], noise=0.0):
     rhs = bp.dot(a)
     k = np.linalg.solve(lhs, rhs)
 
-    # --! wrap the gain matrix in a callable policy strategy
-    return lqr(k, setpoint=setpoint, noise=noise)    
+    # --! return gain matrix
+    return np.atleast_2d(k)
 
 
 class normalizer(util_data.normalizer):
@@ -464,77 +437,6 @@ class dataset(util_data.dataset):
         timeseries_exc = self.read_timeseries(self.make_path(data_type='exc'))
 
         return normalizer(timeseries_nom, timeseries_exc, self.setpoint, self.state_ndim, self.control_ndim, self.mask_ndim)
-
-
-class replay_buffer(rl.replay_buffer):
-    def __init__(self, buffer=None):
-        self.buffer = buffer if buffer is not None else []
-
-    def __add__(self, other):
-        a = self.buffer
-        b = other.buffer
-
-        # --! interleave both buffers, such that the new buffer has elements: a[0], b[0], a[1], b[1], etc.
-        c = list(chain.from_iterable(zip(a, b)))
-
-        return replay_buffer(buffer=c)
-
-    def add(self, lookback, reward, next_lookback, done):
-
-        # --! convert a bool flag to a float which is either 0.0 or 1.0
-        done = done.float()
-
-        # --! all entities must be shaped as 3D data
-        done = torch.atleast_3d(done)
-        reward = torch.atleast_3d(reward)
-
-        # --! pack all elements as a tuple and put the tuple into the buffer
-        self.buffer.append((
-            lookback.detach(),
-            reward,
-            next_lookback.detach(),
-            done
-        ))
-
-    def random_batch(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        return map(torch.cat, zip(*batch))
-
-    def empty(self):
-        return len(self.buffer)==0
-
-    def encode_lookback(self, sa_window):
-        s, a = map(torch.cat, zip(*sa_window))
-        return torch.unsqueeze(torch.cat([s, a, torch.ones_like(a)], dim=-1), 0)
-
-    def encode_sa(self, s, a):
-        return torch.cat([s, a, torch.ones_like(a)], dim=-1)
-
-    def extract_current_state(self, lookback):
-        return lookback[:, [-1], :2]
-
-    def extract_current_action(self, lookback):
-        return lookback[:, [-1], 2:3]
-
-    def update_current_action(self, lookback, a):
-        lookback[:, -2:, [2]] = a
-
-    def update_lookback(self, lookback, s):
-
-        # --! make a dummy (zero) action
-        a = torch.zeros(s.shape[0], s.shape[1], 1)
-
-        sa = self.encode_sa(s, a)
-        return torch.cat([lookback[:, 1:], sa], dim=1)
-
-    def get_coarse_zeta(self, lookback):
-
-        # --! compute norms of states
-        state, _ = torch.split(lookback, [2, 1 + 1], dim=-1) # <- get the number of data dimensions !!!
-        return torch.mean(torch.linalg.norm(state, dim=-1, keepdim=True), dim=1, keepdim=True)
-
-    def coarse_zeta_threshold(self):
-        return 0.05
 
 
 class replay_factory(rl.replay_factory):

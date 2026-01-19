@@ -236,7 +236,7 @@ class iteration_improve(iteration_state):
         res_policy.train()
 
         # --! now, model rollout horizon
-        horizon = 40
+        horizon = 1
         nepoch = 100
 
         for epoch in range(nepoch):
@@ -475,54 +475,14 @@ class replay:
         return len(self.buffer)==0
 
     def to_file(self, filepath):
+
+        # --! extract the last data element (s, a, mask) from every state (lookback)
         state, reward, next_state, done = map(torch.cat, zip(*self.buffer))
         data = state[:, [-1]]
 
+        # --! for purity, reshape this 3D data, such that there is one n-step trajectory with m features, i.e. [1, n, m]
+        data = torch.transpose(data, 0, 1)
+        print(f'saving data with a shape {data.shape} to a file')
+
         util_data.write_datafile(filepath, data.numpy())
-
-
-class replay_buffer(interface):
-
-    @abstractmethod
-    def add(self, lookback, reward, next_lookback, done):
-        return
-
-    @abstractmethod
-    def random_batch(self, batch_size):
-        return
-
-    @abstractmethod
-    def empty(self):
-        return
-
-    @abstractmethod
-    def encode_lookback(self, sa_window):
-        """Encodes a KIND lookback from a window of state-action pairs ``sa_window``."""
-        return
-
-    @abstractmethod
-    def encode_sa(self, s, a):
-        """Encodes a state-action pair from state ``s`` and action ``a`` to be shifted into a KIND lookback."""
-        return
-
-    @abstractmethod
-    def extract_current_state(self, lookback):
-        """Extracts the current state from a given ``lookback``."""
-        return
-
-    @abstractmethod
-    def update_current_action(self, lookback, a):
-        return
-
-    @abstractmethod
-    def update_lookback(self, lookback, s):
-        return
-
-    @abstractmethod
-    def get_coarse_zeta(self, lookback):
-        return
-
-    @abstractmethod
-    def coarse_zeta_threshold(self):
-        return
 
