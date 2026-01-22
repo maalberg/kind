@@ -101,7 +101,7 @@ def duffing_update(t, state, sim, u):
 class duffing(rl.environment):
     """Simulates a Duffing oscillator. Implements Dyna environment interface."""
 
-    def __init__(self, beta, gamma, reward, alpha=-1.0, delta=0.2, omega=1.2, dt_sim=1e-4, dt_control=2e-2, t_final=100.0):
+    def __init__(self, beta, gamma, reward_fn, alpha=-1.0, delta=0.2, omega=1.2, dt_sim=1e-4, dt_control=2e-2, t_final=100.0):
 
         self.alpha = alpha
         self.beta  = beta
@@ -113,9 +113,7 @@ class duffing(rl.environment):
         self.x = self.ic[0]
         self.dx = self.ic[1]
 
-        self.base_policy = None
-        self.residual_policy = None
-        self.reward = reward
+        self.r_fn = reward_fn
 
         # --! define simulation timing
         self.dt_sim = dt_sim
@@ -138,7 +136,7 @@ class duffing(rl.environment):
 
         # --! based on current state and action, calculate reward 
         state = np.array([[self.x, self.dx]])
-        reward = self.reward(state, np.array([[action]]))
+        reward = self.r_fn(state, np.array([[action]]))
 
         # --! for integration below, define step timing
         t_start = self.jstep * self.dt_control
@@ -164,42 +162,9 @@ class duffing(rl.environment):
 
         return next_state, reward, done
 
-    def simulate(self, skip_nsample=0):
-        """Simulates this duffing oscillator from time equals 0 seconds till time specified in ``t_final``."""
-
-        x_buf = []
-        dx_buf = []
-        u_buf = []
-
-        # --! first, we reset this simulator to start from the initial condition
-        obs = self.reset()
-        done = False
-
-        # --! step though this environment while not done
-        while not done:
-
-            # --! derive control input
-            if self.base_policy is not None:
-                action = np.squeeze(self.base_policy(obs))
-                if self.residual_policy is not None:
-                    tata
-            else:
-                action = 0.0
-
-            # --! step to get the next observation
-            next_obs, reward, done = self.step(action)
-
-            # --! save current observation and action in buffers
-            x_buf.append(obs[0, 0])
-            dx_buf.append(obs[0, 1])
-            u_buf.append(action)
-
-            # --! repeat
-            obs = next_obs
-
-        # --! reshape lists as column vectors, concatenate them, unsqueeze at axis 0 and return
-        sim_o = np.concatenate([np.array(buf[skip_nsample:]).reshape(-1, 1) for buf in [x_buf, dx_buf, u_buf]], axis=-1)
-        return np.expand_dims(sim_o, axis=0)
+    @property
+    def reward_fn(self):
+        return self.r_fn
 
 
 class duffing_adapter(rl.environment):
@@ -207,6 +172,12 @@ class duffing_adapter(rl.environment):
 
     def __init__(self, env):
         self.env = env
+
+        reward_fn = env.reward_fn
+        self.r_fn = DuffingRewardTorch(
+            reward_fn.Q, reward_fn.R,
+            reward_fn.setpoint,
+            reward_fn.alpha, reward_fn.beta, reward_fn.lambda_E)
 
     def reset(self):
         obs = self.env.reset()
@@ -223,45 +194,46 @@ class duffing_adapter(rl.environment):
 
         return next_state, reward, done
 
+    @property
+    def reward_fn(self):
+        return self.r_fn
 
-def make_duffing(name, reward):
 
-    if name == 'ood':
-        d = duffing(20.0, 20.0, reward)
-        d.ic = [2.5, 5.0]
-        return d
-    elif name == 'id':
-        d = duffing(1.0, 0.1, reward)
+def make_duffing(name, reward_fn, dt=1e-2):
+
+    if name == 'nom':
+        d = duffing(1.0, 0.1, reward_fn, dt_control=dt)
         d.ic = [0.2, 0.2]
         return d
+    elif name == 'exc':
+        d = duffing(20.0, 20.0, reward_fn, dt_control=dt)
+        d.ic = [2.5, 5.0]
+        return d
     else:
+        print(f'err >> unknown duffing name: {name}')
         return None
 
 
-class lqr:
+class base_policy:
+    """Defines a PyTorch-based base policy."""
 
-    def __init__(self, gain, setpoint=[0.0, 0.0], noise=0.0):
-        self.gain = np.atleast_2d(gain)
-        self.setpoint = np.atleast_2d(setpoint)
-        self.noise = noise
+    def __init__(self, gain, setpoint):
+        self.gain = torch.from_numpy(gain).to(torch.float32)
+        self.setpoint = torch.atleast_2d(torch.tensor(setpoint))
 
-    def act(self, state):
-        state = state - self.setpoint
-        u = -np.matmul(state, np.transpose(self.gain))
-        return u + self.noise * np.random.standard_normal(size=u.shape)
+    def __call__(self, obs):
+        obs = obs - self.setpoint
+        return -torch.matmul(obs, torch.transpose(self.gain, 0, 1))
 
 
-def make_policy(duffing, q, r, setpoint=[0.0, 0.0], noise=0.0):
+def make_base_policy(duffing_alpha, duffing_delta, q, r, dt=1e-2, setpoint=[0.0, 0.0]):
     """Makes a baseline LQR policy for a Duffing oscillator.
     Parameters ``q`` and ``r`` are diagonal numpy arrays for state and action costs, respectively.
-    Parameter ``noise`` defines the standard deviation of an additive Gaussian noise."""
-
-    alpha = duffing.alpha
-    delta = duffing.delta
+    Default parameter ``setpoint`` is set to the origin."""
 
     a = np.array([
         [ 0,      1    ],
-        [-alpha, -delta],
+        [-duffing_alpha, -duffing_delta],
     ])
 
     b = np.array([
@@ -271,7 +243,7 @@ def make_policy(duffing, q, r, setpoint=[0.0, 0.0], noise=0.0):
 
     # --! discretize a continuous-time state-space system
     sys = signal.StateSpace(a, b, np.eye(2), np.zeros((2, 1)))
-    sys = sys.to_discrete(1e-2)
+    sys = sys.to_discrete(dt)
 
     # --! take discrete matrices A and B
     a = sys.A
@@ -287,7 +259,7 @@ def make_policy(duffing, q, r, setpoint=[0.0, 0.0], noise=0.0):
     k = np.linalg.solve(lhs, rhs)
 
     # --! return gain matrix
-    return np.atleast_2d(k)
+    return base_policy(k, setpoint)
 
 
 class normalizer(util_data.normalizer):
@@ -536,4 +508,36 @@ class replay_factory(rl.replay_factory):
 
         # --! shift in new state-action pair from the right
         return torch.cat([state[:, 1:], sa], dim=1)
+
+
+class dataset_factory(rl.dataset_factory):
+
+    def __init__(self, setpoint):
+        self.setpoint = setpoint
+        self.normalizer = None
+
+    def create_dataset(self, args):
+
+        ds = dataset(
+            args.file_dir, args.file_name, args.file_ext,
+            args.data_nsample,
+            (args.data_train_size, args.data_test_size),
+            args.batch_size, (args.lookback_nsample, args.forecast_nsample), self.setpoint, load_normalized=True)
+
+        self.normalizer = ds.normalizer
+        return ds
+
+    def create_normalizer(self, args):
+        if self.normalizer is not None:
+            print('using available normalizer')
+            return self.normalizer
+
+        ds = dataset(
+            args.file_dir, args.file_name, args.file_ext,
+            args.data_nsample,
+            (args.data_train_size, args.data_test_size),
+            args.batch_size, (args.lookback_nsample, args.forecast_nsample), self.setpoint, load_normalized=False)
+
+        print('creating new normalizer')
+        return ds.normalizer
 

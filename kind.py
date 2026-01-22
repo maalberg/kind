@@ -3,6 +3,8 @@
 from abc import abstractmethod
 from abc import ABC as interface
 
+from collections import namedtuple
+
 import torch
 import numpy as np
 import argparse
@@ -11,6 +13,9 @@ import json
 
 import util_data
 import util_nn
+
+
+regimes = namedtuple('regimes', 'nominal excursion')
 
 
 def create_args_parser():

@@ -6,16 +6,23 @@ from collections import deque
 from collections import namedtuple
 from itertools import chain
 
+from matplotlib import pyplot as plt
+
 import random
 import torch
 
+import os
+
+import kind
 import util_nn
 import util_data
 
 
+environments = namedtuple('environments', 'nominal excursion')
 policies = namedtuple('policies', 'base residual')
 reward_functions = namedtuple('reward_functions', 'nominal excursion')
 value_functions = namedtuple('value_functions', 'nominal excursion')
+zeta_thresholds = namedtuple('zeta_thresholds', 'nominal excursion')
 
 
 def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_data, horizon, gamma, epoch=0):
@@ -103,9 +110,7 @@ def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_da
 class policy_iteration:
     """Implements a model-based policy iteration."""
 
-    def __init__(self, model, base_policy, normalizer, reward_fn_nom, reward_fn_exc):
-
-        self.model = model
+    def __init__(self, base_policy, reward_fn, normalizer):
 
         self.base_policy = base_policy
         self.res_policy = policy(normalizer)
@@ -114,111 +119,25 @@ class policy_iteration:
         self.value_fn_nom = value_fn(normalizer)
         self.value_fn_exc = value_fn(normalizer)
 
-        self.reward_fn_nom = reward_fn_nom
-        self.reward_fn_exc = reward_fn_exc
+        self.reward_fn = reward_fn
 
-        # --! state machine
-        self.state_evaluate = iteration_evaluate(self)
-        self.state_improve = iteration_improve(self)
-        self.state = self.state_evaluate
+        self.normalizer = normalizer
 
-    def iterate(self, factory, replay_nom, replay_exc, dataset):
-        return self._get_state().iterate(factory, replay_nom, replay_exc, dataset)
+    def evaluate_policy(self, replay_factory, replay):
+        losses_nom = self._train_value(self.value_fn_nom, replay_factory, replay.nominal)
+        losses_exc = self._train_value(self.value_fn_exc, replay_factory, replay.excursion)
 
-    def _get_state_evaluate(self):
-        return self.state_evaluate
+        return losses_nom, losses_exc
 
-    def _get_state_improve(self):
-        return self.state_improve
+    def improve_policy(self, model, replay_factory, replay):
 
-    def _get_state(self):
-        return self.state
+        replay = replay.nominal + replay.excursion
 
-    def _set_state(self, state):
-        self.state = state
+        value_fn_nom = self.value_fn_nom
+        value_fn_exc = self.value_fn_exc
 
-
-class iteration_state(interface):
-
-    @abstractmethod
-    def iterate(self, factory, replay_nom, replay_exc, dataset):
-        return
-
-
-class iteration_evaluate(iteration_state):
-
-    def __init__(self, iteration):
-        self.iter = iteration
-
-    def iterate(self, factory, replay_nom, replay_exc, dataset):
-
-        loss_nom = self._evaluate_policy(self.iter.value_fn_nom, factory, replay_nom, dataset)
-        loss_exc = self._evaluate_policy(self.iter.value_fn_exc, factory, replay_exc, dataset)
-
-        self.iter._set_state(self.iter._get_state_improve())
-
-        return loss_nom, loss_exc
-
-    def _evaluate_policy(self, value_fn, factory, replay, dataset):
-
-        nepoch = 350
-        batch_size = 128
-        gamma = 0.94
-
-        learning_rate = 1e-3
-        weight_decay = 1e-5
-        value_optim = torch.optim.Adam(value_fn.parameters(), lr=learning_rate, weight_decay=weight_decay)
-
-        losses = []
-
-        value_fn.train()
-
-        for epoch in range(nepoch):
-            value_optim.zero_grad()
-
-            # --! sample a random batch
-            lookback, reward, next_lookback, done = replay.random_batch(batch_size)
-
-            # --! target must be treated as a constant, so restrict any gradient flow during target calculation
-            with torch.no_grad():
-                next_state = factory.extract_current_s(next_lookback)
-                target = reward + gamma * (1.0 - done) * value_fn(next_state)
-
-            # --! compute the value of the current state
-            state = factory.extract_current_s(lookback)
-            value = value_fn(state)
-
-            # --! compute loss
-            criterion = torch.nn.MSELoss()
-            loss = criterion(value, target)
-
-            losses.append(loss.item())
-            loss.backward()
-            value_optim.step()
-
-        return losses
-
-
-class iteration_improve(iteration_state):
-
-    def __init__(self, iteration):
-        self.iter = iteration
-
-    def iterate(self, factory, replay_nom, replay_exc, dataset):
-        loss = self._improve_policy(dataset, factory, replay_nom + replay_exc, self.iter.reward_fn_nom, self.iter.reward_fn_exc)
-        self.iter._set_state(self.iter._get_state_evaluate())
-
-        return loss
-
-    def _improve_policy(self, dataset, factory, replay, reward_fn_nom, reward_fn_exc):
-
-        value_fn_nom = self.iter.value_fn_nom
-        value_fn_exc = self.iter.value_fn_exc
-
-        res_policy = self.iter.res_policy
-        base_policy = self.iter.base_policy
-
-        model = self.iter.model
+        res_policy = self.res_policy
+        base_policy = self.base_policy
 
         gamma = 0.94
         batch_size = 128
@@ -248,10 +167,10 @@ class iteration_improve(iteration_state):
             a = advantage(
                 model,
                 policies(base_policy, res_policy),
-                reward_functions(reward_fn_nom, reward_fn_exc),
+                self.reward_fn,
                 value_functions(value_fn_nom, value_fn_exc),
-                dataset.normalizer,
-                factory, replay_data,
+                self.normalizer,
+                replay_factory, replay_data,
                 horizon, gamma, epoch
             )
 
@@ -259,6 +178,45 @@ class iteration_improve(iteration_state):
             losses.append(policy_loss.item())
             policy_loss.backward()
             policy_optim.step()
+
+        return losses
+
+    def _train_value(self, value_fn, replay_factory, replay):
+
+        nepoch = 350
+        batch_size = 128
+        gamma = 0.94
+
+        learning_rate = 1e-3
+        weight_decay = 1e-5
+        value_optim = torch.optim.Adam(value_fn.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+        losses = []
+
+        value_fn.train()
+
+        for epoch in range(nepoch):
+            value_optim.zero_grad()
+
+            # --! sample a random batch
+            lookback, reward, next_lookback, done = replay.random_batch(batch_size)
+
+            # --! target must be treated as a constant, so restrict any gradient flow during target calculation
+            with torch.no_grad():
+                next_state = replay_factory.extract_current_s(next_lookback)
+                target = reward + gamma * (1.0 - done) * value_fn(next_state)
+
+            # --! compute the value of the current state
+            state = replay_factory.extract_current_s(lookback)
+            value = value_fn(state)
+
+            # --! compute loss
+            criterion = torch.nn.MSELoss()
+            loss = criterion(value, target)
+
+            losses.append(loss.item())
+            loss.backward()
+            value_optim.step()
 
         return losses
 
@@ -400,12 +358,18 @@ class environment(interface):
     @abstractmethod
     def reset(self):
         """Resets this environment to start a new episode and returns the first observation from that new episode."""
-        return
+        pass
 
     @abstractmethod
     def step(self, action):
         """Applies ``action`` and returns the next observation, reward and termination flags."""
-        return
+        pass
+
+    @property
+    @abstractmethod
+    def reward_fn(self):
+        """Returns reward function used by this environment."""
+        pass
 
 
 class replay_factory(interface):
@@ -485,4 +449,169 @@ class replay:
         print(f'saving data with a shape {data.shape} to a file')
 
         util_data.write_datafile(filepath, data.numpy())
+
+
+class dataset_factory(interface):
+
+    @abstractmethod
+    def create_dataset(self, args):
+        pass
+
+    @abstractmethod
+    def create_normalizer(self, args):
+        pass
+
+
+class agent:
+    """Implements a Dyna-style reinforcement learning agent."""
+
+    def __init__(self, env, base_policy, dataset_factory, replay_factory, args):
+
+        self.env = env
+        self.base_policy = base_policy
+        self.dataset_factory = dataset_factory
+        self.replay_factory = replay_factory
+        self.args = args
+
+        # --! construct policy iteration
+        self.piter = policy_iteration(
+            base_policy,
+            kind.regimes(env.nominal.reward_fn, env.excursion.reward_fn),
+            dataset_factory.create_normalizer(args))
+
+    def train(self, niter=1):
+
+        # --! first, acquire replay data buffers from environment
+        replay = self._acquire_replay(None, zeta_thresholds(0.0, 0.0), self.args.lookback_nsample, self.args.lookback_nsample*3)
+
+        # --! save acquired data to files to comply with KIND model interface
+        self._save_replay(replay)
+
+        # --! second, train a KIND model on the acquired data
+        model = self._train_model()
+
+        # --! third, run policy iteration
+        self._iterate_policy(model, replay)
+
+    def _acquire_replay(self, residual_policy, zeta, state_nsample, skip_nsample):
+
+        replay_nom = self.replay_factory.create(
+            self.env.nominal,
+            policies(self.base_policy, residual_policy),
+            zeta.nominal,
+            state_nsample, skip_nsample)
+        replay_exc = self.replay_factory.create(
+            self.env.excursion,
+            policies(self.base_policy, residual_policy),
+            zeta.excursion,
+            state_nsample, skip_nsample)
+
+        return kind.regimes(replay_nom, replay_exc)
+
+    def _save_replay(self, replay):
+
+        filename = f'{self.args.file_name}_nom'
+        replay.nominal.to_file(os.path.join(self.args.file_dir, filename))
+
+        filename = f'{self.args.file_name}_exc'
+        replay.excursion.to_file(os.path.join(self.args.file_dir, filename))
+
+    def _train_model(self):
+        model = kind.model(self.args)
+        training = kind.training(model)
+        dataset = self.dataset_factory.create_dataset(self.args)
+
+        model.train()
+        keep_training = True
+        while keep_training:
+            training.fit(dataset)
+            keep_training = training.fit_next()
+
+        model.eval()
+        _, _, data_loader = dataset.load(data_type='mixed')
+
+        jdata = 1
+
+        with torch.no_grad():
+            for back, fore in data_loader:
+                truth = torch.cat([back, fore], dim=1)
+
+                model_output = model(back[[jdata]])
+                pre = model_output[0]
+                alpha = model_output[9]
+
+                plt.figure(figsize=(6,5))
+
+                plt.subplot(2,1,1)
+                plt.plot(truth[jdata, :, :2])
+                plt.plot(pre[0, :, :2], linestyle='dashed', label='x')
+                plt.legend()
+
+                plt.subplot(2,1,2)
+                plt.plot(alpha[0, :, :2], label='alpha')
+                plt.ylim((0.0, 1.05))
+                plt.legend()
+
+                plt.show()
+
+                break
+
+        model.eval()
+        return kind.model_adapter(model, dataset.normalizer)
+
+    def _iterate_policy(self, model, replay):
+        loss_nom, loss_exc = self.piter.evaluate_policy(self.replay_factory, replay)
+        loss_policy = self.piter.improve_policy(model, self.replay_factory, replay)
+
+        self.piter.value_fn_nom.eval()
+        self.piter.value_fn_exc.eval()
+
+        state, reward, next_state, done = map(torch.cat, zip(*replay.nominal.buffer))
+        obs_nom = self.replay_factory.extract_current_s(state)
+        obs_norm_nom = torch.squeeze(torch.linalg.norm(obs_nom, dim=-1, ord=2))
+        value_nom = torch.squeeze(self.piter.value_fn_nom(obs_nom))
+
+        state, reward, next_state, done = map(torch.cat, zip(*replay.excursion.buffer))
+        obs_exc = self.replay_factory.extract_current_s(state)
+        obs_norm_exc = torch.squeeze(torch.linalg.norm(obs_exc, dim=-1, ord=2))
+        value_exc = torch.squeeze(self.piter.value_fn_exc(obs_exc))
+
+        with torch.no_grad():
+
+            plt.figure(figsize=(6,10))
+
+            plt.subplot(4,1,1)
+            plt.plot(loss_nom)
+            plt.xlabel('epochs')
+            plt.ylabel('nominal loss')
+
+            plt.subplot(4,1,2)
+            plt.scatter(obs_norm_nom, value_nom)
+            plt.scatter(obs_norm_nom[0], value_nom[0])
+            plt.xlabel('state norm')
+            plt.ylabel('nominal value')
+
+            plt.subplot(4,1,3)
+            plt.plot(loss_exc)
+            plt.xlabel('epochs')
+            plt.ylabel('excursion loss')
+
+            plt.subplot(4,1,4)
+            plt.scatter(obs_norm_exc, value_exc)
+            plt.scatter(obs_norm_exc[0], value_exc[0])
+            plt.xlabel('state norm')
+            plt.ylabel('excursion value')
+
+            plt.tight_layout()
+            plt.show()
+
+        with torch.no_grad():
+
+            plt.figure(figsize=(6,3))
+
+            plt.plot(loss_policy)
+            plt.xlabel('epochs')
+            plt.ylabel('policy loss')
+
+            plt.show()
 
