@@ -481,17 +481,19 @@ class agent:
 
     def train(self, niter=1):
 
-        # --! first, acquire replay data buffers from environment
-        replay = self._acquire_replay(None, zeta_thresholds(0.0, 0.0), self.args.lookback_nsample, self.args.lookback_nsample*3)
+        for curr_iter in range(niter):
 
-        # --! save acquired data to files to comply with KIND model interface
-        self._save_replay(replay)
+            # --! first, acquire replay data buffers from environment
+            replay = self._acquire_replay(None, zeta_thresholds(0.0, 0.0), self.args.lookback_nsample, self.args.lookback_nsample*3)
 
-        # --! second, train a KIND model on the acquired data
-        model = self._train_model()
+            # --! save acquired data to files to comply with KIND model interface
+            self._save_replay(replay, curr_iter + 1)
 
-        # --! third, run policy iteration
-        self._iterate_policy(model, replay)
+            # --! second, train a KIND model on the acquired data
+            model = self._train_model(curr_iter + 1)
+
+            # --! third, run policy iteration
+            self._iterate_policy(model, replay)
 
     def _acquire_replay(self, residual_policy, zeta, state_nsample, skip_nsample):
 
@@ -508,19 +510,25 @@ class agent:
 
         return kind.regimes(replay_nom, replay_exc)
 
-    def _save_replay(self, replay):
+    def _save_replay(self, replay, curr_iter):
 
-        filename = f'{self.args.file_name}_nom'
+        filename = f'{self.args.file_name}_nom_{curr_iter}'
         replay.nominal.to_file(os.path.join(self.args.file_dir, filename))
 
-        filename = f'{self.args.file_name}_exc'
+        filename = f'{self.args.file_name}_exc_{curr_iter}'
         replay.excursion.to_file(os.path.join(self.args.file_dir, filename))
 
-    def _train_model(self):
+    def _train_model(self, curr_iter):
+
+        # --! update file index in KIND arguments
+        self.args.file_index = curr_iter
+
+        # --! create model and dataset
         model = kind.model(self.args)
         training = kind.training(model)
         dataset = self.dataset_factory.create_dataset(self.args)
 
+        # --! train model
         model.train()
         keep_training = True
         while keep_training:

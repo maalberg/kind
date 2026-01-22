@@ -386,17 +386,17 @@ class dataset(util_data.dataset):
     mask_ndim = 1
 
     def __init__(self,
-                 file_dir, file_name, file_ext,
+                 file_dir, file_name, file_index, file_ext,
                  data_nsample,
                  data_split_size,
                  batch_size, window_nsample, setpoint, load_normalized=True):
-        super().__init__(file_dir, file_name, file_ext,
+        super().__init__(file_dir, file_name, file_index, file_ext,
                          data_nsample, data_split_size,
                          batch_size, window_nsample, setpoint, load_normalized)
 
     def make_path(self, data_type='nom'):
-        file_name = self.file_name + '_' + data_type + self.file_ext
-        return os.path.join(self.file_dir, file_name)
+        filename = f'{self.file_name}_{data_type}_{self.file_index}{self.file_ext}'
+        return os.path.join(self.file_dir, filename)
 
     def extract_target(self, window):
         """Extracts the first two feature dimensions: position and velocity."""
@@ -519,7 +519,7 @@ class dataset_factory(rl.dataset_factory):
     def create_dataset(self, args):
 
         ds = dataset(
-            args.file_dir, args.file_name, args.file_ext,
+            args.file_dir, args.file_name, args.file_index, args.file_ext,
             args.data_nsample,
             (args.data_train_size, args.data_test_size),
             args.batch_size, (args.lookback_nsample, args.forecast_nsample), self.setpoint, load_normalized=True)
@@ -533,7 +533,7 @@ class dataset_factory(rl.dataset_factory):
             return self.normalizer
 
         ds = dataset(
-            args.file_dir, args.file_name, args.file_ext,
+            args.file_dir, args.file_name, args.file_index, args.file_ext,
             args.data_nsample,
             (args.data_train_size, args.data_test_size),
             args.batch_size, (args.lookback_nsample, args.forecast_nsample), self.setpoint, load_normalized=False)

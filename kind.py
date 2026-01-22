@@ -25,6 +25,7 @@ def create_args_parser():
     # --! data arguments
     parser.add_argument('--file_dir', type=str, required=True, help='relative path to file directory')
     parser.add_argument('--file_name', type=str, required=True, help='file name with no extension (e.g., .csv) and no suffix (e.g., _stat)')
+    parser.add_argument('--file_index', type=int, required=False, default=0, help='file index to define or separate learning stages')
     parser.add_argument('--file_ext', type=str, required=False, default='.csv', help='data file extension')
     parser.add_argument('--data_nsample', type=int, required=True, help='number of samples in timeseries stored in data')
     parser.add_argument('--data_train_size', type=float, required=False, default=0.8, help='dataset part to include in training')

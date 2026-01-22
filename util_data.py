@@ -37,11 +37,12 @@ class dataset(interface):
     min_std = torch.tensor(1e-3, dtype=torch.float32)
 
     def __init__(self,
-                 file_dir, file_name, file_ext,
+                 file_dir, file_name, file_index, file_ext,
                  data_nsample, data_split_size, batch_size, window_nsample, setpoint, load_normalized=True):
 
         self.file_dir = file_dir
         self.file_name = file_name
+        self.file_index = file_index
         self.file_ext = file_ext
         self.data_nsample = data_nsample
         self.split_size = data_split_size
