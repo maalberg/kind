@@ -3,13 +3,14 @@
 from abc import abstractmethod
 from abc import ABC as interface
 
-from collections import namedtuple
-
 import torch
+import torch.nn.functional as F
 import numpy as np
 import argparse
 import time
 import json
+
+from collections import namedtuple
 
 import util_data
 import util_nn
@@ -76,12 +77,21 @@ class model(torch.nn.Module):
 
     def forward(self, lookback):
 
-        # --! execute both operators on the given lookback
+        # --! execute both operators on given lookback
         mean_nom, zeta_nom, fun_nom, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model_nom(lookback)
         mean_exc, zeta_exc, fun_exc, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model_exc(lookback)
 
-        # --! derive alpha
-        alpha = zeta_exc / (zeta_exc + zeta_nom)
+        # --! zeta signal has two features - signed error and geometry error - these are applied to each target channel
+        zeta_chan_ndim = self.args.target_ndim
+        signed_error_nom, geometry_error_nom = torch.split(zeta_nom, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
+        signed_error_exc, geometry_error_exc = torch.split(zeta_exc, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
+
+        beta = 2.0
+        error_nom = torch.abs(signed_error_nom) + beta * torch.abs(geometry_error_nom)
+        error_exc = torch.abs(signed_error_exc) + beta * torch.abs(geometry_error_exc)
+
+        # --! derive alpha [0, 1]
+        alpha = error_exc / (error_exc + error_nom)
 
         # --! blend the two types of time series using the derived alpha to get the final prediction
         prediction = alpha * mean_nom + (1 - alpha) * mean_exc
@@ -322,6 +332,37 @@ class training_phase(interface):
         loss = 0.5 * (uncertainty_log + (timeseries_pred_mean - timeseries)**2 * uncertainty)
         return loss.mean()
 
+    def smoothed_derivative(self, x, window_nsample=9):
+
+        # --! compute finite difference along time dimension
+        dx = x[:, 1:, :] - x[:, :-1, :]
+        dx = F.pad(dx, (0, 0, 1, 0)) # pad time dimension
+
+        nbatch, nsample, nchan = dx.shape
+
+        # --! create a moving-average kernel
+        kernel = torch.ones(window_nsample, device=x.device, dtype=x.dtype) / window_nsample
+        kernel = kernel.view(1, 1, window_nsample)
+
+        # --! prepare for grouped convolution: [nbatch, nchan, nsample]
+        dx = dx.transpose(1, 2)
+
+        # Repeat kernel for each channel
+        kernel = kernel.repeat(nchan, 1, 1)
+
+        # --! perform depthwise convolution
+        dx = F.conv1d(
+            dx,
+            kernel,
+            padding=window_nsample // 2,
+            groups=nchan
+        )
+
+        # --! back to [nbatch, nsample, nchan]
+        dx = dx.transpose(1, 2)
+
+        return dx
+
 
 class mean_training_nom(training_phase):
 
@@ -397,7 +438,7 @@ class zeta_training_nom(training_phase):
         fun_u_pre = pred[11]
 
         loss_linear = self.apply_criterion_mean(fun_u, fun_u_pre)
-        loss_uncertain = self.apply_criterion_uncertain_test(timeseries, timeseries_pred_mean, timeseries_u_pre)
+        loss_uncertain = self.apply_criterion_zeta(timeseries, timeseries_pred_mean, timeseries_u_pre)
         loss = loss_uncertain + loss_linear
 
         return loss
@@ -406,9 +447,24 @@ class zeta_training_nom(training_phase):
         self.training.set_phase(self.training.get_phase_mean_exc())
         return True
 
-    def apply_criterion_uncertain_test(self, true, pre, pre_u):
-        err = torch.abs(true - pre)
-        return self.apply_criterion_mean(err, pre_u)
+    def apply_criterion_zeta(self, true, pred, zeta):
+
+        zeta_chan_ndim = self.training.model.args.target_ndim
+        signed_error, geometry_error = torch.split(zeta, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
+
+        with torch.no_grad():
+            signed_target = true - pred
+
+        signed_loss = self.apply_criterion_mean(signed_target, signed_error)
+
+        with torch.no_grad():
+            da = self.smoothed_derivative(true, window_nsample=9) # <-- fix me: put number of window samples into model arguments
+            db = self.smoothed_derivative(pred, window_nsample=9)
+            geometry_target = da - db
+
+        geometry_loss = self.apply_criterion_mean(geometry_target, geometry_error)
+
+        return signed_loss + geometry_loss
 
 
 class mean_training_exc(training_phase):
@@ -485,7 +541,7 @@ class zeta_training_exc(training_phase):
         fun_u_pre = pred[13]
 
         loss_linear = self.apply_criterion_mean(fun_u, fun_u_pre)
-        loss_uncertain = self.apply_criterion_uncertain_test(timeseries, timeseries_pred_mean, timeseries_u_pre)
+        loss_uncertain = self.apply_criterion_zeta(timeseries, timeseries_pred_mean, timeseries_u_pre)
         loss = loss_uncertain + loss_linear
 
         return loss
@@ -493,9 +549,24 @@ class zeta_training_exc(training_phase):
     def next(self):
         return False
 
-    def apply_criterion_uncertain_test(self, true, pre, pre_u):
-        err = torch.abs(true - pre)
-        return self.apply_criterion_mean(err, pre_u)
+    def apply_criterion_zeta(self, true, pred, zeta):
+
+        zeta_chan_ndim = self.training.model.args.target_ndim
+        signed_error, geometry_error = torch.split(zeta, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
+
+        with torch.no_grad():
+            signed_target = true - pred
+
+        signed_loss = self.apply_criterion_mean(signed_target, signed_error)
+
+        with torch.no_grad():
+            da = self.smoothed_derivative(true, window_nsample=9) # <-- fix me: put number of window samples into model arguments
+            db = self.smoothed_derivative(pred, window_nsample=9)
+            geometry_target = da - db
+
+        geometry_loss = self.apply_criterion_mean(geometry_target, geometry_error)
+
+        return signed_loss + geometry_loss
     
 
 class operator(torch.nn.Module, interface):
@@ -678,12 +749,18 @@ class operator_nom(operator):
         mod_var_gen_feat = util_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
         self.mod_u_gen = util_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
 
-        # --! create prediction decoders to decode predicted embeddings back to timeseries and uncertainty
+        # --! create prediction decoder to decode predicted embeddings back to timeseries
         pre_dec_ni = nfun
         pre_dec_no = self.param_kernsize * self.ntarget
         pre_dec_feat = util_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
         self.pre_mean_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
-        self.pre_u_dec  = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+
+        # --! construct uncertainty decoder that outputs
+        # --! two uncertainty features for each target: signed error and error 'geometry'
+        zeta_dec_ni = nfun
+        zeta_dec_no = self.param_kernsize * self.ntarget * 2
+        zeta_dec_feat = util_nn.make_feat(ni=zeta_dec_ni, no=zeta_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.zeta_dec = util_nn.fcnn(feat=zeta_dec_feat, actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -916,8 +993,8 @@ class operator_nom(operator):
         timeseries_pre_mean  = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.ntarget)
 
         # --! decode predicted and denormalized function uncertainty to model uncertainty
-        timeseries_u_pre = self.pre_u_dec(torch.cat([fun_u_pre, fun_u_pre_forecast], dim=1))
-        timeseries_u_pre = timeseries_u_pre.reshape(timeseries_u_pre.shape[0], -1, self.ntarget)
+        timeseries_u_pre = self.zeta_dec(torch.cat([fun_u_pre, fun_u_pre_forecast], dim=1))
+        timeseries_u_pre = timeseries_u_pre.reshape(timeseries_u_pre.shape[0], -1, self.ntarget * 2)
 
         return timeseries_pre_mean, timeseries_u_pre, fun, fun_pre, fun_u, fun_u_pre
 
@@ -933,7 +1010,7 @@ class operator_nom(operator):
         if self.nfeature > 1:
             util_nn.freeze_module(self.fun_u_prune)
         util_nn.freeze_module(self.mod_u_gen)
-        util_nn.freeze_module(self.pre_u_dec)
+        util_nn.freeze_module(self.zeta_dec)
 
     def unfreeze(self):
         util_nn.unfreeze_module(self.fun_enc)
@@ -944,7 +1021,7 @@ class operator_nom(operator):
         util_nn.unfreeze_module(self.mod_mean)
         util_nn.unfreeze_module(self.mod_u_gen)
         util_nn.unfreeze_module(self.pre_mean_dec)
-        util_nn.unfreeze_module(self.pre_u_dec)
+        util_nn.unfreeze_module(self.zeta_dec)
 
 
 class operator_exc(operator):
@@ -1030,12 +1107,18 @@ class operator_exc(operator):
         mod_u_gen_feat = util_nn.make_feat(ni=mod_u_gen_ni, no=mod_u_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
         self.mod_u_gen = util_nn.fcnn(feat=mod_u_gen_feat, actfun_hid='relu')
 
-        # --! create MLP-based decoders to decode embeddings back to timeseries with uncertainty
+        # --! create MLP-based decoders to decode embeddings back to timeseries
         pre_dec_ni = nfun
         pre_dec_no = self.param_kernsize * self.ntarget
         pre_dec_feat = util_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
         self.pre_mean_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
-        self.pre_u_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+
+        # --! construct uncertainty decoder that outputs
+        # --! two uncertainty features for each target: signed error and error 'geometry'
+        zeta_dec_ni = nfun
+        zeta_dec_no = self.param_kernsize * self.ntarget * 2
+        zeta_dec_feat = util_nn.make_feat(ni=zeta_dec_ni, no=zeta_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.zeta_dec = util_nn.fcnn(feat=zeta_dec_feat, actfun_hid='relu')
 
     def embed(self, timeseries):
 
@@ -1276,8 +1359,8 @@ class operator_exc(operator):
         timeseries_pre_mean = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.ntarget)
 
         # --! decode predicted and denormalized function uncertainty to model uncertainty
-        timeseries_u_pre = self.pre_u_dec(torch.cat([fun_u_pre, fun_u_pre_forecast], dim=1))
-        timeseries_u_pre = timeseries_u_pre.reshape(timeseries_u_pre.shape[0], -1, self.ntarget)
+        timeseries_u_pre = self.zeta_dec(torch.cat([fun_u_pre, fun_u_pre_forecast], dim=1))
+        timeseries_u_pre = timeseries_u_pre.reshape(timeseries_u_pre.shape[0], -1, self.ntarget * 2)
 
         return timeseries_pre_mean, timeseries_u_pre, fun, fun_pre, fun_u, fun_u_pre
 
@@ -1294,7 +1377,7 @@ class operator_exc(operator):
         if self.nfeature > 1:
             util_nn.freeze_module(self.fun_u_prune)
         util_nn.freeze_module(self.mod_u_gen)
-        util_nn.freeze_module(self.pre_u_dec)
+        util_nn.freeze_module(self.zeta_dec)
 
     def unfreeze(self):
         util_nn.unfreeze_module(self.fun_enc)
@@ -1306,5 +1389,5 @@ class operator_exc(operator):
         util_nn.unfreeze_module(self.mod_mean_gen)
         util_nn.unfreeze_module(self.mod_u_gen)
         util_nn.unfreeze_module(self.pre_mean_dec)
-        util_nn.unfreeze_module(self.pre_u_dec)
+        util_nn.unfreeze_module(self.zeta_dec)
 
