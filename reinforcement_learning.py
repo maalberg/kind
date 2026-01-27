@@ -51,7 +51,7 @@ def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_da
     with torch.no_grad():
 
         # --! compute the uncertainty of a nominal KIND operator
-        zeta = model(lookback)[2]
+        zeta = model(lookback)[14]
 
         # --! uncertainty zeta is represented by the mean of batch elements
         zeta = torch.mean(zeta, dim=tuple(range(1, zeta.dim())), keepdim=True)
@@ -113,7 +113,7 @@ class policy_iteration:
     def __init__(self, base_policy, reward_fn, normalizer):
 
         self.base_policy = base_policy
-        self.res_policy = policy(normalizer)
+        self.residual_policy = policy(normalizer)
 
         # --! we use two separate value functions: one for nominal and another for excursion regimes
         self.value_fn_nom = value_fn(normalizer)
@@ -136,14 +136,14 @@ class policy_iteration:
         value_fn_nom = self.value_fn_nom
         value_fn_exc = self.value_fn_exc
 
-        res_policy = self.res_policy
+        residual_policy = self.residual_policy
         base_policy = self.base_policy
 
         gamma = 0.94
         batch_size = 128
         learning_rate = 1e-3
         weight_decay = 1e-5
-        policy_optim = torch.optim.Adam(res_policy.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        policy_optim = torch.optim.Adam(residual_policy.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
         losses = []
 
@@ -152,10 +152,10 @@ class policy_iteration:
         value_fn_exc.eval()
 
         # --! train policy
-        res_policy.train()
+        residual_policy.train()
 
         # --! now, model rollout horizon
-        horizon = 1
+        horizon = 200
         nepoch = 100
 
         for epoch in range(nepoch):
@@ -166,7 +166,7 @@ class policy_iteration:
 
             a = advantage(
                 model,
-                policies(base_policy, res_policy),
+                policies(base_policy, residual_policy),
                 self.reward_fn,
                 value_functions(value_fn_nom, value_fn_exc),
                 self.normalizer,
@@ -481,19 +481,23 @@ class agent:
 
     def train(self, niter=1):
 
-        for curr_iter in range(niter):
+        # --! initially there is no residual policy, so zeta (one of policy inputs) does not matter and is thus 0
+        policy = None
+        zeta = kind.regimes(0.0, 0.0)
+
+        for i in range(niter):
 
             # --! first, acquire replay data buffers from environment
-            replay = self._acquire_replay(None, zeta_thresholds(0.0, 0.0), self.args.lookback_nsample, self.args.lookback_nsample*3)
+            replay = self._acquire_replay(policy, zeta, self.args.lookback_nsample, self.args.lookback_nsample*3)
 
             # --! save acquired data to files to comply with KIND model interface
-            self._save_replay(replay, curr_iter + 1)
+            self._save_replay(replay, i + 1)
 
             # --! second, train a KIND model on the acquired data
-            model = self._train_model(curr_iter + 1)
+            model, zeta = self._train_model(i + 1)
 
             # --! third, run policy iteration
-            self._iterate_policy(model, replay)
+            policy = self._iterate_policy(model, replay)
 
     def _acquire_replay(self, residual_policy, zeta, state_nsample, skip_nsample):
 
@@ -510,19 +514,19 @@ class agent:
 
         return kind.regimes(replay_nom, replay_exc)
 
-    def _save_replay(self, replay, curr_iter):
+    def _save_replay(self, replay, i):
 
-        filename = f'{self.args.file_name}_nom_{curr_iter}'
+        filename = f'{self.args.file_name}_nom_{i}'
         replay.nominal.to_file(os.path.join(self.args.file_dir, filename))
 
-        filename = f'{self.args.file_name}_exc_{curr_iter}'
+        filename = f'{self.args.file_name}_exc_{i}'
         replay.excursion.to_file(os.path.join(self.args.file_dir, filename))
 
-    def _train_model(self, curr_iter):
+    def _train_model(self, i):
 
         # --! update file index in KIND arguments
-        self.args.file_index = curr_iter
-
+        self.args.file_index = i
+ 
         # --! create model and dataset
         model = kind.model(self.args)
         training = kind.training(model)
@@ -534,6 +538,9 @@ class agent:
         while keep_training:
             training.fit(dataset)
             keep_training = training.fit_next()
+
+        # --! having a model, we can now estimate zeta
+        zeta = self._estimate_zeta(model, dataset)
 
         model.eval()
         _, _, data_loader = dataset.load(data_type='mixed')
@@ -564,8 +571,10 @@ class agent:
 
                 break
 
-        model.eval()
-        return kind.model_adapter(model, dataset.normalizer)
+        # --! wrap model with a model adapter which normalizes/denormalizes input data on the fly
+        model = kind.model_adapter(model, dataset.normalizer)
+
+        return model, zeta
 
     def _iterate_policy(self, model, replay):
         loss_nom, loss_exc = self.piter.evaluate_policy(self.replay_factory, replay)
@@ -622,4 +631,43 @@ class agent:
             plt.ylabel('policy loss')
 
             plt.show()
+
+        return self.piter.residual_policy
+
+    def _estimate_zeta(self, model, dataset):
+
+        # --! check that this model works with normalized inputs only
+        assert isinstance(model, kind.model) and dataset.load_normalized==True
+
+        model.eval()
+
+        # --! estimate zeta of a nominal model on nominal data
+        train_loader, _, _ = dataset.load(data_type='nom') # training loader provides more data for estimation
+        zeta = []
+        with torch.no_grad():
+            for back, fore in train_loader:
+
+                model_output = model(back)
+                zeta_nom = model_output[14]
+
+                zeta.append(torch.mean(zeta_nom).item())
+
+        zeta = torch.tensor(zeta, dtype=torch.float32)
+        zeta_nom_nom = torch.mean(zeta)
+
+        # --! estimate zeta of a nominal model on excursion data
+        train_loader, _, _ = dataset.load(data_type='exc')
+        zeta = []
+        with torch.no_grad():
+            for back, fore in train_loader:
+
+                model_output = model(back)
+                zeta_nom = model_output[14]
+
+                zeta.append(torch.mean(zeta_nom).item())
+
+        zeta = torch.tensor(zeta, dtype=torch.float32)
+        zeta_nom_exc = torch.mean(zeta)
+
+        return kind.regimes(zeta_nom_nom, zeta_nom_exc)
 

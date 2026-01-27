@@ -78,33 +78,35 @@ class model(torch.nn.Module):
     def forward(self, lookback):
 
         # --! execute both operators on given lookback
-        mean_nom, zeta_nom, fun_nom, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model_nom(lookback)
-        mean_exc, zeta_exc, fun_exc, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model_exc(lookback)
+        mean_nom, raw_zeta_nom, fun_nom, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model_nom(lookback)
+        mean_exc, raw_zeta_exc, fun_exc, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model_exc(lookback)
 
-        # --! zeta signal has two features - signed error and geometry error - these are applied to each target channel
+        # --! raw zeta signal has two features: signed error and geometry error
         zeta_chan_ndim = self.args.target_ndim
-        signed_error_nom, geometry_error_nom = torch.split(zeta_nom, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
-        signed_error_exc, geometry_error_exc = torch.split(zeta_exc, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
+        signed_error_nom, geometry_error_nom = torch.split(raw_zeta_nom, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
+        signed_error_exc, geometry_error_exc = torch.split(raw_zeta_exc, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
 
-        beta = 2.0
-        error_nom = torch.abs(signed_error_nom) + beta * torch.abs(geometry_error_nom)
-        error_exc = torch.abs(signed_error_exc) + beta * torch.abs(geometry_error_exc)
+        # --! convert raw zeta to true zeta - a non-negative signal with penalty on high-angle intersections
+        beta = 2.0 # <-- todo: put beta into model arguments
+        zeta_nom = torch.abs(signed_error_nom) + beta * torch.abs(geometry_error_nom)
+        zeta_exc = torch.abs(signed_error_exc) + beta * torch.abs(geometry_error_exc)
 
         # --! derive alpha [0, 1]
-        alpha = error_exc / (error_exc + error_nom)
+        alpha = zeta_exc / (zeta_exc + zeta_nom)
 
         # --! blend the two types of time series using the derived alpha to get the final prediction
         prediction = alpha * mean_nom + (1 - alpha) * mean_exc
 
         model_output = (
             prediction,
-            mean_nom, zeta_nom,
-            mean_exc, zeta_exc,
+            mean_nom, raw_zeta_nom, # <-- returning raw zeta is essential for training
+            mean_exc, raw_zeta_exc,
             fun_nom, fun_stat_pred,
             fun_exc, fun_trans_pred,
             alpha,
             dfun_stat, dfun_stat_pred,
-            dfun_trans, dfun_trans_pred
+            dfun_trans, dfun_trans_pred,
+            zeta_nom, zeta_exc
         )
 
         return model_output
@@ -452,11 +454,15 @@ class zeta_training_nom(training_phase):
         zeta_chan_ndim = self.training.model.args.target_ndim
         signed_error, geometry_error = torch.split(zeta, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
 
+        # --! take difference between true and predicted time series,
+        # --! hence zero difference at a certain time step signifies that the time series intersect
         with torch.no_grad():
             signed_target = true - pred
 
         signed_loss = self.apply_criterion_mean(signed_target, signed_error)
 
+        # --! take difference between derivatives of true and predicted time series,
+        # --! hence zero difference at a certain time step signifies that the time series change in a similar way
         with torch.no_grad():
             da = self.smoothed_derivative(true, window_nsample=9) # <-- fix me: put number of window samples into model arguments
             db = self.smoothed_derivative(pred, window_nsample=9)
