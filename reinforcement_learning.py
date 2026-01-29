@@ -84,10 +84,10 @@ def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_da
         rollout_return += gamma**k * rollout_reward
 
         # --! KIND predicts next state
-        model_output = model(rollout) # < gradients flow here
+        model_o = model(rollout) # < gradients flow here
 
         # --! having a prediction, take its forecast part
-        forecast = model_output[0][:, 384:]
+        forecast = model_o.blend[:, 384:]
 
         # --! take the first observation from the forecast
         next_state = forecast[:, :1, :]
@@ -155,7 +155,7 @@ class policy_iteration:
         residual_policy.train()
 
         # --! now, model rollout horizon
-        horizon = 200
+        horizon = 1
         nepoch = 100
 
         for epoch in range(nepoch):
@@ -647,8 +647,8 @@ class agent:
         with torch.no_grad():
             for back, fore in train_loader:
 
-                model_output = model(back)
-                zeta_nom = model_output[14]
+                model_o = model(back)
+                zeta_nom = model_o.zeta_nom
 
                 zeta.append(torch.mean(zeta_nom).item())
 
@@ -661,8 +661,8 @@ class agent:
         with torch.no_grad():
             for back, fore in train_loader:
 
-                model_output = model(back)
-                zeta_nom = model_output[14]
+                model_o = model(back)
+                zeta_nom = model_o.zeta_nom
 
                 zeta.append(torch.mean(zeta_nom).item())
 

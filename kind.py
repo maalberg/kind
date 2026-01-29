@@ -17,6 +17,12 @@ import util_nn
 
 
 regimes = namedtuple('regimes', 'nominal excursion')
+model_output = namedtuple('model_output', [
+    'blend', 'alpha',
+    'mean_nom', 'zeta_raw_nom', 'zeta_nom',
+    'mean_exc', 'zeta_raw_exc', 'zeta_exc',
+    'mean_fun_nom', 'mean_fun_pred_nom', 'zeta_fun_nom', 'zeta_fun_pred_nom',
+    'mean_fun_exc', 'mean_fun_pred_exc', 'zeta_fun_exc', 'zeta_fun_pred_exc'])
 
 
 def create_args_parser():
@@ -97,19 +103,26 @@ class model(torch.nn.Module):
         # --! blend the two types of time series using the derived alpha to get the final prediction
         prediction = alpha * mean_nom + (1 - alpha) * mean_exc
 
-        model_output = (
-            prediction,
-            mean_nom, raw_zeta_nom, # <-- returning raw zeta is essential for training
-            mean_exc, raw_zeta_exc,
-            fun_nom, fun_stat_pred,
-            fun_exc, fun_trans_pred,
-            alpha,
-            dfun_stat, dfun_stat_pred,
-            dfun_trans, dfun_trans_pred,
-            zeta_nom, zeta_exc
-        )
+        #model_output = (
+            #prediction,
+            #mean_nom, raw_zeta_nom, # <-- returning raw zeta is essential for training
+            #mean_exc, raw_zeta_exc,
+            #fun_nom, fun_stat_pred,
+            #fun_exc, fun_trans_pred,
+            #alpha,
+            #dfun_stat, dfun_stat_pred,
+            #dfun_trans, dfun_trans_pred,
+            #zeta_nom, zeta_exc
+        #)
 
-        return model_output
+        return model_output(
+            blend=prediction, alpha=alpha,
+            mean_nom=mean_nom, zeta_raw_nom=raw_zeta_nom, zeta_nom=zeta_nom,
+            mean_exc=mean_exc, zeta_raw_exc=raw_zeta_exc, zeta_exc=zeta_exc,
+            mean_fun_nom=fun_nom, mean_fun_pred_nom=fun_stat_pred, mean_fun_exc=fun_exc, mean_fun_pred_exc=fun_trans_pred,
+            zeta_fun_nom=dfun_stat, zeta_fun_pred_nom=dfun_stat_pred, zeta_fun_exc=dfun_trans, zeta_fun_pred_exc=dfun_trans_pred)
+
+        #return model_output
 
 
 class model_adapter:
@@ -133,14 +146,14 @@ class model_adapter:
         lookback, mask = self.normalizer.normalize(lookback)
 
         # --! pass normalized data to the model
-        model_output = self.model(lookback)
+        model_o = self.model(lookback)
 
         # --! denormalize model output
         #
         # --! extract predictions that need to be denormalized
-        prediction = model_output[0]
-        prediction_nom = model_output[1]
-        prediction_exc = model_output[3]
+        prediction = model_o.blend
+        prediction_nom = model_o.mean_nom
+        prediction_exc = model_o.mean_exc
 
         # --! denormalize extracted predictions
         prediction = self.normalizer.denormalize(prediction, mask)
@@ -148,15 +161,12 @@ class model_adapter:
         prediction_exc = self.normalizer.denormalize(prediction_exc, mask)
 
         # --! put unscaled timeseries back to the result tuple and return the tuple
-        model_output = list(model_output)
-        model_output[0] = prediction
-        model_output[1] = prediction_nom
-        model_output[3] = prediction_exc
+        model_o = model_o._asdict()
+        model_o['blend'] = prediction
+        model_o['mean_nom'] = prediction_nom
+        model_o['mean_exc'] = prediction_exc
 
-        model_output = tuple(model_output)
-
-        # --! return model output
-        return model_output
+        return model_output(**model_o)
 
 
 class training:
@@ -392,10 +402,10 @@ class mean_training_nom(training_phase):
     def compute_loss(self, true, pred):
 
         timeseries = true
-        timeseries_pred = pred[1] # < stationary prediction
+        timeseries_pred = pred.mean_nom
 
-        fun = pred[5]
-        fun_pred = pred[6]
+        fun = pred.mean_fun_nom
+        fun_pred = pred.mean_fun_pred_nom
 
         loss_recon = self.apply_criterion_mean(timeseries, timeseries_pred)
         loss_linear = self.apply_criterion_mean(fun, fun_pred)
@@ -434,10 +444,10 @@ class zeta_training_nom(training_phase):
     def compute_loss(self, true, pred):
 
         timeseries = true
-        timeseries_pred_mean = pred[1]
-        timeseries_u_pre = pred[2]
-        fun_u = pred[10]
-        fun_u_pre = pred[11]
+        timeseries_pred_mean = pred.mean_nom
+        timeseries_u_pre = pred.zeta_raw_nom
+        fun_u = pred.zeta_fun_nom
+        fun_u_pre = pred.zeta_fun_pred_nom
 
         loss_linear = self.apply_criterion_mean(fun_u, fun_u_pre)
         loss_uncertain = self.apply_criterion_zeta(timeseries, timeseries_pred_mean, timeseries_u_pre)
@@ -499,10 +509,10 @@ class mean_training_exc(training_phase):
     def compute_loss(self, true, pred):
 
         timeseries = true
-        timeseries_pred_mean = pred[3]
+        timeseries_pred_mean = pred.mean_exc
 
-        fun = pred[7]
-        fun_pred = pred[8]
+        fun = pred.mean_fun_exc
+        fun_pred = pred.mean_fun_pred_exc
 
         loss_recon = self.apply_criterion_mean(timeseries, timeseries_pred_mean)
         loss_linear = self.apply_criterion_mean(fun, fun_pred)
@@ -541,10 +551,10 @@ class zeta_training_exc(training_phase):
     def compute_loss(self, true, pred):
 
         timeseries = true
-        timeseries_pred_mean = pred[3]
-        timeseries_u_pre = pred[4]
-        fun_u = pred[12]
-        fun_u_pre = pred[13]
+        timeseries_pred_mean = pred.mean_exc
+        timeseries_u_pre = pred.zeta_raw_exc
+        fun_u = pred.zeta_fun_exc
+        fun_u_pre = pred.zeta_fun_pred_exc
 
         loss_linear = self.apply_criterion_mean(fun_u, fun_u_pre)
         loss_uncertain = self.apply_criterion_zeta(timeseries, timeseries_pred_mean, timeseries_u_pre)
