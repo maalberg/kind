@@ -420,7 +420,7 @@ class replay_factory(rl.replay_factory):
     def __init__(self):
         pass
 
-    def create(self, env, policy, zeta, state_nsample, skip_nsample):
+    def create(self, env, policy, zeta, zeta_star, state_nsample, skip_nsample):
 
         # --! create an empty replay buffer
         buf = rl.replay()
@@ -451,7 +451,7 @@ class replay_factory(rl.replay_factory):
 
             # --! provided residual policy is available, add residual action to the base one
             if policy.residual is not None:
-                a = a + torch.squeeze(policy.residual(s, zeta=zeta), 0)
+                a = a + torch.squeeze(policy.residual(s, zeta=zeta, zeta_star=zeta_star), 0)
 
             # --! update window with observation and action at time t + 1, and encode next state
             sa_window.append((s, a))

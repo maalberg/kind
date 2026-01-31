@@ -25,7 +25,7 @@ value_functions = namedtuple('value_functions', 'nominal excursion')
 zeta_thresholds = namedtuple('zeta_thresholds', 'nominal excursion')
 
 
-def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_data, horizon, gamma, epoch=0):
+def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory, replay_data, horizon, gamma, epoch=0):
     """Computes advantage for reinforcement learning policy."""
 
     lookback, reward, next_lookback, done = replay_data
@@ -51,7 +51,8 @@ def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_da
     with torch.no_grad():
 
         # --! compute the uncertainty of a nominal KIND operator
-        zeta = model(lookback)[14]
+        model_o = model(lookback)
+        zeta = model_o.zeta_nom
 
         # --! uncertainty zeta is represented by the mean of batch elements
         zeta = torch.mean(zeta, dim=tuple(range(1, zeta.dim())), keepdim=True)
@@ -65,7 +66,7 @@ def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_da
         state = factory.extract_current_s(rollout)
 
         # --! compute action
-        delta_u = policy.residual.forward(state, zeta=zeta, epoch=epoch)
+        delta_u = policy.residual.forward(state, zeta=zeta, zeta_star=zeta_star, epoch=epoch)
         u = policy.base(state) + delta_u
 
         # --! update action in replay buffer with newly computed action
@@ -129,7 +130,7 @@ class policy_iteration:
 
         return losses_nom, losses_exc
 
-    def improve_policy(self, model, replay_factory, replay):
+    def improve_policy(self, model, zeta_star, replay_factory, replay):
 
         replay = replay.nominal + replay.excursion
 
@@ -165,7 +166,7 @@ class policy_iteration:
             replay_data = replay.random_batch(batch_size)
 
             a = advantage(
-                model,
+                model, zeta_star,
                 policies(base_policy, residual_policy),
                 self.reward_fn,
                 value_functions(value_fn_nom, value_fn_exc),
@@ -303,18 +304,16 @@ class policy_state(interface):
     def forward(self, state, **kwargs):
         return
 
-    def _ramp_action(self, zeta, u_min=0.005, u_max_exc=0.5, zeta_star=0.002, zeta_exc=0.44):
+    def _authorize_action(self, zeta, zeta_star, u_min=0.005, u_max_exc=0.5):
 
-        # --! normalize zeta into [0, 1]
-        beta = (zeta - zeta_star) / (zeta_exc - zeta_star)
+        # --! normalize zeta star range to [0, 1]
+        zeta_norm = (zeta - zeta_star.nominal) / (zeta_star.excursion - zeta_star.nominal)
+        zeta_norm = zeta_norm.clamp(0.0, 1.0)
 
-        # --! clamp to [0, 1]
-        beta = torch.clamp(beta, 0.0, 1.0)
-
-        # --! linear ramp
-        u_max = u_min + beta * (u_max_exc - u_min)
-
-        return u_max
+        # --! compute a classic 'smoothstep',
+        # --! which has s(0) = 0, s(1) = 1, s'(0) = 0, s'(1) = 0.
+        s = 3*zeta_norm**2 - 2*zeta_norm**3
+        return u_min + s * (u_max_exc - u_min)
 
 
 class policy_train(policy_state):
@@ -325,12 +324,13 @@ class policy_train(policy_state):
     def forward(self, state, **kwargs):
 
         zeta = kwargs.get('zeta', 0.0)
+        zeta_star = kwargs.get('zeta_star', kind.regimes(0.0, 0.0))
         epoch = kwargs.get('epoch', 0)
 
         state, mask = self.statemachine.normalizer.normalize_state(state)
 
         u_max_exc = self._schedule_max_action(epoch)
-        action = self._ramp_action(zeta, u_max_exc=u_max_exc) * torch.tanh(self.statemachine.net(state))
+        action = self._authorize_action(zeta, zeta_star, u_max_exc=u_max_exc) * torch.tanh(self.statemachine.net(state))
 
         return self.statemachine.normalizer.denormalize_action(action, mask)
 
@@ -346,9 +346,10 @@ class policy_eval(policy_state):
     def forward(self, state, **kwargs):
 
         zeta = kwargs.get('zeta', 0.0)
+        zeta_star = kwargs.get('zeta_star', kind.regimes(0.0, 0.0))
 
         state, mask = self.statemachine.normalizer.normalize_state(state)
-        action = self._ramp_action(zeta) * torch.tanh(self.statemachine.net(state))
+        action = self._authorize_action(zeta, zeta_star) * torch.tanh(self.statemachine.net(state))
 
         return self.statemachine.normalizer.denormalize_action(action, mask)
 
@@ -481,35 +482,37 @@ class agent:
 
     def train(self, niter=1):
 
-        # --! initially there is no residual policy, so zeta (one of policy inputs) does not matter and is thus 0
+        # --! initially there is no residual policy,
+        # --! so zeta star constants (maximum zetas of a nominal model on nominal and excursion data) do not matter and are set to 0
         policy = None
-        zeta = kind.regimes(0.0, 0.0)
+        zeta_star = kind.regimes(0.0, 0.0)
 
         for i in range(niter):
 
             # --! first, acquire replay data buffers from environment
-            replay = self._acquire_replay(policy, zeta, self.args.lookback_nsample, self.args.lookback_nsample*3)
+            replay = self._acquire_replay(policy, zeta_star, self.args.lookback_nsample, self.args.lookback_nsample*3)
 
             # --! save acquired data to files to comply with KIND model interface
             self._save_replay(replay, i + 1)
 
             # --! second, train a KIND model on the acquired data
-            model, zeta = self._train_model(i + 1)
+            model, zeta_star = self._train_model(i + 1)
+            print(zeta_star)
 
             # --! third, run policy iteration
-            policy = self._iterate_policy(model, replay)
+            policy = self._iterate_policy(model, zeta_star, replay)
 
-    def _acquire_replay(self, residual_policy, zeta, state_nsample, skip_nsample):
+    def _acquire_replay(self, residual_policy, zeta_star, state_nsample, skip_nsample):
 
         replay_nom = self.replay_factory.create(
             self.env.nominal,
             policies(self.base_policy, residual_policy),
-            zeta.nominal,
+            zeta_star.nominal, zeta_star,
             state_nsample, skip_nsample)
         replay_exc = self.replay_factory.create(
             self.env.excursion,
             policies(self.base_policy, residual_policy),
-            zeta.excursion,
+            zeta_star.excursion, zeta_star,
             state_nsample, skip_nsample)
 
         return kind.regimes(replay_nom, replay_exc)
@@ -539,8 +542,8 @@ class agent:
             training.fit(dataset)
             keep_training = training.fit_next()
 
-        # --! having a model, we can now estimate zeta
-        zeta = self._estimate_zeta(model, dataset)
+        # --! having a model, we can now estimate zeta star constants
+        zeta_star = self._estimate_zeta_star(model, dataset)
 
         model.eval()
         _, _, data_loader = dataset.load(data_type='mixed')
@@ -574,11 +577,11 @@ class agent:
         # --! wrap model with a model adapter which normalizes/denormalizes input data on the fly
         model = kind.model_adapter(model, dataset.normalizer)
 
-        return model, zeta
+        return model, zeta_star
 
-    def _iterate_policy(self, model, replay):
+    def _iterate_policy(self, model, zeta_star, replay):
         loss_nom, loss_exc = self.piter.evaluate_policy(self.replay_factory, replay)
-        loss_policy = self.piter.improve_policy(model, self.replay_factory, replay)
+        loss_policy = self.piter.improve_policy(model, zeta_star, self.replay_factory, replay)
 
         self.piter.value_fn_nom.eval()
         self.piter.value_fn_exc.eval()
@@ -634,14 +637,16 @@ class agent:
 
         return self.piter.residual_policy
 
-    def _estimate_zeta(self, model, dataset):
+    def _estimate_zeta_star(self, model, dataset):
+        """Estimates zeta star constants as a mean over ``dataset``.
+        Constants zeta star are a mean zeta response of a nominal model to nominal and excursion data."""
 
         # --! check that this model works with normalized inputs only
         assert isinstance(model, kind.model) and dataset.load_normalized==True
 
         model.eval()
 
-        # --! estimate zeta of a nominal model on nominal data
+        # --! estimate zeta star of a nominal model on nominal data
         train_loader, _, _ = dataset.load(data_type='nom') # training loader provides more data for estimation
         zeta = []
         with torch.no_grad():
@@ -655,7 +660,7 @@ class agent:
         zeta = torch.tensor(zeta, dtype=torch.float32)
         zeta_nom_nom = torch.mean(zeta)
 
-        # --! estimate zeta of a nominal model on excursion data
+        # --! estimate zeta star of a nominal model on excursion data
         train_loader, _, _ = dataset.load(data_type='exc')
         zeta = []
         with torch.no_grad():
