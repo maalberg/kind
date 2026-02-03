@@ -281,6 +281,7 @@ class normalizer(util_data.normalizer):
         # --! operator could be used
         state_norm_max = self._compute_state_norm_max(self._extract_state(timeseries_nom) - self.setpoint).max()
         self.regime_sep = util_data.ceil(state_norm_max, decimals=2)
+        print(f'>>> regime separator is computed as {self.regime_sep}')
 
         # --! to take stats more efficiently below - subtract setpoint from data
         timeseries_nom = self._subtract_setpoint(timeseries_nom)
@@ -516,18 +517,18 @@ class dataset_factory(rl.dataset_factory):
         self.setpoint = setpoint
         self.normalizer = None
 
-    def create_dataset(self, args):
+    def create_dataset(self, args, load_normalized=True):
 
         ds = dataset(
             args.file_dir, args.file_name, args.file_index, args.file_ext,
             args.data_nsample,
             (args.data_train_size, args.data_test_size),
-            args.batch_size, (args.lookback_nsample, args.forecast_nsample), self.setpoint, load_normalized=True)
+            args.batch_size, (args.lookback_nsample, args.forecast_nsample), self.setpoint, load_normalized=load_normalized)
 
         self.normalizer = ds.normalizer
         return ds
 
-    def create_normalizer(self, args):
+    def create_normalizer(self, args, load_normalized=False):
         if self.normalizer is not None:
             print('using available normalizer')
             return self.normalizer
@@ -536,7 +537,7 @@ class dataset_factory(rl.dataset_factory):
             args.file_dir, args.file_name, args.file_index, args.file_ext,
             args.data_nsample,
             (args.data_train_size, args.data_test_size),
-            args.batch_size, (args.lookback_nsample, args.forecast_nsample), self.setpoint, load_normalized=False)
+            args.batch_size, (args.lookback_nsample, args.forecast_nsample), self.setpoint, load_normalized=load_normalized)
 
         print('creating new normalizer')
         return ds.normalizer

@@ -103,26 +103,12 @@ class model(torch.nn.Module):
         # --! blend the two types of time series using the derived alpha to get the final prediction
         prediction = alpha * mean_nom + (1 - alpha) * mean_exc
 
-        #model_output = (
-            #prediction,
-            #mean_nom, raw_zeta_nom, # <-- returning raw zeta is essential for training
-            #mean_exc, raw_zeta_exc,
-            #fun_nom, fun_stat_pred,
-            #fun_exc, fun_trans_pred,
-            #alpha,
-            #dfun_stat, dfun_stat_pred,
-            #dfun_trans, dfun_trans_pred,
-            #zeta_nom, zeta_exc
-        #)
-
         return model_output(
             blend=prediction, alpha=alpha,
             mean_nom=mean_nom, zeta_raw_nom=raw_zeta_nom, zeta_nom=zeta_nom,
             mean_exc=mean_exc, zeta_raw_exc=raw_zeta_exc, zeta_exc=zeta_exc,
             mean_fun_nom=fun_nom, mean_fun_pred_nom=fun_stat_pred, mean_fun_exc=fun_exc, mean_fun_pred_exc=fun_trans_pred,
             zeta_fun_nom=dfun_stat, zeta_fun_pred_nom=dfun_stat_pred, zeta_fun_exc=dfun_trans, zeta_fun_pred_exc=dfun_trans_pred)
-
-        #return model_output
 
 
 class model_adapter:
