@@ -38,13 +38,14 @@ class dataset(interface):
 
     def __init__(self,
                  file_dir, file_name, file_index, file_ext,
-                 data_nsample, data_split_size, batch_size, window_nsample, setpoint, load_normalized=True):
+                 data_nsample_nom, data_nsample_exc, data_split_size, batch_size, window_nsample, setpoint, load_normalized=True):
 
         self.file_dir = file_dir
         self.file_name = file_name
         self.file_index = file_index
         self.file_ext = file_ext
-        self.data_nsample = data_nsample
+        self.data_nsample_nom = data_nsample_nom
+        self.data_nsample_exc = data_nsample_exc
         self.split_size = data_split_size
         self.batch_size = batch_size
         self.window_nsample = window_nsample
@@ -86,7 +87,7 @@ class dataset(interface):
         # --! this method is not supposed to be called for mixed data
         assert data_type in ['nom', 'exc']
 
-        timeseries = self.read_timeseries(self.make_path(data_type))
+        timeseries = self.read_timeseries(self.make_path(data_type), data_type)
         window = self.extract_window(timeseries)
 
         # --! split loaded windows into train, valid, test sets of data
@@ -128,15 +129,19 @@ class dataset(interface):
         """ Extracts target dimension from given ``window``. """
         return
 
-    def read_timeseries(self, path):
-        """ Reads time series from a data file located at ``path``. """
+    def read_timeseries(self, path, data_type):
+        """ Reads time series of type ``data_type`` from a data file located at ``path``. """
+
+        assert data_type in ['nom', 'exc']
 
         # --! read data from a csv file
         data = self.read_csv(path)
 
+        data_nsample = self.data_nsample_nom if data_type=='nom' else self.data_nsample_exc
+
         # --! convert read data to a 3D torch tensor where the first dimension contains time series
-        ntimeseries = data.shape[0] // self.data_nsample
-        return torch.reshape(data, (ntimeseries, self.data_nsample, data.shape[1]))
+        ntimeseries = data.shape[0] // data_nsample
+        return torch.reshape(data, (ntimeseries, data_nsample, data.shape[1]))
 
     @abstractmethod
     def init_normalization(self):
