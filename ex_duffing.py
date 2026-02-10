@@ -206,7 +206,7 @@ def make_duffing(name, reward_fn, dt=1e-2):
         d.ic = [0.2, 0.2]
         return d
     elif name == 'exc':
-        d = duffing(80.0, 40.0, reward_fn, dt_control=dt, alpha=-60.0)
+        d = duffing(140.0, 70.0, reward_fn, dt_control=dt, alpha=-110.0)
         d.ic = [2.5, 5.0]
         return d
     else:
