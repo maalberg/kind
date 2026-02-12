@@ -264,7 +264,7 @@ def make_base_policy(duffing_alpha, duffing_delta, q, r, dt=1e-2, setpoint=[0.0,
 
 class normalizer(util_data.normalizer):
 
-    def __init__(self, timeseries_nom, timeseries_exc, setpoint, state_ndim, control_ndim, mask_ndim):
+    def __init__(self, timeseries_all, timeseries_exc, setpoint, state_ndim, control_ndim, mask_ndim):
 
         # --! save data dimensions
         self.state_ndim = state_ndim
@@ -274,57 +274,44 @@ class normalizer(util_data.normalizer):
         # --! save setpoint before calling subtracting method
         self.setpoint = setpoint
 
-        # --! compute a separator between the two regimes based on state norm
-        #
-        # --! note that the ceil operation is supposed to push the resulting separator slightly above the
-        # --! actual maximum state norms, so that later a simple 'less-then'
-        # --! operator could be used
-
-        # --! note: regime separator is calculated from the first state only
-        self.regime_sep = util_data.ceil(self._compute_regime_indicator(timeseries_nom).max(), decimals=2)
-        print(f'>>> regime separator is computed as {self.regime_sep}')
-
         # --! to take stats more efficiently below - subtract setpoint from data
-        timeseries_nom = self._subtract_setpoint(timeseries_nom)
-        timeseries_exc = self._subtract_setpoint(timeseries_exc)
+        timeseries_all = self._subtract_setpoint(timeseries_all)
 
-        # --! take nominal statistics
-        state, action, _ = torch.split(timeseries_nom, [self.state_ndim, self.control_ndim, self.mask_ndim], dim=-1)
-        self.s_mean_nom = [s.mean() for s in torch.split(state, 1, dim=-1)]
-        self.s_std_nom = [torch.maximum(s.std(), self.std_min) for s in torch.split(state, 1, dim=-1)]
-        self.a_mean_nom = [a.mean() for a in torch.split(action, 1, dim=-1)]
-        self.a_std_nom = [torch.maximum(a.std(), self.std_min) for a in torch.split(action, 1, dim=-1)]
+        # --! take statistics
+        state, action, _ = torch.split(timeseries_all, [self.state_ndim, self.control_ndim, self.mask_ndim], dim=-1)
+        self.s_mean = [s.mean() for s in torch.split(state, 1, dim=-1)]
+        self.s_std = [torch.maximum(s.std(), self.std_min) for s in torch.split(state, 1, dim=-1)]
+        self.a_mean = [a.mean() for a in torch.split(action, 1, dim=-1)]
+        self.a_std = [torch.maximum(a.std(), self.std_min) for a in torch.split(action, 1, dim=-1)]
 
         # --! take excursion statistics
-        state, action, _ = torch.split(timeseries_exc, [self.state_ndim, self.control_ndim, self.mask_ndim], dim=-1)
-        self.s_mean_exc = [s.mean() for s in torch.split(state, 1, dim=-1)]
-        self.s_std_exc = [torch.maximum(s.std(), self.std_min) for s in torch.split(state, 1, dim=-1)]
-        self.a_mean_exc = [a.mean() for a in torch.split(action, 1, dim=-1)]
-        self.a_std_exc = [torch.maximum(a.std(), self.std_min) for a in torch.split(action, 1, dim=-1)]
+        #state, action, _ = torch.split(timeseries_exc, [self.state_ndim, self.control_ndim, self.mask_ndim], dim=-1)
+        #self.s_mean_exc = [s.mean() for s in torch.split(state, 1, dim=-1)]
+        #self.s_std_exc = [torch.maximum(s.std(), self.std_min) for s in torch.split(state, 1, dim=-1)]
+        #self.a_mean_exc = [a.mean() for a in torch.split(action, 1, dim=-1)]
+        #self.a_std_exc = [torch.maximum(a.std(), self.std_min) for a in torch.split(action, 1, dim=-1)]
 
     def mask(self, timeseries):
-        """Determines a data mask that differentiates between nominal and excursion data."""
 
-        mask = self._compute_regime_indicator(timeseries) < self.regime_sep
+        mask = torch.ones(timeseries.shape[0], 1, 1, dtype=torch.bool)
         return torch.squeeze(mask)
 
     def normalize(self, timeseries):
         assert timeseries.shape[-1]==(self.state_ndim + self.control_ndim + self.mask_ndim)
 
         mask = self.mask(timeseries)
+        assert torch.all(mask)
 
         timeseries = self._subtract_setpoint(timeseries)
         state, action, action_mask = torch.split(timeseries, [self.state_ndim, self.control_ndim, self.mask_ndim], dim=-1)
 
         state = torch.cat([
             self._normalize_timeseries(
-                s, mask, mean_nom, std_nom, mean_exc, std_exc) for s, mean_nom, std_nom, mean_exc, std_exc in zip(
-                    torch.split(state, 1, dim=-1), self.s_mean_nom, self.s_std_nom, self.s_mean_exc, self.s_std_exc)], dim=-1)
+                s, mask, mean, std) for s, mean, std in zip(torch.split(state, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
 
         action = torch.cat([
             self._normalize_timeseries(
-                a, mask, mean_nom, std_nom, mean_exc, std_exc) for a, mean_nom, std_nom, mean_exc, std_exc in zip(
-                    torch.split(action, 1, dim=-1), self.a_mean_nom, self.a_std_nom, self.a_mean_exc, self.a_std_exc)], dim=-1)
+                a, mask, mean, std) for a, mean, std in zip(torch.split(action, 1, dim=-1), self.a_mean, self.a_std)], dim=-1)
 
         return torch.cat([state, action, action_mask], dim=-1), mask
 
@@ -336,8 +323,7 @@ class normalizer(util_data.normalizer):
 
         state = torch.cat([
             self._normalize_timeseries(
-                s, mask, mean_nom, std_nom, mean_exc, std_exc) for s, mean_nom, std_nom, mean_exc, std_exc in zip(
-                    torch.split(state, 1, dim=-1), self.s_mean_nom, self.s_std_nom, self.s_mean_exc, self.s_std_exc)], dim=-1)
+                s, mask, mean, std) for s, mean, std in zip(torch.split(state, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
 
         return state_n, mask
 
@@ -347,8 +333,7 @@ class normalizer(util_data.normalizer):
 
         timeseries_dn = torch.cat([
             self._denormalize_timeseries(
-                s, mask, mean_nom, std_nom, mean_exc, std_exc) for s, mean_nom, std_nom, mean_exc, std_exc in zip(
-                    torch.split(timeseries, 1, dim=-1), self.s_mean_nom, self.s_std_nom, self.s_mean_exc, self.s_std_exc)], dim=-1)
+                s, mask, mean, std) for s, mean, std in zip(torch.split(timeseries, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
 
         timeseries_dn = timeseries_dn + self.setpoint
 
@@ -360,8 +345,7 @@ class normalizer(util_data.normalizer):
 
         action_dn = torch.cat([
             self._denormalize_timeseries(
-                s, mask, mean_nom, std_nom, mean_exc, std_exc) for s, mean_nom, std_nom, mean_exc, std_exc in zip(
-                    torch.split(action, 1, dim=-1), self.a_mean_nom, self.a_std_nom, self.a_mean_exc, self.a_std_exc)], dim=-1)
+                s, mask, mean, std) for s, mean, std in zip(torch.split(action, 1, dim=-1), self.a_mean, self.a_std)], dim=-1)
 
         return action_dn
 
@@ -390,19 +374,17 @@ class normalizer(util_data.normalizer):
         sp = self.setpoint[...,:1]
         return self._compute_state_norm_max(s - sp)
 
-    def _normalize_timeseries(self, timeseries, mask, mean_nom, std_nom, mean_exc, std_exc):
+    def _normalize_timeseries(self, timeseries, mask, mean, std):
 
         timeseries_n = torch.empty_like(timeseries)
-        timeseries_n[mask] = (timeseries[mask] - mean_nom) / std_nom
-        timeseries_n[~mask] = (timeseries[~mask] - mean_exc) / std_exc
+        timeseries_n[mask] = (timeseries[mask] - mean) / std
 
         return timeseries_n
 
-    def _denormalize_timeseries(self, timeseries, mask, mean_nom, std_nom, mean_exc, std_exc):
+    def _denormalize_timeseries(self, timeseries, mask, mean, std):
 
         timeseries_dn = torch.empty_like(timeseries)
-        timeseries_dn[mask] = timeseries[mask] * std_nom + mean_nom
-        timeseries_dn[~mask] = timeseries[~mask] * std_exc + mean_exc
+        timeseries_dn[mask] = timeseries[mask] * std + mean
 
         return timeseries_dn
 
@@ -434,10 +416,10 @@ class dataset(util_data.dataset):
     def init_normalization(self):
 
         # --! read data
-        timeseries_nom = self.read_timeseries(self.make_path(data_type='nom'), 'nom')
-        timeseries_exc = self.read_timeseries(self.make_path(data_type='exc'), 'exc')
+        timeseries_all = self.read_timeseries(self.make_path(data_type='all'), 626)
+        #timeseries_exc = self.read_timeseries(self.make_path(data_type='exc'), 'exc')
 
-        return normalizer(timeseries_nom, timeseries_exc, self.setpoint, self.state_ndim, self.control_ndim, self.mask_ndim)
+        return normalizer(timeseries_all, None, self.setpoint, self.state_ndim, self.control_ndim, self.mask_ndim)
 
 
 class replay_factory(rl.replay_factory):

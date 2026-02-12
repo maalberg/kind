@@ -87,7 +87,9 @@ class dataset(interface):
         # --! this method is not supposed to be called for mixed data
         assert data_type in ['nom', 'exc']
 
-        timeseries = self.read_timeseries(self.make_path(data_type), data_type)
+        data_nsample = self.data_nsample_nom if data_type=='nom' else self.data_nsample_exc
+
+        timeseries = self.read_timeseries(self.make_path(data_type), data_nsample)
         window = self.extract_window(timeseries)
 
         # --! split loaded windows into train, valid, test sets of data
@@ -129,15 +131,11 @@ class dataset(interface):
         """ Extracts target dimension from given ``window``. """
         return
 
-    def read_timeseries(self, path, data_type):
-        """ Reads time series of type ``data_type`` from a data file located at ``path``. """
-
-        assert data_type in ['nom', 'exc']
+    def read_timeseries(self, path, data_nsample):
+        """ Reads time series from a data file located at ``path``. """
 
         # --! read data from a csv file
         data = self.read_csv(path)
-
-        data_nsample = self.data_nsample_nom if data_type=='nom' else self.data_nsample_exc
 
         # --! convert read data to a 3D torch tensor where the first dimension contains time series
         ntimeseries = data.shape[0] // data_nsample
