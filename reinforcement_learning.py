@@ -30,22 +30,14 @@ def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory
 
     lookback, reward, next_lookback, done = replay_data
 
-    # --! determine a data mask that differentiates between nominal and excursion batch elements
-    mask = normalizer.mask(lookback)
-
     # --! restrict any gradient flow while computing the value of the current state
     with torch.no_grad():
 
         # --! extract the current state
         state = factory.extract_current_s(lookback)
 
-        # --! we cannot use empty_like here, because state and value have different dimensions,
-        # --! therefore, ensure proper size of value manually
-        current_value = torch.empty(state.shape[0], 1, 1)
-
         # --! compute the current state value
-        current_value[mask] = value_fn.nominal(state[mask])
-        current_value[~mask] = value_fn.excursion(state[~mask])
+        current_value = value_fn(state)
 
     # --! compute current uncertainty: zeta(x, u)
     with torch.no_grad():
@@ -72,15 +64,8 @@ def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory
         # --! update action in replay buffer with newly computed action
         factory.update_current_a(rollout, u)
 
-        # --! allocate reward
-        #
-        # --! note that we cannot use empty_like here, because reward and state-action pair
-        # --! have different dimensions, so we need to ensure dimensions manually
-        rollout_reward = torch.empty(state.shape[0], 1, 1)
-
         # --! calculate reward for nominal or excursion timeseries present in current batch
-        rollout_reward[mask] = reward_fn.nominal(state[mask], u[mask])
-        rollout_reward[~mask] = reward_fn.excursion(state[~mask], u[~mask])
+        rollout_reward = reward_fn(state, u)
 
         rollout_return += gamma**k * rollout_reward
 
@@ -88,7 +73,7 @@ def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory
         model_o = model(rollout) # < gradients flow here
 
         # --! having a prediction, take its forecast part
-        forecast = model_o.blend[:, 384:]
+        forecast = model_o.blend[:, 64:]
 
         # --! take the first observation from the forecast
         next_state = forecast[:, :1, :]
@@ -98,12 +83,7 @@ def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory
 
     # --! compute the terminal value
     with torch.no_grad():
-
-        # --! we cannot use empty_like here, because state and value have different dimensions,
-        # --! therefore, ensure proper size of value manually
-        terminal_value = torch.empty(next_state.shape[0], 1, 1)
-        terminal_value[mask] = value_fn.nominal(next_state[mask])
-        terminal_value[~mask] = value_fn.excursion(next_state[~mask])
+        terminal_value = value_fn(next_state)
 
     return rollout_return + gamma**horizon * terminal_value - current_value
 
@@ -117,46 +97,36 @@ class policy_iteration:
         self.residual_policy = policy(normalizer)
 
         # --! we use two separate value functions: one for nominal and another for excursion regimes
-        self.value_fn_nom = value_fn(normalizer)
-        self.value_fn_exc = value_fn(normalizer)
-
+        self.value_fn = value_fn(normalizer)
         self.reward_fn = reward_fn
-
         self.normalizer = normalizer
 
     def evaluate_policy(self, replay_factory, replay):
-        losses_nom = self._train_value(self.value_fn_nom, replay_factory, replay.nominal)
-        losses_exc = self._train_value(self.value_fn_exc, replay_factory, replay.excursion)
-
-        return losses_nom, losses_exc
+        return self._train_value(self.value_fn, replay_factory, replay)
 
     def improve_policy(self, model, zeta_star, replay_factory, replay):
 
-        replay = replay.nominal + replay.excursion
-
-        value_fn_nom = self.value_fn_nom
-        value_fn_exc = self.value_fn_exc
+        value_fn = self.value_fn
 
         residual_policy = self.residual_policy
         base_policy = self.base_policy
 
-        gamma = 0.94
-        batch_size = 128
+        gamma = 0.995
+        batch_size = 64
         learning_rate = 1e-3
-        weight_decay = 1e-5
+        weight_decay = 1e-6
         policy_optim = torch.optim.Adam(residual_policy.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
         losses = []
 
-        # --! freeze value functions
-        value_fn_nom.eval()
-        value_fn_exc.eval()
+        # --! freeze value function
+        value_fn.eval()
 
         # --! train policy
         residual_policy.train()
 
         # --! now, model rollout horizon
-        horizon = 1
+        horizon = 20
         nepoch = 100
 
         for epoch in range(nepoch):
@@ -169,7 +139,7 @@ class policy_iteration:
                 model, zeta_star,
                 policies(base_policy, residual_policy),
                 self.reward_fn,
-                value_functions(value_fn_nom, value_fn_exc),
+                value_fn,
                 self.normalizer,
                 replay_factory, replay_data,
                 horizon, gamma, epoch
@@ -185,12 +155,12 @@ class policy_iteration:
 
     def _train_value(self, value_fn, replay_factory, replay):
 
-        nepoch = 350
-        batch_size = 128
-        gamma = 0.94
+        nepoch = 500
+        batch_size = 64
+        gamma = 0.995
 
         learning_rate = 1e-3
-        weight_decay = 1e-5
+        weight_decay = 1e-6
         value_optim = torch.optim.Adam(value_fn.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
         losses = []
@@ -330,8 +300,10 @@ class policy_train(policy_state):
 
         state, mask = self.statemachine.normalizer.normalize_state(state)
 
-        u_max_exc = self._schedule_max_action(epoch)
-        action = self._authorize_action(zeta, zeta_star, u_max_exc=u_max_exc) * torch.tanh(self.statemachine.net(state))
+        #u_max_exc = self._schedule_max_action(epoch)
+        #action = self._authorize_action(zeta, zeta_star, u_max_exc=u_max_exc) * torch.tanh(self.statemachine.net(state))
+
+        action = 0.1 * torch.tanh(self.statemachine.net(state))
 
         return self.statemachine.normalizer.denormalize_action(action, mask)
 
@@ -350,7 +322,9 @@ class policy_eval(policy_state):
         zeta_star = kwargs.get('zeta_star', kind.regimes(0.0, 0.0))
 
         state, mask = self.statemachine.normalizer.normalize_state(state)
-        action = self._authorize_action(zeta, zeta_star) * torch.tanh(self.statemachine.net(state))
+        #action = self._authorize_action(zeta, zeta_star) * torch.tanh(self.statemachine.net(state))
+
+        action = 0.1 * torch.tanh(self.statemachine.net(state))
 
         return self.statemachine.normalizer.denormalize_action(action, mask)
 

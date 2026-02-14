@@ -50,13 +50,15 @@ class DuffingRewardTorch:
         action_cost = action @ self.R @ action.transpose(-1, -2)
 
         # Duffing energy
-        energy_cost = duffing_energy_torch(
+        energy = duffing_energy_torch(
             state,
             alpha=self.alpha,
             beta=self.beta
         )
+        energy_barrier = 0.0
+        escape_penalty = torch.relu(energy - energy_barrier)
 
-        reward = -(state_cost + action_cost + self.lambda_E * energy_cost)
+        reward = -(state_cost + action_cost + self.lambda_E * escape_penalty)
         return reward
 
 
@@ -82,11 +84,15 @@ class duffing_reward:
 
         state_cost = x_err @ self.Q @ x_err.T
         action_cost = action @ self.R @ action.T
-        energy_cost = duffing_energy(state,
-                                     alpha=self.alpha,
-                                     beta=self.beta)
 
-        return -(state_cost + action_cost + self.lambda_E * energy_cost)
+        energy = duffing_energy(
+            state,
+            alpha=self.alpha,
+            beta=self.beta)
+        energy_barrier = 0.0
+        escape_penalty = np.maximum(0.0, energy - energy_barrier)
+
+        return -(state_cost + action_cost + self.lambda_E * escape_penalty)
 
 
 def duffing_update(t, state, sim, u):
@@ -101,7 +107,7 @@ def duffing_update(t, state, sim, u):
 class duffing(rl.environment):
     """Simulates a Duffing oscillator. Implements Dyna environment interface."""
 
-    def __init__(self, beta, gamma, reward_fn, alpha=-1.0, delta=0.5, omega=1.2, dt_sim=1e-4, dt_control=2e-2, t_final=100.0):
+    def __init__(self, reward_fn, beta=20.0, gamma=10.0, alpha=-1.0, delta=0.5, omega=1.2, dt_sim=1e-4, dt_control=2e-2, t_final=100.0):
 
         self.alpha = alpha
         self.beta  = beta
@@ -258,8 +264,8 @@ def make_base_policy(duffing_alpha, duffing_delta, q, r, dt=1e-2, setpoint=[0.0,
     rhs = bp.dot(a)
     k = np.linalg.solve(lhs, rhs)
 
-    # --! return gain matrix
-    return base_policy(k, setpoint)
+    # --! return base policy, and the solution to Riccati equation
+    return base_policy(k, setpoint), p
 
 
 class normalizer(util_data.normalizer):
@@ -293,6 +299,7 @@ class normalizer(util_data.normalizer):
 
     def mask(self, timeseries):
 
+        # --! todo: this is a hack to return all Trues since mask is not needed here, rethink the architecture
         mask = torch.ones(timeseries.shape[0], 1, 1, dtype=torch.bool)
         return torch.squeeze(mask)
 
@@ -325,7 +332,7 @@ class normalizer(util_data.normalizer):
             self._normalize_timeseries(
                 s, mask, mean, std) for s, mean, std in zip(torch.split(state, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
 
-        return state_n, mask
+        return state, mask
 
     def denormalize(self, timeseries, mask):
 
