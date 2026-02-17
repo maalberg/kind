@@ -25,7 +25,7 @@ value_functions = namedtuple('value_functions', 'nominal excursion')
 zeta_thresholds = namedtuple('zeta_thresholds', 'nominal excursion')
 
 
-def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory, replay_data, horizon, gamma, epoch=0):
+def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory, replay_data, env, horizon, gamma, epoch=0):
     """Computes advantage for reinforcement learning policy."""
 
     lookback, reward, next_lookback, done = replay_data
@@ -52,9 +52,23 @@ def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory
     # --! make a working copy of the current lookback to perform model rollouts
     rollout = lookback.clone()
     rollout_return = 0.0
+    rollout_nsample_max = 20
 
     # --! perform model rollouts up to a spefified horizon - 1
     for k in range(horizon):
+
+        if k and k % rollout_nsample_max == 0:
+            with torch.no_grad():
+                env_ic = factory.extract_first_s(rollout)
+                rollout = factory.create_back(64, env, env_ic, policies(policy.base, None))
+                #print(f'>>> advantage: back window reset')
+                #plt.figure(figsize=(6,3))
+                #plt.plot(rollout[0, :, :2])
+                #plt.plot(env_ic[0,0,:2], marker='o')
+                #plt.plot(rollout2[0, :, :2], linestyle='dashed')
+                #plt.show()
+                #print(tata.shape)
+
         state = factory.extract_current_s(rollout)
 
         # --! compute action
@@ -104,7 +118,7 @@ class policy_iteration:
     def evaluate_policy(self, replay_factory, replay):
         return self._train_value(self.value_fn, replay_factory, replay)
 
-    def improve_policy(self, model, zeta_star, replay_factory, replay):
+    def improve_policy(self, model, zeta_star, replay_factory, replay, env):
 
         value_fn = self.value_fn
 
@@ -126,7 +140,7 @@ class policy_iteration:
         residual_policy.train()
 
         # --! now, model rollout horizon
-        horizon = 20
+        horizon = 1
         nepoch = 100
 
         for epoch in range(nepoch):
@@ -141,7 +155,7 @@ class policy_iteration:
                 self.reward_fn,
                 value_fn,
                 self.normalizer,
-                replay_factory, replay_data,
+                replay_factory, replay_data, env,
                 horizon, gamma, epoch
             )
 
@@ -303,7 +317,7 @@ class policy_train(policy_state):
         #u_max_exc = self._schedule_max_action(epoch)
         #action = self._authorize_action(zeta, zeta_star, u_max_exc=u_max_exc) * torch.tanh(self.statemachine.net(state))
 
-        action = 0.1 * torch.tanh(self.statemachine.net(state))
+        action = 0.15 * torch.tanh(self.statemachine.net(state))
 
         return self.statemachine.normalizer.denormalize_action(action, mask)
 
@@ -324,7 +338,7 @@ class policy_eval(policy_state):
         state, mask = self.statemachine.normalizer.normalize_state(state)
         #action = self._authorize_action(zeta, zeta_star) * torch.tanh(self.statemachine.net(state))
 
-        action = 0.1 * torch.tanh(self.statemachine.net(state))
+        action = 0.15 * torch.tanh(self.statemachine.net(state))
 
         return self.statemachine.normalizer.denormalize_action(action, mask)
 
@@ -332,8 +346,9 @@ class policy_eval(policy_state):
 class environment(interface):
 
     @abstractmethod
-    def reset(self):
-        """Resets this environment to start a new episode and returns the first observation from that new episode."""
+    def reset(self, ic):
+        """Resets this environment to start a new episode from initial condition ``ic``.
+        Returns the first observation from that new episode."""
         pass
 
     @abstractmethod
@@ -351,7 +366,7 @@ class environment(interface):
 class replay_factory(interface):
 
     @abstractmethod
-    def create(self, env, policy, zeta, state_nsample, skip_nsample):
+    def create(self, env, env_ic, policy, zeta, zeta_star, state_nsample, skip_nsample):
         pass
 
     @abstractmethod
