@@ -317,7 +317,7 @@ class policy_train(policy_state):
         #u_max_exc = self._schedule_max_action(epoch)
         #action = self._authorize_action(zeta, zeta_star, u_max_exc=u_max_exc) * torch.tanh(self.statemachine.net(state))
 
-        action = 0.15 * torch.tanh(self.statemachine.net(state))
+        action = 0.5 * torch.tanh(self.statemachine.net(state))
 
         return self.statemachine.normalizer.denormalize_action(action, mask)
 
@@ -338,7 +338,7 @@ class policy_eval(policy_state):
         state, mask = self.statemachine.normalizer.normalize_state(state)
         #action = self._authorize_action(zeta, zeta_star) * torch.tanh(self.statemachine.net(state))
 
-        action = 0.15 * torch.tanh(self.statemachine.net(state))
+        action = 0.5 * torch.tanh(self.statemachine.net(state))
 
         return self.statemachine.normalizer.denormalize_action(action, mask)
 

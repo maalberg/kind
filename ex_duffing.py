@@ -58,7 +58,7 @@ class DuffingRewardTorch:
         energy_barrier = 0.0
         escape_penalty = torch.relu(energy - energy_barrier)
 
-        reward = -(state_cost + action_cost + self.lambda_E * escape_penalty)
+        reward = -(state_cost + action_cost)# + self.lambda_E * escape_penalty)
         return reward
 
 
@@ -92,7 +92,7 @@ class duffing_reward:
         energy_barrier = 0.0
         escape_penalty = np.maximum(0.0, energy - energy_barrier)
 
-        return -(state_cost + action_cost + self.lambda_E * escape_penalty)
+        return -(state_cost + action_cost)# + self.lambda_E * escape_penalty)
 
 
 def duffing_update(t, state, sim, u):
