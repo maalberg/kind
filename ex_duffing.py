@@ -49,16 +49,7 @@ class DuffingRewardTorch:
         state_cost = x_err @ self.Q @ x_err.transpose(-1, -2)
         action_cost = action @ self.R @ action.transpose(-1, -2)
 
-        # Duffing energy
-        energy = duffing_energy_torch(
-            state,
-            alpha=self.alpha,
-            beta=self.beta
-        )
-        energy_barrier = 0.0
-        escape_penalty = torch.relu(energy - energy_barrier)
-
-        reward = -(state_cost + action_cost)# + self.lambda_E * escape_penalty)
+        reward = -(state_cost + action_cost)
         return reward
 
 
@@ -85,14 +76,7 @@ class duffing_reward:
         state_cost = x_err @ self.Q @ x_err.T
         action_cost = action @ self.R @ action.T
 
-        energy = duffing_energy(
-            state,
-            alpha=self.alpha,
-            beta=self.beta)
-        energy_barrier = 0.0
-        escape_penalty = np.maximum(0.0, energy - energy_barrier)
-
-        return -(state_cost + action_cost)# + self.lambda_E * escape_penalty)
+        return -(state_cost + action_cost)
 
 
 def duffing_update(t, state, sim, u):
