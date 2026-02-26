@@ -138,20 +138,20 @@ class model_adapter:
         # --! denormalize model output
         #
         # --! extract predictions that need to be denormalized
-        prediction = model_o.blend
-        prediction_nom = model_o.mean_nom
-        prediction_exc = model_o.mean_exc
+        pred = model_o.blend
+        pred_nom = model_o.mean_nom
+        pred_exc = model_o.mean_exc
 
         # --! denormalize extracted predictions
-        prediction = self.normalizer.denormalize(prediction, mask)
-        prediction_nom = self.normalizer.denormalize(prediction_nom, mask)
-        prediction_exc = self.normalizer.denormalize(prediction_exc, mask)
+        pred = self.normalizer.denormalize(pred, mask)
+        pred_nom = self.normalizer.denormalize(pred_nom, mask)
+        pred_exc = self.normalizer.denormalize(pred_exc, mask)
 
         # --! put unscaled timeseries back to the result tuple and return the tuple
         model_o = model_o._asdict()
-        model_o['blend'] = prediction
-        model_o['mean_nom'] = prediction_nom
-        model_o['mean_exc'] = prediction_exc
+        model_o['blend'] = pred
+        model_o['mean_nom'] = pred_nom
+        model_o['mean_exc'] = pred_exc
 
         return model_output(**model_o)
 
@@ -316,22 +316,34 @@ class training_phase(interface):
         """ Transitions to next state, or immediately returns False if there is no next state. """
         return
 
-    def apply_criterion_mean(self, timeseries, timeseries_pred):
+    def apply_criterion_mean(self, true, pred):
         criterion = torch.nn.MSELoss(reduction='mean')
-        return criterion(timeseries_pred, timeseries)
+        return criterion(pred, true)
 
-    def apply_criterion_uncertain(self, timeseries, timeseries_pred_mean, timeseries_pred_uncertain):
-        # --! clamp a log-variance to avoid big numbers
-        uncertainty_log = torch.clamp(timeseries_pred_uncertain, min=-10, max=5)
+    def apply_criterion_zeta(self, true, pred, zeta):
 
-        # --! convert the log variance into variance
-        uncertainty = torch.exp(-uncertainty_log)
+        zeta_chan_ndim = self.training.model.args.target_ndim
+        signed_error, geometry_error = torch.split(zeta, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
 
-        # --! compute a negative log-likelihood manually, instead of calling torch.nn.GaussianNLLLoss
-        loss = 0.5 * (uncertainty_log + (timeseries_pred_mean - timeseries)**2 * uncertainty)
-        return loss.mean()
+        # --! take difference between true and predicted time series,
+        # --! hence zero difference at a certain time step signifies that the time series intersect
+        with torch.no_grad():
+            signed_target = true - pred
 
-    def smoothed_derivative(self, x, window_nsample=9):
+        signed_loss = self.apply_criterion_mean(signed_target, signed_error)
+
+        # --! take difference between derivatives of true and predicted time series,
+        # --! hence zero difference at a certain time step signifies that the time series change in a similar way
+        with torch.no_grad():
+            da = self.smooth_derivative(true, window_nsample=9) # <-- fix me: put number of window samples into model arguments
+            db = self.smooth_derivative(pred, window_nsample=9)
+            geometry_target = da - db
+
+        geometry_loss = self.apply_criterion_mean(geometry_target, geometry_error)
+
+        return signed_loss + geometry_loss
+
+    def smooth_derivative(self, x, window_nsample=9):
 
         # --! compute finite difference along time dimension
         dx = x[:, 1:, :] - x[:, :-1, :]
@@ -389,13 +401,13 @@ class mean_training_nom(training_phase):
     def compute_loss(self, true, pred):
 
         timeseries = true
-        timeseries_pred = pred.mean_nom
+        timeseries_mean = pred.mean_nom
 
-        fun = pred.mean_fun_nom
-        fun_pred = pred.mean_fun_pred_nom
+        embed = pred.mean_fun_nom
+        embed_pred = pred.mean_fun_pred_nom
 
-        loss_recon = self.apply_criterion_mean(timeseries, timeseries_pred)
-        loss_linear = self.apply_criterion_mean(fun, fun_pred)
+        loss_recon = self.apply_criterion_mean(timeseries, timeseries_mean)
+        loss_linear = self.apply_criterion_mean(embed, embed_pred)
         loss = loss_recon + loss_linear
 
         return loss
@@ -431,43 +443,21 @@ class zeta_training_nom(training_phase):
     def compute_loss(self, true, pred):
 
         timeseries = true
-        timeseries_pred_mean = pred.mean_nom
-        timeseries_u_pre = pred.zeta_raw_nom
-        fun_u = pred.zeta_fun_nom
-        fun_u_pre = pred.zeta_fun_pred_nom
+        timeseries_mean = pred.mean_nom
+        timeseries_zeta = pred.zeta_raw_nom
 
-        loss_linear = self.apply_criterion_mean(fun_u, fun_u_pre)
-        loss_uncertain = self.apply_criterion_zeta(timeseries, timeseries_pred_mean, timeseries_u_pre)
-        loss = loss_uncertain + loss_linear
+        embed = pred.zeta_fun_nom
+        embed_pred = pred.zeta_fun_pred_nom
+
+        loss_linear = self.apply_criterion_mean(embed, embed_pred)
+        loss_zeta = self.apply_criterion_zeta(timeseries, timeseries_mean, timeseries_zeta)
+        loss = loss_zeta + loss_linear
 
         return loss
 
     def next(self):
         self.training.set_phase(self.training.get_phase_mean_exc())
         return True
-
-    def apply_criterion_zeta(self, true, pred, zeta):
-
-        zeta_chan_ndim = self.training.model.args.target_ndim
-        signed_error, geometry_error = torch.split(zeta, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
-
-        # --! take difference between true and predicted time series,
-        # --! hence zero difference at a certain time step signifies that the time series intersect
-        with torch.no_grad():
-            signed_target = true - pred
-
-        signed_loss = self.apply_criterion_mean(signed_target, signed_error)
-
-        # --! take difference between derivatives of true and predicted time series,
-        # --! hence zero difference at a certain time step signifies that the time series change in a similar way
-        with torch.no_grad():
-            da = self.smoothed_derivative(true, window_nsample=9) # <-- fix me: put number of window samples into model arguments
-            db = self.smoothed_derivative(pred, window_nsample=9)
-            geometry_target = da - db
-
-        geometry_loss = self.apply_criterion_mean(geometry_target, geometry_error)
-
-        return signed_loss + geometry_loss
 
 
 class mean_training_exc(training_phase):
@@ -496,13 +486,13 @@ class mean_training_exc(training_phase):
     def compute_loss(self, true, pred):
 
         timeseries = true
-        timeseries_pred_mean = pred.mean_exc
+        timeseries_mean = pred.mean_exc
 
-        fun = pred.mean_fun_exc
-        fun_pred = pred.mean_fun_pred_exc
+        embed = pred.mean_fun_exc
+        embed_pred = pred.mean_fun_pred_exc
 
-        loss_recon = self.apply_criterion_mean(timeseries, timeseries_pred_mean)
-        loss_linear = self.apply_criterion_mean(fun, fun_pred)
+        loss_recon = self.apply_criterion_mean(timeseries, timeseries_mean)
+        loss_linear = self.apply_criterion_mean(embed, embed_pred)
         loss = loss_recon + loss_linear
 
         return loss
@@ -538,38 +528,20 @@ class zeta_training_exc(training_phase):
     def compute_loss(self, true, pred):
 
         timeseries = true
-        timeseries_pred_mean = pred.mean_exc
-        timeseries_u_pre = pred.zeta_raw_exc
-        fun_u = pred.zeta_fun_exc
-        fun_u_pre = pred.zeta_fun_pred_exc
+        timeseries_mean = pred.mean_exc
+        timeseries_zeta = pred.zeta_raw_exc
 
-        loss_linear = self.apply_criterion_mean(fun_u, fun_u_pre)
-        loss_uncertain = self.apply_criterion_zeta(timeseries, timeseries_pred_mean, timeseries_u_pre)
+        embed = pred.zeta_fun_exc
+        embed_pred = pred.zeta_fun_pred_exc
+
+        loss_linear = self.apply_criterion_mean(embed, embed_pred)
+        loss_uncertain = self.apply_criterion_zeta(timeseries, timeseries_mean, timeseries_zeta)
         loss = loss_uncertain + loss_linear
 
         return loss
 
     def next(self):
         return False
-
-    def apply_criterion_zeta(self, true, pred, zeta):
-
-        zeta_chan_ndim = self.training.model.args.target_ndim
-        signed_error, geometry_error = torch.split(zeta, [zeta_chan_ndim, zeta_chan_ndim], dim=-1)
-
-        with torch.no_grad():
-            signed_target = true - pred
-
-        signed_loss = self.apply_criterion_mean(signed_target, signed_error)
-
-        with torch.no_grad():
-            da = self.smoothed_derivative(true, window_nsample=9) # <-- fix me: put number of window samples into model arguments
-            db = self.smoothed_derivative(pred, window_nsample=9)
-            geometry_target = da - db
-
-        geometry_loss = self.apply_criterion_mean(geometry_target, geometry_error)
-
-        return signed_loss + geometry_loss
     
 
 class operator(torch.nn.Module, interface):
