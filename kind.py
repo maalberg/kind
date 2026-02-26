@@ -375,10 +375,10 @@ class mean_training_nom(training_phase):
         model = self.training.model
 
         model.model_exc.freeze_mean()
-        model.model_exc.freeze_var()
+        model.model_exc.freeze_zeta()
 
         model.model_nom.unfreeze()
-        model.model_nom.freeze_var()
+        model.model_nom.freeze_zeta()
 
     def load_data(self, dataset):
         return dataset.load(data_type='nom')
@@ -417,7 +417,7 @@ class zeta_training_nom(training_phase):
         model = self.training.model
 
         model.model_exc.freeze_mean()
-        model.model_exc.freeze_var()
+        model.model_exc.freeze_zeta()
 
         model.model_nom.unfreeze()
         model.model_nom.freeze_mean()
@@ -482,10 +482,10 @@ class mean_training_exc(training_phase):
         model = self.training.model
 
         model.model_exc.unfreeze()
-        model.model_exc.freeze_var()
+        model.model_exc.freeze_zeta()
 
         model.model_nom.freeze_mean()
-        model.model_nom.freeze_var()
+        model.model_nom.freeze_zeta()
 
     def load_data(self, dataset):
         return dataset.load(data_type='exc')
@@ -527,7 +527,7 @@ class zeta_training_exc(training_phase):
         model.model_exc.freeze_mean()
 
         model.model_nom.freeze_mean()
-        model.model_nom.freeze_var()
+        model.model_nom.freeze_zeta()
 
     def load_data(self, dataset):
         return dataset.load(data_type='mixed')
@@ -591,33 +591,38 @@ class operator(torch.nn.Module, interface):
         self.fore_nsample = args.forecast_nsample
 
     @abstractmethod
-    def embed(self, timeseries):
-        """Embeds ``timeseries`` as functions of a latent space."""
+    def embed_mean(self, timeseries):
+        """Embeds ``timeseries`` in a mean latent space to model the mean of these ``timeseries``."""
         return
 
     @abstractmethod
-    def predict_mean(self, functions):
-        """Predicts ``functions`` embedded in a latent space."""
+    def predict_mean(self, embeddings):
+        """Predicts ``embeddings`` in the mean latent space."""
         return
 
     @abstractmethod
-    def predict_var(self, errors):
-        """Predicts ``errors`` of functions embedded in a latent space."""
+    def embed_zeta(self, timeseries):
+        """Embeds ``timeseries`` in a zeta latent space to model how uncertain the model is about these ``timeseries``."""
+        return
+
+    @abstractmethod
+    def predict_zeta(self, embeddings):
+        """Predicts ``embeddings`` in the zeta latent space."""
         return
 
     @abstractmethod
     def forward(self, timeseries):
-        """Predicts given ``timeseries`` based on an embedded function space."""
+        """Predicts given ``timeseries`` based on the mean and zeta latent spaces."""
         return
 
     @abstractmethod
     def freeze_mean(self):
-        """Makes submodules that are responsible for mean signal prediction fixed, untrainable."""
+        """Makes submodules that are responsible for mean prediction fixed, untrainable."""
         return
 
     @abstractmethod
-    def freeze_var(self):
-        """Makes submodules that are responsible for the variance of prediction fixed, untrainable."""
+    def freeze_zeta(self):
+        """Makes submodules that are responsible for the zeta prediction fixed, untrainable."""
         return
 
     @abstractmethod
@@ -765,7 +770,7 @@ class operator_nom(operator):
         zeta_dec_feat = util_nn.make_feat(ni=zeta_dec_ni, no=zeta_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
         self.zeta_dec = util_nn.fcnn(feat=zeta_dec_feat, actfun_hid='relu')
 
-    def embed(self, timeseries):
+    def embed_mean(self, timeseries):
 
         # --! reshape timeseries to form an input to embeddings encoder
         #
@@ -807,17 +812,17 @@ class operator_nom(operator):
         # --! type of grouped basis functions
         param = torch.split(param, list(self.fun.values()), dim=-1)
 
-        # --! evaluate embedding functions at each slice of timeseries
-        fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+        # --! evaluate embeddings at each slice of timeseries
+        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
 
-        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nfun]
-        # --! to [B, T / kernsize, ndim * nfun]
-        fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
+        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
+        # --! to [B, T / kernsize, ndim * nembed]
+        embed = embed.reshape(embed.shape[0], embed.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(fun) if self.nfeature > 1 else fun
+        return self.fun_prune(embed) if self.nfeature > 1 else embed
 
-    def embed_uncertainty(self, timeseries):
+    def embed_zeta(self, timeseries):
 
         # --! reshape timeseries to form an input to embeddings encoder
         #
@@ -859,22 +864,22 @@ class operator_nom(operator):
         # --! type of grouped basis functions
         param = torch.split(param, list(self.fun.values()), dim=-1)
 
-        # --! evaluate embedding functions at each slice of timeseries
-        fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+        # --! evaluate embeddings at each slice of timeseries
+        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
 
-        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nfun]
-        # --! to [B, T / kernsize, ndim * nfun]
-        fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
+        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
+        # --! to [B, T / kernsize, ndim * nembed]
+        embed = embed.reshape(embed.shape[0], embed.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_u_prune(fun) if self.nfeature > 1 else fun
+        return self.fun_u_prune(embed) if self.nfeature > 1 else embed
 
-    def predict_mean(self, functions):
+    def predict_mean(self, embeddings):
 
-        lookback_nsample = functions.shape[1]
-        forecast_nsample = self.fun_nsample_forecast
+        back_nsample = embeddings.shape[1]
+        fore_nsample = self.fun_nsample_forecast
 
-        horizon = lookback_nsample + forecast_nsample
+        horizon = back_nsample + fore_nsample
 
         # --! extract the matrix of stationary dynamics
         #
@@ -891,115 +896,83 @@ class operator_nom(operator):
         mat_power = torch.stack([
             torch.linalg.matrix_power(mat, power) for power in range(1, horizon)], dim=1)
 
-        # --! extract the initial conditions of function values, i.e. the first slice
+        # --! extract the initial conditions of embedded values, i.e. the first slice
         #
         # --! the initial conditions (ic) are shaped as [B, 1, 1, nfun] to allow tensor broadcasting
         # --! when multiplying by dynamics matrices
-        fun_ic = torch.unsqueeze(functions[:, :1], -2)
+        embed_ic = torch.unsqueeze(embeddings[:, :1], -2)
 
-        # --! predict the stationary evolution of function values by multiplying their initial conditions
+        # --! predict the stationary evolution of embedded values by multiplying their initial conditions
         # --! by powered dynamics matrices
         #
         # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun], i.e.
         # --! batches with functions trajectories consisting of individual function-points [1, nfun]
-        fun_pre = torch.matmul(fun_ic, mat_power)
+        embed_pred = torch.matmul(embed_ic, mat_power)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        fun_pre = torch.squeeze(fun_pre, -2)
+        embed_pred = torch.squeeze(embed_pred, -2)
 
-        return torch.split(fun_pre, [lookback_nsample - 1, forecast_nsample], dim=1)
+        return torch.split(embed_pred, [back_nsample - 1, fore_nsample], dim=1)
 
-    def predict_var(self, errors):
-
-        # --! constants for convenience
-        batsize     = errors.shape[0]
-        err_nsample = errors.shape[1]
-        nfun        = errors.shape[2]
-
-        # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
-        # --! capture the evolution of error values
-        i           = torch.flatten(errors, start_dim=1)
-        mat         = self.mod_var_gen(i).reshape(batsize, -1, nfun, nfun)
-        mat         = util_nn.cumprod_mat(mat[:, 1:])
-
-        # --! extract the initial condition of error history
-        #
-        # --! the initial condition (ic) is shaped as [B, 1, 1, nfun] to allow tensor broadcasting
-        # --! when multiplying by the matrices
-        err_ic      = torch.unsqueeze(errors[:, :1], -2)
-
-        # --! predict the evolution of errors by multiplying their initial conditions by the matrices
-        #
-        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun],
-        # --! i.e. a batch with error trajectories consisting of individual error-points [1, nfun]
-        err_pre = torch.matmul(err_ic, mat)
-
-        # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        err_pre = torch.squeeze(err_pre, -2)
-
-        # --! return separate predictions for lookback and forecast windows
-        #
-        # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(err_pre, [err_nsample - 1, self.fun_nsample_forecast], dim=1)
-
-    def predict_uncertainty(self, functions):
+    def predict_zeta(self, embeddings):
 
         # --! constants for convenience
-        batsize = functions.shape[0]
-        fun_nsample = functions.shape[1]
-        nfun = functions.shape[2]
+        batsize = embeddings.shape[0]
+        embed_nsample = embeddings.shape[1]
+        nembed = embeddings.shape[2]
 
         # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
-        # --! capture the evolution of function values
-        i = torch.flatten(functions, start_dim=1)
-        mat = self.mod_u_gen(i).reshape(batsize, -1, nfun, nfun)
+        # --! capture the evolution of embedded values
+        i = torch.flatten(embeddings, start_dim=1)
+        mat = self.mod_u_gen(i).reshape(batsize, -1, nembed, nembed)
         mat = util_nn.cumprod_mat(mat[:, 1:])
 
-        # --! extract the initial condition of function history
+        # --! extract the initial condition of embedded history
         #
         # --! the initial condition (ic) is shaped as [B, 1, 1, nfun] to allow tensor broadcasting
         # --! when multiplying by the matrices
-        fun_ic = torch.unsqueeze(functions[:, :1], -2)
+        embed_ic = torch.unsqueeze(embeddings[:, :1], -2)
 
-        # --! predict the evolution of functions by multiplying their initial conditions by the matrices
+        # --! predict the evolution of embeddings by multiplying their initial conditions by the matrices
         #
         # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun],
-        # --! i.e. a batch with function trajectories consisting of individual error-points [1, nfun]
-        fun_pre = torch.matmul(fun_ic, mat)
+        # --! i.e. a batch with embedded trajectories consisting of individual zeta-points [1, nembed]
+        embed_pred = torch.matmul(embed_ic, mat)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        fun_pre = torch.squeeze(fun_pre, -2)
+        embed_pred = torch.squeeze(embed_pred, -2)
 
         # --! return separate predictions for lookback and forecast windows
         #
         # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(fun_pre, [fun_nsample - 1, self.fun_nsample_forecast], dim=1)
+        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_forecast], dim=1)
 
     def forward(self, timeseries):
 
-        # --! from given timeseries, embed latent function values and then predict these embeddings
+        # --! from given timeseries, embed mean latent values and then predict these embeddings
         # --! starting from the first value (initial condition) upto a specified horizon
-        fun = self.embed(timeseries)
-        fun_pre, fun_pre_forecast  = self.predict_mean(fun)
-        fun_pre = torch.cat([fun[:, :1], fun_pre], dim=1)
+        mean = self.embed_mean(timeseries)
+        mean_pred_back, mean_pred_fore  = self.predict_mean(mean)
+        mean_pred_back = torch.cat([mean[:, :1], mean_pred_back], dim=1)
 
-        fun_u = self.embed_uncertainty(timeseries)
-        fun_u_pre, fun_u_pre_forecast = self.predict_uncertainty(fun_u)
-        fun_u_pre = torch.cat([fun_u[:, :1], fun_u_pre], dim=1)
+        # --! do a similar procedure for uncertainty score zeta
+        zeta = self.embed_zeta(timeseries)
+        zeta_pred_back, zeta_pred_fore = self.predict_zeta(zeta)
+        zeta_pred_back = torch.cat([zeta[:, :1], zeta_pred_back], dim=1)
 
-        # --! decode predicted embeddings to timeseries
+        # --! decode predicted mean embeddings to time series domain
         #
         # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
         # --! so we reshape the decoded results back to their
         # --! original shape [B, T, ndim]
-        timeseries_pre_mean  = self.pre_mean_dec(torch.cat([fun_pre, fun_pre_forecast], dim=1))
-        timeseries_pre_mean  = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.ntarget)
+        ts_mean = self.pre_mean_dec(torch.cat([mean_pred_back, mean_pred_fore], dim=1))
+        ts_mean = ts_mean.reshape(ts_mean.shape[0], -1, self.ntarget)
 
-        # --! decode predicted and denormalized function uncertainty to model uncertainty
-        timeseries_u_pre = self.zeta_dec(torch.cat([fun_u_pre, fun_u_pre_forecast], dim=1))
-        timeseries_u_pre = timeseries_u_pre.reshape(timeseries_u_pre.shape[0], -1, self.ntarget * 2)
+        # --! decode predicted zeta embeddings to time series domain
+        ts_zeta = self.zeta_dec(torch.cat([zeta_pred_back, zeta_pred_fore], dim=1))
+        ts_zeta = ts_zeta.reshape(ts_zeta.shape[0], -1, self.ntarget * 2)
 
-        return timeseries_pre_mean, timeseries_u_pre, fun, fun_pre, fun_u, fun_u_pre
+        return ts_mean, ts_zeta, mean, mean_pred_back, zeta, zeta_pred_back
 
     def freeze_mean(self):
         util_nn.freeze_module(self.fun_enc)
@@ -1008,7 +981,7 @@ class operator_nom(operator):
         util_nn.freeze_module(self.mod_mean)
         util_nn.freeze_module(self.pre_mean_dec)
 
-    def freeze_var(self):
+    def freeze_zeta(self):
         util_nn.freeze_module(self.fun_u_enc)
         if self.nfeature > 1:
             util_nn.freeze_module(self.fun_u_prune)
@@ -1123,7 +1096,7 @@ class operator_exc(operator):
         zeta_dec_feat = util_nn.make_feat(ni=zeta_dec_ni, no=zeta_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
         self.zeta_dec = util_nn.fcnn(feat=zeta_dec_feat, actfun_hid='relu')
 
-    def embed(self, timeseries):
+    def embed_mean(self, timeseries):
 
         # --! reshape timeseries to form an input to embeddings encoder
         #
@@ -1164,20 +1137,20 @@ class operator_exc(operator):
         # --! split extracted parameters based on number of parameters required by each basis function
         param = torch.split(param, list(self.fun.values()), dim=-1)
 
-        # --! evaluate embedding functions at each slice of timeseries
+        # --! evaluate embeddings at each slice of timeseries
         #
-        # --! note that there is one single measurement of each function to describe
+        # --! note that there is one single measurement of each embedding to describe
         # --! a slice, so the granularity of slicing plays an important a role
-        fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
 
-        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nfun]
-        # --! to [B, T / kernsize, ndim * nfun]
-        fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
+        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
+        # --! to [B, T / kernsize, ndim * nembed]
+        embed = embed.reshape(embed.shape[0], embed.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(fun) if self.nfeature > 1 else fun
+        return self.fun_prune(embed) if self.nfeature > 1 else embed
 
-    def embed_uncertainty(self, timeseries):
+    def embed_zeta(self, timeseries):
 
         # --! reshape timeseries to form an input to embeddings encoder
         #
@@ -1219,153 +1192,121 @@ class operator_exc(operator):
         # --! type of grouped basis functions
         param = torch.split(param, list(self.fun.values()), dim=-1)
 
-        # --! evaluate embedding functions at each slice of timeseries
-        fun = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+        # --! evaluate embeddings at each slice of timeseries
+        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
 
-        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nfun]
-        # --! to [B, T / kernsize, ndim * nfun]
-        fun = fun.reshape(fun.shape[0], fun.shape[1], -1)
+        # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
+        # --! to [B, T / kernsize, ndim * nembed]
+        embed = embed.reshape(embed.shape[0], embed.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_u_prune(fun) if self.nfeature > 1 else fun
+        return self.fun_u_prune(embed) if self.nfeature > 1 else embed
 
-    def predict_mean(self, functions):
+    def predict_mean(self, embeddings):
 
-        batsize     = functions.shape[0]
-        fun_nsample = functions.shape[1]
-        nfun        = functions.shape[2]
+        batsize = embeddings.shape[0]
+        embed_nsample = embeddings.shape[1]
+        nembed = embeddings.shape[2]
 
-        # --! encode attention over the sequence of function values
+        # --! encode attention over the sequence of embedded values
         #
-        # --! functions, which are shaped as [B, T / kernzise, nfun] are encoded into attention with the same shape
+        # --! embeddings, which are shaped as [B, T / kernzise, nembed] are encoded into attention with the same shape
         #
         # --! attention is produced for each sequence step (rows of attention matrix); this information can be
         # --! used to derive linear time-varying matrices that locally adapt to changes in dynamics
-        functions = self.mod_mean_att_enc(functions)
+        embeddings = self.mod_mean_att_enc(embeddings)
 
         # --! note that we omit matrix transpose here, relying on training to figure it out
         #
         # --! note also that the neural network, which generates matrices, is already configured to
         # --! cover the entire prediction horizon, i.e. lookback and forecast windows
-        mod_mean_gen_i = torch.flatten(functions, start_dim=1)
-        mat            = self.mod_mean_gen(mod_mean_gen_i).reshape(batsize, -1, nfun, nfun)
+        mod_mean_gen_i = torch.flatten(embeddings, start_dim=1)
+        mat            = self.mod_mean_gen(mod_mean_gen_i).reshape(batsize, -1, nembed, nembed)
 
         # --! accumulate matrix products to enable predictions, such as z2 = A1*z1, z3 = A2*A1*z1, etc,
         # --! where zi are our embeddings, and where Ai are linear time-varying matrices
         mat = util_nn.cumprod_mat(mat[:, 1:])
 
-        # --! extract the initial conditions of function values, i.e. the first slice
+        # --! extract the initial conditions of embedded values, i.e. the first slice
         #
         # --! the initial conditions (ic) are shaped as [B, 1, 1, nfun] to allow tensor broadcasting
         # --! when multiplying by dynamics matrices
-        fun_ic = torch.unsqueeze(functions[:, :1], -2)
+        embed_ic = torch.unsqueeze(embeddings[:, :1], -2)
 
-        # --! predict the stationary evolution of function values by multiplying their initial conditions
+        # --! predict the stationary evolution of embedded values by multiplying their initial conditions
         # --! by powered dynamics matrices
         #
-        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun], i.e.
-        # --! batches with functions trajectories consisting of inidividual function-points [1, nfun]
-        fun_pre = torch.matmul(fun_ic, mat)
+        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nembed], i.e.
+        # --! batches with functions trajectories consisting of inidividual function-points [1, nembed]
+        embed_pred = torch.matmul(embed_ic, mat)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        fun_pre = torch.squeeze(fun_pre, -2)
+        embed_pred = torch.squeeze(embed_pred, -2)
 
         # --! return separate predictions for lookback and forecast windows
         #
         # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(fun_pre, [fun_nsample - 1, self.fun_nsample_forecast], dim=1)
+        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_forecast], dim=1)
 
-    def predict_var(self, errors):
-
-        # --! constants for convenience
-        batsize     = errors.shape[0]
-        err_nsample = errors.shape[1]
-        nfun        = errors.shape[2]
-
-        # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
-        # --! capture the evolution of error values
-        i           = torch.flatten(errors, start_dim=1)
-        mat         = self.mod_var_gen(i).reshape(batsize, -1, nfun, nfun)
-        mat         = util_nn.cumprod_mat(mat[:, 1:])
-
-        # --! extract the initial condition of error history
-        #
-        # --! the initial condition (ic) is shaped as [B, 1, 1, nfun] to allow tensor broadcasting
-        # --! when multiplying by the matrices
-        err_ic      = torch.unsqueeze(errors[:, :1], -2)
-
-        # --! predict the evolution of errors by multiplying their initial conditions by the matrices
-        #
-        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun],
-        # --! i.e. a batch with error trajectories consisting of individual error-points [1, nfun]
-        err_pre = torch.matmul(err_ic, mat)
-
-        # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        err_pre = torch.squeeze(err_pre, -2)
-
-        # --! return separate predictions for lookback and forecast windows
-        #
-        # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(err_pre, [err_nsample - 1, self.fun_nsample_forecast], dim=1)
-
-    def predict_uncertainty(self, functions):
+    def predict_zeta(self, embeddings):
 
         # --! constants for convenience
-        batsize = functions.shape[0]
-        fun_nsample = functions.shape[1]
-        nfun = functions.shape[2]
+        batsize = embeddings.shape[0]
+        embed_nsample = embeddings.shape[1]
+        nembed = embeddings.shape[2]
 
         # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
         # --! capture the evolution of function values
-        i = torch.flatten(functions, start_dim=1)
-        mat = self.mod_u_gen(i).reshape(batsize, -1, nfun, nfun)
+        i = torch.flatten(embeddings, start_dim=1)
+        mat = self.mod_u_gen(i).reshape(batsize, -1, nembed, nembed)
         mat = util_nn.cumprod_mat(mat[:, 1:])
 
-        # --! extract the initial condition of function history
+        # --! extract the initial condition of embedded history
         #
-        # --! the initial condition (ic) is shaped as [B, 1, 1, nfun] to allow tensor broadcasting
+        # --! the initial condition (ic) is shaped as [B, 1, 1, nembed] to allow tensor broadcasting
         # --! when multiplying by the matrices
-        fun_ic = torch.unsqueeze(functions[:, :1], -2)
+        embed_ic = torch.unsqueeze(embeddings[:, :1], -2)
 
-        # --! predict the evolution of functions by multiplying their initial conditions by the matrices
+        # --! predict the evolution of embeddings by multiplying their initial conditions by the matrices
         #
-        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nfun],
-        # --! i.e. a batch with function trajectories consisting of individual error-points [1, nfun]
-        fun_pre = torch.matmul(fun_ic, mat)
+        # --! both tensors are broadcasted together and multiplied to produce a shape [B, H - 1, 1, nembed],
+        # --! i.e. a batch with function trajectories consisting of individual zeta points [1, nembed]
+        embed_pred = torch.matmul(embed_ic, mat)
 
         # --! remove extra singleton dimensions that were needed for the broadcasting of multiplication
-        fun_pre = torch.squeeze(fun_pre, -2)
+        embed_pred = torch.squeeze(embed_pred, -2)
 
         # --! return separate predictions for lookback and forecast windows
         #
         # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(fun_pre, [fun_nsample - 1, self.fun_nsample_forecast], dim=1)
+        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_forecast], dim=1)
 
     def forward(self, timeseries):
 
-        # --! from given timeseries, embed latent function values and then predict these embeddings
+        # --! from given timeseries, embed mean latent values and then predict these embeddings
         # --! starting from the first value (initial condition) upto a specified horizon
-        fun                       = self.embed(timeseries)
-        fun_pre, fun_pre_forecast = self.predict_mean(fun)
-        fun_pre                   = torch.cat([fun[:, :1], fun_pre], dim=1)
+        mean = self.embed_mean(timeseries)
+        mean_pred_back, mean_pred_fore = self.predict_mean(mean)
+        mean_pred_back = torch.cat([mean[:, :1], mean_pred_back], dim=1)
 
-        fun_u = self.embed_uncertainty(timeseries)
-        fun_u_pre, fun_u_pre_forecast = self.predict_uncertainty(fun_u)
-        fun_u_pre = torch.cat([fun_u[:, :1], fun_u_pre], dim=1)
+        # --! do a similar procedure to embedded zeta values
+        zeta = self.embed_zeta(timeseries)
+        zeta_pred_back, zeta_pred_fore = self.predict_zeta(zeta)
+        zeta_pred_back = torch.cat([zeta[:, :1], zeta_pred_back], dim=1)
 
-        # --! decode predicted embeddings to timeseries
+        # --! decode predicted mean embeddings to time series domain
         #
-        # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
+        # --! time series are decoded as slice rows shaped as [B, T / kernsize, kernsize],
         # --! so we reshape the decoded results back to their
         # --! original shape [B, T, ndim]
-        timeseries_pre_mean = self.pre_mean_dec(torch.cat([fun_pre, fun_pre_forecast], dim=1))
-        timeseries_pre_mean = timeseries_pre_mean.reshape(timeseries_pre_mean.shape[0], -1, self.ntarget)
+        ts_mean = self.pre_mean_dec(torch.cat([mean_pred_back, mean_pred_fore], dim=1))
+        ts_mean = ts_mean.reshape(ts_mean.shape[0], -1, self.ntarget)
 
-        # --! decode predicted and denormalized function uncertainty to model uncertainty
-        timeseries_u_pre = self.zeta_dec(torch.cat([fun_u_pre, fun_u_pre_forecast], dim=1))
-        timeseries_u_pre = timeseries_u_pre.reshape(timeseries_u_pre.shape[0], -1, self.ntarget * 2)
+        # --! decode predicted zeta embeddings to time series domain
+        ts_zeta = self.zeta_dec(torch.cat([zeta_pred_back, zeta_pred_fore], dim=1))
+        ts_zeta = ts_zeta.reshape(ts_zeta.shape[0], -1, self.ntarget * 2)
 
-        return timeseries_pre_mean, timeseries_u_pre, fun, fun_pre, fun_u, fun_u_pre
+        return ts_mean, ts_zeta, mean, mean_pred_back, zeta, zeta_pred_back
 
     def freeze_mean(self):
         util_nn.freeze_module(self.fun_enc)
@@ -1375,7 +1316,7 @@ class operator_exc(operator):
         util_nn.freeze_module(self.mod_mean_gen)
         util_nn.freeze_module(self.pre_mean_dec)
 
-    def freeze_var(self):
+    def freeze_zeta(self):
         util_nn.freeze_module(self.fun_u_enc)
         if self.nfeature > 1:
             util_nn.freeze_module(self.fun_u_prune)
