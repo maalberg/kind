@@ -21,8 +21,8 @@ model_output = namedtuple('model_output', [
     'blend', 'alpha',
     'mean_nom', 'zeta_raw_nom', 'zeta_nom',
     'mean_exc', 'zeta_raw_exc', 'zeta_exc',
-    'mean_fun_nom', 'mean_fun_pred_nom', 'zeta_fun_nom', 'zeta_fun_pred_nom',
-    'mean_fun_exc', 'mean_fun_pred_exc', 'zeta_fun_exc', 'zeta_fun_pred_exc'])
+    'mean_embed_nom', 'mean_embed_pred_nom', 'zeta_embed_nom', 'zeta_embed_pred_nom',
+    'mean_embed_exc', 'mean_embed_pred_exc', 'zeta_embed_exc', 'zeta_embed_pred_exc'])
 
 
 def create_args_parser():
@@ -35,15 +35,19 @@ def create_args_parser():
     parser.add_argument('--file_index', type=int, required=False, default=0, help='file index to define or separate learning stages')
     parser.add_argument('--file_ext', type=str, required=False, default='.csv', help='data file extension')
     parser.add_argument('--data_nsample_nom', type=int, required=True, help='number of samples in time series stored in nominal data')
-    parser.add_argument('--data_nsample_exc', type=int, required=True, help='number of samples in time series stored in excirsion data')
+    parser.add_argument('--data_nsample_exc', type=int, required=True, help='number of samples in time series stored in excursion data')
     parser.add_argument('--data_train_size', type=float, required=False, default=0.8, help='dataset part to include in training')
     parser.add_argument('--data_test_size', type=float, required=False, default=0.5, help='non-train part to include in test, rest is validation')
     parser.add_argument('--feature_ndim', type=int, required=True, help='number of feature dimensions in data')
     parser.add_argument('--target_ndim', type=int, required=True, help='number of target dimensions in data')
 
-    # --! forecasting arguments
-    parser.add_argument('--lookback_nsample', type=int, required=True, help='number of samples in a lookback window')
-    parser.add_argument('--forecast_nsample', type=int, required=True, help='number of samples in a forecast window')
+    # --! KIND
+    parser.add_argument('--back_nsample', type=int, required=True, help='number of samples in lookback window')
+    parser.add_argument('--fore_nsample', type=int, required=True, help='number of samples in forecast window')
+    parser.add_argument('--rez_nsample_nom', type=int, required=True, help='resolution (number of samples) in nominal data window')
+    parser.add_argument('--rez_nsample_exc', type=int, required=True, help='resolution (number of samples) in excursion data window')
+    parser.add_argument('--embed_nom', type=json.loads, required=True, help='type and number of embeddings for nominal operator')
+    parser.add_argument('--embed_exc', type=json.loads, required=True, help='type and number of embeddings for excursion operator')
 
     # --! training
     parser.add_argument('--batch_size', type=int, required=False, default=128, help='training batch size')
@@ -53,11 +57,6 @@ def create_args_parser():
     parser.add_argument('--patience', type=int, required=False, default=10, help='patience for early stopping during training')
     parser.add_argument('--checkpoints', type=str, required=True, help='location of model training checkpoints')
 
-    # --! KIND
-    parser.add_argument('--seg_nsample_stat', type=int, required=True, help='number of samples in a stationary data slice')
-    parser.add_argument('--seg_nsample_trans', type=int, required=True, help='number of samples in a transient data slice')
-    parser.add_argument('--fun_stat', type=json.loads, required=True, help='embedded functions for stationary operator')
-    parser.add_argument('--fun_trans', type=json.loads, required=True, help='embedded functions for transient operator')
     parser.add_argument('--nneuron_stat', type=int, required=False, default=64, help='number of neurons in stationary operator layers')
     parser.add_argument('--nlayer_stat', type=int, required=False, default=3, help='number of layers in stationary operator')
     parser.add_argument('--nneuron_trans', type=int, required=False, default=64, help='number of neurons in transient operator layers')
@@ -85,8 +84,8 @@ class model(torch.nn.Module):
     def forward(self, lookback):
 
         # --! execute both operators on given lookback
-        mean_nom, raw_zeta_nom, fun_nom, fun_stat_pred, dfun_stat, dfun_stat_pred = self.model_nom(lookback)
-        mean_exc, raw_zeta_exc, fun_exc, fun_trans_pred, dfun_trans, dfun_trans_pred = self.model_exc(lookback)
+        mean_nom, raw_zeta_nom, mean_embed_nom, mean_embed_pred_nom, zeta_embed_nom, zeta_embed_pred_nom = self.model_nom(lookback)
+        mean_exc, raw_zeta_exc, mean_embed_exc, mean_embed_pred_exc, zeta_embed_exc, zeta_embed_pred_exc = self.model_exc(lookback)
 
         # --! raw zeta signal has two features: signed error and geometry error
         zeta_chan_ndim = self.args.target_ndim
@@ -105,11 +104,17 @@ class model(torch.nn.Module):
         prediction = alpha * mean_nom + (1 - alpha) * mean_exc
 
         return model_output(
+
             blend=prediction, alpha=alpha,
+
             mean_nom=mean_nom, zeta_raw_nom=raw_zeta_nom, zeta_nom=zeta_nom,
             mean_exc=mean_exc, zeta_raw_exc=raw_zeta_exc, zeta_exc=zeta_exc,
-            mean_fun_nom=fun_nom, mean_fun_pred_nom=fun_stat_pred, mean_fun_exc=fun_exc, mean_fun_pred_exc=fun_trans_pred,
-            zeta_fun_nom=dfun_stat, zeta_fun_pred_nom=dfun_stat_pred, zeta_fun_exc=dfun_trans, zeta_fun_pred_exc=dfun_trans_pred)
+
+            mean_embed_nom=mean_embed_nom, mean_embed_pred_nom=mean_embed_pred_nom,
+            mean_embed_exc=mean_embed_exc, mean_embed_pred_exc=mean_embed_pred_exc,
+
+            zeta_embed_nom=zeta_embed_nom, zeta_embed_pred_nom=zeta_embed_pred_nom,
+            zeta_embed_exc=zeta_embed_exc, zeta_embed_pred_exc=zeta_embed_pred_exc)
 
 
 class model_adapter:
@@ -403,8 +408,8 @@ class mean_training_nom(training_phase):
         timeseries = true
         timeseries_mean = pred.mean_nom
 
-        embed = pred.mean_fun_nom
-        embed_pred = pred.mean_fun_pred_nom
+        embed = pred.mean_embed_nom
+        embed_pred = pred.mean_embed_pred_nom
 
         loss_recon = self.apply_criterion_mean(timeseries, timeseries_mean)
         loss_linear = self.apply_criterion_mean(embed, embed_pred)
@@ -446,8 +451,8 @@ class zeta_training_nom(training_phase):
         timeseries_mean = pred.mean_nom
         timeseries_zeta = pred.zeta_raw_nom
 
-        embed = pred.zeta_fun_nom
-        embed_pred = pred.zeta_fun_pred_nom
+        embed = pred.zeta_embed_nom
+        embed_pred = pred.zeta_embed_pred_nom
 
         loss_linear = self.apply_criterion_mean(embed, embed_pred)
         loss_zeta = self.apply_criterion_zeta(timeseries, timeseries_mean, timeseries_zeta)
@@ -488,8 +493,8 @@ class mean_training_exc(training_phase):
         timeseries = true
         timeseries_mean = pred.mean_exc
 
-        embed = pred.mean_fun_exc
-        embed_pred = pred.mean_fun_pred_exc
+        embed = pred.mean_embed_exc
+        embed_pred = pred.mean_embed_pred_exc
 
         loss_recon = self.apply_criterion_mean(timeseries, timeseries_mean)
         loss_linear = self.apply_criterion_mean(embed, embed_pred)
@@ -531,8 +536,8 @@ class zeta_training_exc(training_phase):
         timeseries_mean = pred.mean_exc
         timeseries_zeta = pred.zeta_raw_exc
 
-        embed = pred.zeta_fun_exc
-        embed_pred = pred.zeta_fun_pred_exc
+        embed = pred.zeta_embed_exc
+        embed_pred = pred.zeta_embed_pred_exc
 
         loss_linear = self.apply_criterion_mean(embed, embed_pred)
         loss_uncertain = self.apply_criterion_zeta(timeseries, timeseries_mean, timeseries_zeta)
@@ -559,8 +564,8 @@ class operator(torch.nn.Module, interface):
         # --! store mutual configuration inside this base class
         self.nfeature = args.feature_ndim
         self.ntarget = args.target_ndim
-        self.back_nsample = args.lookback_nsample
-        self.fore_nsample = args.forecast_nsample
+        self.back_nsample = args.back_nsample
+        self.fore_nsample = args.fore_nsample
 
     @abstractmethod
     def embed_mean(self, timeseries):
@@ -602,24 +607,24 @@ class operator(torch.nn.Module, interface):
         """Makes all trainable submodules trainable again."""
         return
 
-    def _respec_fun(self, spec):
-        """Adapts function specifications ``spec`` to facilitate model internal workings.
+    def _extract_embed_config(self, config):
+        """Extracts embedding configuration from ``config`` to a format that facilitates model internal workings.
 
-        The adaptation converts the number of specific functions, e.g., 'sin', into
-        the total number of parameters required by these specific functions. For
-        example, if 5 functions of 'sin' are to be used, then the total number
+        The extraction converts the number of specific embeddings, e.g., 'sin', into
+        the total number of parameters required by these specific embeddings. For
+        example, if 5 embeddings of 'sin' are to be used, then the total number
         of parameters becomes 5 * 2 = 10, as a 'sin' takes 2 parameters.
         """
 
-        newspec = spec.copy()
+        newconfig = config.copy()
 
-        for fun in newspec:
-            if fun == 'sin':
-                newspec[fun] = newspec[fun] * self.sin_nparam # sine takes two parameters
-            elif fun == 'cos':
-                newspec[fun] = newspec[fun] * self.cos_nparam # cosine takes two parameters
+        for embed in newconfig:
+            if embed == 'sin':
+                newconfig[embed] = newconfig[embed] * self.sin_nparam # sine takes two parameters
+            elif embed == 'cos':
+                newconfig[embed] = newconfig[embed] * self.cos_nparam # cosine takes two parameters
 
-        return newspec
+        return newconfig
 
     def _eval_fun(self, fun, param):
         if fun == 'sin':
@@ -664,32 +669,27 @@ class operator(torch.nn.Module, interface):
 
 
 class operator_nom(operator):
-    """ Models dynamics of nominal timeseries in a DMD-like manner. """
+    """Models dynamics of nominal time series in a dynamical mode decomposition-like manner."""
 
     def __init__(self, args):
 
         # --! initialize common operator parameters
         super().__init__(args)
 
-        # --! this here is a convenient place to get the total number of functions, because
-        # --! later the function configuration becomes respecified
-        # --! to facilitate other things
-        nfun = sum(args.fun_stat.values())
+        # --! get the number of embeddings
+        nembed = sum(args.embed_nom.values())
 
-        # --! initialize stationary-specific parameters
-        #
-        # --! note that here the function configuration becomes respecified
-        self.fun            = self._respec_fun(args.fun_stat)
-        self.param_kernsize = args.seg_nsample_stat
+        # --! initialize nominal-specific parameters
+        self.embed_config = self._extract_embed_config(args.embed_nom)
+        self.param_kernsize = args.rez_nsample_nom
 
         if self.fore_nsample % self.param_kernsize:
             raise Exception('the number of forecast samples must be a multiple of a kernel size!')
-        self.fun_nsample_forecast  = self.fore_nsample // self.param_kernsize
+        self.fun_nsample_fore = self.fore_nsample // self.param_kernsize
 
-        # --! here the function configuration is already respecified, such that it is convenient
-        # --! to get the total number of required function parameters
-        nparam      = sum(self.fun.values())
-        fun_nsample = self.back_nsample // self.param_kernsize
+        # --! get the total number of required embedded parameters
+        nparam = sum(self.embed_config.values())
+        embed_nsample = self.back_nsample // self.param_kernsize
 
         # --! create an encoder to encode timeseries into embedded functions
         #
@@ -707,37 +707,37 @@ class operator_nom(operator):
             # --! basis functions, such that only the number of these basis functions
             # --! influences the order of the DMD matrix, whereas the number of data
             # --! dimensions has no effect on the order
-            fun_prune_ni = nfun * self.nfeature
-            fun_prune_no = nfun
+            fun_prune_ni = nembed * self.nfeature
+            fun_prune_no = nembed
             self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
             self.fun_u_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
-        # --! create a DMD-like model (a matrix) that captures stationary (mean) dynamics
+        # --! create a DMD-like model (a matrix) that captures nominal (mean) dynamics
         #
         # --! since this matrix is learned only once and does not adapt during runtime,
-        # --! this operator can also be called static, instead of stationary
-        mod_mean_ni = nfun
-        mod_mean_no = nfun
+        # --! this operator can also be called static, instead of nominal
+        mod_mean_ni = nembed
+        mod_mean_no = nembed
         self.mod_mean = torch.nn.Linear(mod_mean_ni, mod_mean_no, bias=False)
 
-        # --! create a generator that produces models capturing the evolution of variance (uncertainty)
+        # --! create a generator that produces models capturing the evolution of uncertainty zeta
         #
-        # --! the generator takes a flattened sequence of function values and returns
+        # --! the generator takes a flattened sequence of embedded values and returns
         # --! a flattened sequence of square matrices
-        mod_var_gen_ni = fun_nsample * nfun
-        mod_var_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
+        mod_var_gen_ni = embed_nsample * nembed
+        mod_var_gen_no = (embed_nsample + self.fun_nsample_fore) * nembed * nembed
         mod_var_gen_feat = util_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
         self.mod_u_gen = util_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
 
         # --! create prediction decoder to decode predicted embeddings back to timeseries
-        pre_dec_ni = nfun
+        pre_dec_ni = nembed
         pre_dec_no = self.param_kernsize * self.ntarget
         pre_dec_feat = util_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
         self.pre_mean_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
 
         # --! construct uncertainty decoder that outputs
         # --! two uncertainty features for each target: signed error and error 'geometry'
-        zeta_dec_ni = nfun
+        zeta_dec_ni = nembed
         zeta_dec_no = self.param_kernsize * self.ntarget * 2
         zeta_dec_feat = util_nn.make_feat(ni=zeta_dec_ni, no=zeta_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
         self.zeta_dec = util_nn.fcnn(feat=zeta_dec_feat, actfun_hid='relu')
@@ -758,7 +758,7 @@ class operator_nom(operator):
         # --! based on inputs, encode parameter kernels (filters)
         kern = self.fun_enc(i)
 
-        nparam = sum(self.fun.values())
+        nparam = sum(self.embed_config.values())
 
         # --! reshape encoded kernels to support their next multiplication with inputs, e.g.
         # --!
@@ -782,10 +782,10 @@ class operator_nom(operator):
 
         # --! split extracted parameters based on the number of parameters required by each
         # --! type of grouped basis functions
-        param = torch.split(param, list(self.fun.values()), dim=-1)
+        param = torch.split(param, list(self.embed_config.values()), dim=-1)
 
         # --! evaluate embeddings at each slice of timeseries
-        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.embed_config.keys(), param)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
         # --! to [B, T / kernsize, ndim * nembed]
@@ -810,7 +810,7 @@ class operator_nom(operator):
         # --! based on inputs, encode parameter kernels (filters)
         kern = self.fun_u_enc(i)
 
-        nparam = sum(self.fun.values())
+        nparam = sum(self.embed_config.values())
 
         # --! reshape encoded kernels to support their next multiplication with inputs, e.g.
         # --!
@@ -834,10 +834,10 @@ class operator_nom(operator):
 
         # --! split extracted parameters based on the number of parameters required by each
         # --! type of grouped basis functions
-        param = torch.split(param, list(self.fun.values()), dim=-1)
+        param = torch.split(param, list(self.embed_config.values()), dim=-1)
 
         # --! evaluate embeddings at each slice of timeseries
-        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.embed_config.keys(), param)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
         # --! to [B, T / kernsize, ndim * nembed]
@@ -849,7 +849,7 @@ class operator_nom(operator):
     def predict_mean(self, embeddings):
 
         back_nsample = embeddings.shape[1]
-        fore_nsample = self.fun_nsample_forecast
+        fore_nsample = self.fun_nsample_fore
 
         horizon = back_nsample + fore_nsample
 
@@ -917,7 +917,7 @@ class operator_nom(operator):
         # --! return separate predictions for lookback and forecast windows
         #
         # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_forecast], dim=1)
+        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_fore], dim=1)
 
     def forward(self, timeseries):
 
@@ -980,27 +980,22 @@ class operator_exc(operator):
         # --! initialize common operator parameters
         super().__init__(args)
 
-        # --! this here is a convenient place to get the total number of functions, because
-        # --! later the function configuration becomes respecified
-        # --! to facilitate other things
-        nfun = sum(args.fun_trans.values())
+        # --! get the total number of embeddings
+        nembed = sum(args.embed_exc.values())
 
-        # --! initialize transient-specific parameters
-        #
-        # --! note that here the function configuration becomes respecified
-        self.fun            = self._respec_fun(args.fun_trans)
-        self.param_kernsize = args.seg_nsample_trans
+        # --! initialize excursion-specific parameters
+        self.embed_config = self._extract_embed_config(args.embed_exc)
+        self.param_kernsize = args.rez_nsample_exc
 
         if self.fore_nsample % self.param_kernsize:
             raise Exception('the number of forecast samples must be a multiple of a kernel size!')
-        self.fun_nsample_forecast  = self.fore_nsample // self.param_kernsize
+        self.fun_nsample_fore  = self.fore_nsample // self.param_kernsize
 
-        # --! here the function configuration is already respecified, such that it is convenient
-        # --! to get the total number of required function parameters
-        nparam = sum(self.fun.values())
-        fun_nsample = self.back_nsample // self.param_kernsize
+        # --! get the total number of required embedded parameters
+        nparam = sum(self.embed_config.values())
+        embed_nsample = self.back_nsample // self.param_kernsize
 
-        # --! create an MLP-based encoder to encode timeseries into embedded functions
+        # --! create an MLP-based encoder to encode timeseries into embeddings
         #
         # --! more precisely, input timeseries are partitioned into slices, and the encoder
         # --! encodes slice-specific kernels for every function parameter
@@ -1016,13 +1011,13 @@ class operator_exc(operator):
             # --! basis functions, such that only the number of these basis functions
             # --! influences the order of linear matrices and the number of data
             # --! dimensions has no effect on that order
-            fun_prune_ni = nfun * self.nfeature
-            fun_prune_no = nfun
+            fun_prune_ni = nembed * self.nfeature
+            fun_prune_no = nembed
             self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
             self.fun_u_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
 
         # --! encoder network which learns to attend over slices of embedded function values
-        mod_mean_att_enc_ni = nfun
+        mod_mean_att_enc_ni = nembed
 
         # --! the attention encoder is implemented in terms of a Transformer encoder network
         self.mod_mean_att_enc = torch.nn.TransformerEncoder(
@@ -1041,8 +1036,8 @@ class operator_exc(operator):
         # --! the generator takes a flattened sequence of function values and
         # --! returns a flattened sequence of square matrices,
         # --! covering all prediction horizon
-        mod_mean_gen_ni = fun_nsample * nfun
-        mod_mean_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
+        mod_mean_gen_ni = embed_nsample * nembed
+        mod_mean_gen_no = (embed_nsample + self.fun_nsample_fore) * nembed * nembed
         mod_mean_gen_feat = util_nn.make_feat(ni=mod_mean_gen_ni, no=mod_mean_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
         self.mod_mean_gen = util_nn.fcnn(feat=mod_mean_gen_feat, actfun_hid='relu')
 
@@ -1050,20 +1045,20 @@ class operator_exc(operator):
         #
         # --! the generator takes a flattened sequence of function values and returns
         # --! a flattened sequence of square matrices
-        mod_u_gen_ni = fun_nsample * nfun
-        mod_u_gen_no = (fun_nsample + self.fun_nsample_forecast) * nfun * nfun
+        mod_u_gen_ni = embed_nsample * nembed
+        mod_u_gen_no = (embed_nsample + self.fun_nsample_fore) * nembed * nembed
         mod_u_gen_feat = util_nn.make_feat(ni=mod_u_gen_ni, no=mod_u_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
         self.mod_u_gen = util_nn.fcnn(feat=mod_u_gen_feat, actfun_hid='relu')
 
         # --! create MLP-based decoders to decode embeddings back to timeseries
-        pre_dec_ni = nfun
+        pre_dec_ni = nembed
         pre_dec_no = self.param_kernsize * self.ntarget
         pre_dec_feat = util_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
         self.pre_mean_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
 
         # --! construct uncertainty decoder that outputs
         # --! two uncertainty features for each target: signed error and error 'geometry'
-        zeta_dec_ni = nfun
+        zeta_dec_ni = nembed
         zeta_dec_no = self.param_kernsize * self.ntarget * 2
         zeta_dec_feat = util_nn.make_feat(ni=zeta_dec_ni, no=zeta_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
         self.zeta_dec = util_nn.fcnn(feat=zeta_dec_feat, actfun_hid='relu')
@@ -1084,7 +1079,7 @@ class operator_exc(operator):
         # --! based on inputs, encode parameter kernels (filters)
         kern = self.fun_enc(i)
 
-        nparam = sum(self.fun.values())
+        nparam = sum(self.embed_config.values())
 
         # --! reshape encoded kernels to support their next multiplication with inputs, e.g.
         # --!
@@ -1107,13 +1102,13 @@ class operator_exc(operator):
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
 
         # --! split extracted parameters based on number of parameters required by each basis function
-        param = torch.split(param, list(self.fun.values()), dim=-1)
+        param = torch.split(param, list(self.embed_config.values()), dim=-1)
 
         # --! evaluate embeddings at each slice of timeseries
         #
         # --! note that there is one single measurement of each embedding to describe
         # --! a slice, so the granularity of slicing plays an important a role
-        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.embed_config.keys(), param)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
         # --! to [B, T / kernsize, ndim * nembed]
@@ -1138,7 +1133,7 @@ class operator_exc(operator):
         # --! based on inputs, encode parameter kernels (filters)
         kern = self.fun_u_enc(i)
 
-        nparam = sum(self.fun.values())
+        nparam = sum(self.embed_config.values())
 
         # --! reshape encoded kernels to support their next multiplication with inputs, e.g.
         # --!
@@ -1162,10 +1157,10 @@ class operator_exc(operator):
 
         # --! split extracted parameters based on the number of parameters required by each
         # --! type of grouped basis functions
-        param = torch.split(param, list(self.fun.values()), dim=-1)
+        param = torch.split(param, list(self.embed_config.values()), dim=-1)
 
         # --! evaluate embeddings at each slice of timeseries
-        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.fun.keys(), param)], dim=-1)
+        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.embed_config.keys(), param)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
         # --! to [B, T / kernsize, ndim * nembed]
@@ -1218,7 +1213,7 @@ class operator_exc(operator):
         # --! return separate predictions for lookback and forecast windows
         #
         # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_forecast], dim=1)
+        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_fore], dim=1)
 
     def predict_zeta(self, embeddings):
 
@@ -1251,7 +1246,7 @@ class operator_exc(operator):
         # --! return separate predictions for lookback and forecast windows
         #
         # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_forecast], dim=1)
+        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_fore], dim=1)
 
     def forward(self, timeseries):
 
