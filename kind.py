@@ -626,19 +626,19 @@ class operator(torch.nn.Module, interface):
 
         return newconfig
 
-    def _eval_fun(self, fun, param):
-        if fun == 'sin':
+    def _eval_embed(self, embed, param):
+        if embed == 'sin':
             return self._eval_sin(param)
-        elif fun == 'cos':
+        elif embed == 'cos':
             return self._eval_cos(param)
-        elif fun == 'data':
+        elif embed == 'data':
             return self._eval_data(param)
-        elif fun == 'poly':
+        elif embed == 'poly':
             return self._eval_poly(param)
-        elif fun == 'exp':
+        elif embed == 'exp':
             return self._eval_exp(param)
         else:
-            raise Exception("unsupported basis function!")
+            raise Exception("unsupported embedding!")
 
     def _eval_sinx(self, param):
         amp, ang = torch.split(param, 1, dim=-1)
@@ -681,66 +681,70 @@ class operator_nom(operator):
 
         # --! initialize nominal-specific parameters
         self.embed_config = self._extract_embed_config(args.embed_nom)
-        self.param_kernsize = args.rez_nsample_nom
+        self.rez_nsample = args.rez_nsample_nom
 
-        if self.fore_nsample % self.param_kernsize:
-            raise Exception('the number of forecast samples must be a multiple of a kernel size!')
-        self.fun_nsample_fore = self.fore_nsample // self.param_kernsize
+        if self.fore_nsample % self.rez_nsample:
+            raise Exception('number of forecast samples must be a multiple of resolution!')
+
+        # --! get the number of embedded samples in the forecast window
+        self.embed_nsample_fore = self.fore_nsample // self.rez_nsample
 
         # --! get the total number of required embedded parameters
         nparam = sum(self.embed_config.values())
-        embed_nsample = self.back_nsample // self.param_kernsize
 
-        # --! create an encoder to encode timeseries into embedded functions
+        # --! get the number of embedded samples in the lookback window
+        embed_nsample_back = self.back_nsample // self.rez_nsample
+
+        # --! create an encoder to encode timeseries into embedded values
         #
-        # --! more precisely, input timeseries are partitioned into slices, and the encoder
-        # --! encodes slice-specific kernels for every function parameter
+        # --! more precisely, input timeseries are partitioned into segments according to the resolution, and
+        # --! the encoder encodes segment-specific kernels for every embedded parameter
         # --! in the embedded (latent) space
-        fun_enc_ni   = self.param_kernsize * self.nfeature
-        fun_enc_no   = nparam * self.param_kernsize * self.nfeature
-        fun_enc_feat = util_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
-        self.fun_enc = util_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
-        self.fun_u_enc = util_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
+        enc_ni = self.rez_nsample * self.nfeature
+        enc_no = nparam * self.rez_nsample * self.nfeature
+        enc_feat = util_nn.make_feat(ni=enc_ni, no=enc_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.enc_mean = util_nn.fcnn(feat=enc_feat, actfun_hid='relu')
+        self.enc_zeta = util_nn.fcnn(feat=enc_feat, actfun_hid='relu')
 
         if self.nfeature > 1:
-            # --! this linear transformation is supposed to prune the dimensionality of the
-            # --! basis functions, such that only the number of these basis functions
-            # --! influences the order of the DMD matrix, whereas the number of data
-            # --! dimensions has no effect on the order
-            fun_prune_ni = nembed * self.nfeature
-            fun_prune_no = nembed
-            self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
-            self.fun_u_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
+            # --! this linear transformation is supposed to prune the dimensionality of the embeddings,
+            # --! such that only the number of these embeddings influences
+            # --! the order of the DMD matrix, whereas the number of
+            # --! data dimensions has no effect on the order
+            prune_ni = nembed * self.nfeature
+            prune_no = nembed
+            self.prune_mean = torch.nn.Linear(prune_ni, prune_no, bias=False)
+            self.prune_zeta = torch.nn.Linear(prune_ni, prune_no, bias=False)
 
         # --! create a DMD-like model (a matrix) that captures nominal (mean) dynamics
         #
         # --! since this matrix is learned only once and does not adapt during runtime,
         # --! this operator can also be called static, instead of nominal
-        mod_mean_ni = nembed
-        mod_mean_no = nembed
-        self.mod_mean = torch.nn.Linear(mod_mean_ni, mod_mean_no, bias=False)
+        model_ni = nembed
+        model_no = nembed
+        self.model_mean = torch.nn.Linear(model_ni, model_no, bias=False)
 
         # --! create a generator that produces models capturing the evolution of uncertainty zeta
         #
         # --! the generator takes a flattened sequence of embedded values and returns
         # --! a flattened sequence of square matrices
-        mod_var_gen_ni = embed_nsample * nembed
-        mod_var_gen_no = (embed_nsample + self.fun_nsample_fore) * nembed * nembed
-        mod_var_gen_feat = util_nn.make_feat(ni=mod_var_gen_ni, no=mod_var_gen_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
-        self.mod_u_gen = util_nn.fcnn(feat=mod_var_gen_feat, actfun_hid='relu')
+        model_ni = embed_nsample_back * nembed
+        model_no = (embed_nsample_back + self.embed_nsample_fore) * nembed * nembed
+        model_feat = util_nn.make_feat(ni=model_ni, no=model_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.model_zeta = util_nn.fcnn(feat=model_feat, actfun_hid='relu')
 
         # --! create prediction decoder to decode predicted embeddings back to timeseries
-        pre_dec_ni = nembed
-        pre_dec_no = self.param_kernsize * self.ntarget
-        pre_dec_feat = util_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
-        self.pre_mean_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+        dec_ni = nembed
+        dec_no = self.rez_nsample * self.ntarget
+        dec_feat = util_nn.make_feat(ni=dec_ni, no=dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.dec_mean = util_nn.fcnn(feat=dec_feat, actfun_hid='relu')
 
         # --! construct uncertainty decoder that outputs
         # --! two uncertainty features for each target: signed error and error 'geometry'
-        zeta_dec_ni = nembed
-        zeta_dec_no = self.param_kernsize * self.ntarget * 2
-        zeta_dec_feat = util_nn.make_feat(ni=zeta_dec_ni, no=zeta_dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
-        self.zeta_dec = util_nn.fcnn(feat=zeta_dec_feat, actfun_hid='relu')
+        dec_ni = nembed
+        dec_no = self.rez_nsample * self.ntarget * 2
+        dec_feat = util_nn.make_feat(ni=dec_ni, no=dec_no, nneuron=args.nneuron_stat, nlayer=args.nlayer_stat)
+        self.dec_zeta = util_nn.fcnn(feat=dec_feat, actfun_hid='relu')
 
     def embed_mean(self, timeseries):
 
@@ -752,11 +756,11 @@ class operator_nom(operator):
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
-        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
-        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
+        i = timeseries.reshape(timeseries.shape[0], -1, self.rez_nsample, self.nfeature)
+        i = i.reshape(timeseries.shape[0], -1, self.rez_nsample * self.nfeature)
 
         # --! based on inputs, encode parameter kernels (filters)
-        kern = self.fun_enc(i)
+        kern = self.enc_mean(i)
 
         nparam = sum(self.embed_config.values())
 
@@ -770,12 +774,12 @@ class operator_nom(operator):
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize * self.nfeature)
+            self.rez_nsample * self.nfeature)
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize, self.nfeature)
-        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
+            self.rez_nsample, self.nfeature)
+        i = i.reshape(i.shape[0], i.shape[1], self.rez_nsample, self.nfeature)
 
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
@@ -785,14 +789,14 @@ class operator_nom(operator):
         param = torch.split(param, list(self.embed_config.values()), dim=-1)
 
         # --! evaluate embeddings at each slice of timeseries
-        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.embed_config.keys(), param)], dim=-1)
+        embed = torch.cat([self._eval_embed(e, p) for e, p in zip(self.embed_config.keys(), param)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
         # --! to [B, T / kernsize, ndim * nembed]
         embed = embed.reshape(embed.shape[0], embed.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(embed) if self.nfeature > 1 else embed
+        return self.prune_mean(embed) if self.nfeature > 1 else embed
 
     def embed_zeta(self, timeseries):
 
@@ -804,11 +808,11 @@ class operator_nom(operator):
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
-        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
-        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
+        i = timeseries.reshape(timeseries.shape[0], -1, self.rez_nsample, self.nfeature)
+        i = i.reshape(timeseries.shape[0], -1, self.rez_nsample * self.nfeature)
 
         # --! based on inputs, encode parameter kernels (filters)
-        kern = self.fun_u_enc(i)
+        kern = self.enc_zeta(i)
 
         nparam = sum(self.embed_config.values())
 
@@ -822,12 +826,12 @@ class operator_nom(operator):
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize * self.nfeature)
+            self.rez_nsample * self.nfeature)
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize, self.nfeature)
-        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
+            self.rez_nsample, self.nfeature)
+        i = i.reshape(i.shape[0], i.shape[1], self.rez_nsample, self.nfeature)
 
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
@@ -837,19 +841,19 @@ class operator_nom(operator):
         param = torch.split(param, list(self.embed_config.values()), dim=-1)
 
         # --! evaluate embeddings at each slice of timeseries
-        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.embed_config.keys(), param)], dim=-1)
+        embed = torch.cat([self._eval_embed(e, p) for e, p in zip(self.embed_config.keys(), param)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
         # --! to [B, T / kernsize, ndim * nembed]
         embed = embed.reshape(embed.shape[0], embed.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_u_prune(embed) if self.nfeature > 1 else embed
+        return self.prune_zeta(embed) if self.nfeature > 1 else embed
 
     def predict_mean(self, embeddings):
 
         back_nsample = embeddings.shape[1]
-        fore_nsample = self.fun_nsample_fore
+        fore_nsample = self.embed_nsample_fore
 
         horizon = back_nsample + fore_nsample
 
@@ -857,7 +861,7 @@ class operator_nom(operator):
         #
         # --! the matrix is unsqueezed to a shape [1, nfun, nfun] to allow
         # --! broadcasting when multiplying with functions
-        mat = torch.unsqueeze(self.mod_mean.weight, 0)
+        mat = torch.unsqueeze(self.model_mean.weight, 0)
 
         # --! stack together matrices raised to powers to cover all prediction horizon
         #
@@ -895,8 +899,8 @@ class operator_nom(operator):
 
         # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
         # --! capture the evolution of embedded values
-        i = torch.flatten(embeddings, start_dim=1)
-        mat = self.mod_u_gen(i).reshape(batsize, -1, nembed, nembed)
+        model_i = torch.flatten(embeddings, start_dim=1)
+        mat = self.model_zeta(model_i).reshape(batsize, -1, nembed, nembed)
         mat = util_nn.cumprod_mat(mat[:, 1:])
 
         # --! extract the initial condition of embedded history
@@ -917,7 +921,7 @@ class operator_nom(operator):
         # --! return separate predictions for lookback and forecast windows
         #
         # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_fore], dim=1)
+        return torch.split(embed_pred, [embed_nsample - 1, self.embed_nsample_fore], dim=1)
 
     def forward(self, timeseries):
 
@@ -937,39 +941,39 @@ class operator_nom(operator):
         # --! timeseries are decoded as slice rows shaped as [B, T / kernsize, kernsize],
         # --! so we reshape the decoded results back to their
         # --! original shape [B, T, ndim]
-        ts_mean = self.pre_mean_dec(torch.cat([mean_pred_back, mean_pred_fore], dim=1))
+        ts_mean = self.dec_mean(torch.cat([mean_pred_back, mean_pred_fore], dim=1))
         ts_mean = ts_mean.reshape(ts_mean.shape[0], -1, self.ntarget)
 
         # --! decode predicted zeta embeddings to time series domain
-        ts_zeta = self.zeta_dec(torch.cat([zeta_pred_back, zeta_pred_fore], dim=1))
+        ts_zeta = self.dec_zeta(torch.cat([zeta_pred_back, zeta_pred_fore], dim=1))
         ts_zeta = ts_zeta.reshape(ts_zeta.shape[0], -1, self.ntarget * 2)
 
         return ts_mean, ts_zeta, mean, mean_pred_back, zeta, zeta_pred_back
 
     def freeze_mean(self):
-        util_nn.freeze_module(self.fun_enc)
+        util_nn.freeze_module(self.enc_mean)
         if self.nfeature > 1:
-            util_nn.freeze_module(self.fun_prune)
-        util_nn.freeze_module(self.mod_mean)
-        util_nn.freeze_module(self.pre_mean_dec)
+            util_nn.freeze_module(self.prune_mean)
+        util_nn.freeze_module(self.model_mean)
+        util_nn.freeze_module(self.dec_mean)
 
     def freeze_zeta(self):
-        util_nn.freeze_module(self.fun_u_enc)
+        util_nn.freeze_module(self.enc_zeta)
         if self.nfeature > 1:
-            util_nn.freeze_module(self.fun_u_prune)
-        util_nn.freeze_module(self.mod_u_gen)
-        util_nn.freeze_module(self.zeta_dec)
+            util_nn.freeze_module(self.prune_zeta)
+        util_nn.freeze_module(self.model_zeta)
+        util_nn.freeze_module(self.dec_zeta)
 
     def unfreeze(self):
-        util_nn.unfreeze_module(self.fun_enc)
-        util_nn.unfreeze_module(self.fun_u_enc)
+        util_nn.unfreeze_module(self.enc_mean)
+        util_nn.unfreeze_module(self.enc_zeta)
         if self.nfeature > 1:
-            util_nn.unfreeze_module(self.fun_prune)
-            util_nn.unfreeze_module(self.fun_u_prune)
-        util_nn.unfreeze_module(self.mod_mean)
-        util_nn.unfreeze_module(self.mod_u_gen)
-        util_nn.unfreeze_module(self.pre_mean_dec)
-        util_nn.unfreeze_module(self.zeta_dec)
+            util_nn.unfreeze_module(self.prune_mean)
+            util_nn.unfreeze_module(self.prune_zeta)
+        util_nn.unfreeze_module(self.model_mean)
+        util_nn.unfreeze_module(self.model_zeta)
+        util_nn.unfreeze_module(self.dec_mean)
+        util_nn.unfreeze_module(self.dec_zeta)
 
 
 class operator_exc(operator):
@@ -985,44 +989,45 @@ class operator_exc(operator):
 
         # --! initialize excursion-specific parameters
         self.embed_config = self._extract_embed_config(args.embed_exc)
-        self.param_kernsize = args.rez_nsample_exc
+        self.rez_nsample = args.rez_nsample_exc
 
-        if self.fore_nsample % self.param_kernsize:
-            raise Exception('the number of forecast samples must be a multiple of a kernel size!')
-        self.fun_nsample_fore  = self.fore_nsample // self.param_kernsize
+        if self.fore_nsample % self.rez_nsample:
+            raise Exception('number of forecast samples must be a multiple of resolution!')
+        self.embed_nsample_fore  = self.fore_nsample // self.rez_nsample
 
         # --! get the total number of required embedded parameters
         nparam = sum(self.embed_config.values())
-        embed_nsample = self.back_nsample // self.param_kernsize
+
+        # --! get the number of embedded samples in the lookback window
+        embed_nsample_back = self.back_nsample // self.rez_nsample
 
         # --! create an MLP-based encoder to encode timeseries into embeddings
         #
-        # --! more precisely, input timeseries are partitioned into slices, and the encoder
-        # --! encodes slice-specific kernels for every function parameter
+        # --! more precisely, input timeseries are partitioned into segments according to resolution, and the encoder
+        # --! encodes segment-specific kernels for every embedded parameter
         # --! in the embedded (latent) space
-        fun_enc_ni   = self.param_kernsize * self.nfeature
-        fun_enc_no   = nparam * self.param_kernsize * self.nfeature
-        fun_enc_feat = util_nn.make_feat(ni=fun_enc_ni, no=fun_enc_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
-        self.fun_enc = util_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
-        self.fun_u_enc = util_nn.fcnn(feat=fun_enc_feat, actfun_hid='relu')
+        enc_ni = self.rez_nsample * self.nfeature
+        enc_no = nparam * self.rez_nsample * self.nfeature
+        enc_feat = util_nn.make_feat(ni=enc_ni, no=enc_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.enc_mean = util_nn.fcnn(feat=enc_feat, actfun_hid='relu')
+        self.enc_zeta = util_nn.fcnn(feat=enc_feat, actfun_hid='relu')
 
         if self.nfeature > 1:
-            # --! this linear transformation is supposed to prune the dimensionality of the
-            # --! basis functions, such that only the number of these basis functions
-            # --! influences the order of linear matrices and the number of data
+            # --! this linear transformation is supposed to prune the dimensionality of the embeddings,
+            # --! such that only the number of these embeddings influences
+            # --! the order of linear matrices and the number of data
             # --! dimensions has no effect on that order
-            fun_prune_ni = nembed * self.nfeature
-            fun_prune_no = nembed
-            self.fun_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
-            self.fun_u_prune = torch.nn.Linear(fun_prune_ni, fun_prune_no, bias=False)
+            prune_ni = nembed * self.nfeature
+            prune_no = nembed
+            self.prune_mean = torch.nn.Linear(prune_ni, prune_no, bias=False)
+            self.prune_zeta = torch.nn.Linear(prune_ni, prune_no, bias=False)
 
-        # --! encoder network which learns to attend over slices of embedded function values
-        mod_mean_att_enc_ni = nembed
-
-        # --! the attention encoder is implemented in terms of a Transformer encoder network
-        self.mod_mean_att_enc = torch.nn.TransformerEncoder(
+        # --! encoder network which learns to attend over embedded values, where the encoder
+        # --! is implemented in terms of a Transformer encoder network
+        enc_ni = nembed
+        self.enc_model_mean = torch.nn.TransformerEncoder(
             torch.nn.TransformerEncoderLayer(
-                d_model=mod_mean_att_enc_ni,
+                d_model=enc_ni,
                 nhead=1,
                 dim_feedforward=args.nneuron_trans,
                 batch_first=True),
@@ -1033,35 +1038,35 @@ class operator_exc(operator):
         # --! encoded attention; these matrices enable piecewise-linear
         # --! predictions of mean embedding sequences
         #
-        # --! the generator takes a flattened sequence of function values and
+        # --! the generator takes a flattened sequence of embedded values and
         # --! returns a flattened sequence of square matrices,
         # --! covering all prediction horizon
-        mod_mean_gen_ni = embed_nsample * nembed
-        mod_mean_gen_no = (embed_nsample + self.fun_nsample_fore) * nembed * nembed
-        mod_mean_gen_feat = util_nn.make_feat(ni=mod_mean_gen_ni, no=mod_mean_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
-        self.mod_mean_gen = util_nn.fcnn(feat=mod_mean_gen_feat, actfun_hid='relu')
+        model_ni = embed_nsample_back * nembed
+        model_no = (embed_nsample_back + self.embed_nsample_fore) * nembed * nembed
+        model_feat = util_nn.make_feat(ni=model_ni, no=model_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.model_mean = util_nn.fcnn(feat=model_feat, actfun_hid='relu')
 
-        # --! create a generator that produces models capturing the evolution of variance (uncertainty)
+        # --! create a generator that produces models capturing the evolution of uncertainty zeta
         #
-        # --! the generator takes a flattened sequence of function values and returns
+        # --! the generator takes a flattened sequence of embedded values and returns
         # --! a flattened sequence of square matrices
-        mod_u_gen_ni = embed_nsample * nembed
-        mod_u_gen_no = (embed_nsample + self.fun_nsample_fore) * nembed * nembed
-        mod_u_gen_feat = util_nn.make_feat(ni=mod_u_gen_ni, no=mod_u_gen_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
-        self.mod_u_gen = util_nn.fcnn(feat=mod_u_gen_feat, actfun_hid='relu')
+        model_ni = embed_nsample_back * nembed
+        model_no = (embed_nsample_back + self.embed_nsample_fore) * nembed * nembed
+        model_feat = util_nn.make_feat(ni=model_ni, no=model_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.model_zeta = util_nn.fcnn(feat=model_feat, actfun_hid='relu')
 
         # --! create MLP-based decoders to decode embeddings back to timeseries
-        pre_dec_ni = nembed
-        pre_dec_no = self.param_kernsize * self.ntarget
-        pre_dec_feat = util_nn.make_feat(ni=pre_dec_ni, no=pre_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
-        self.pre_mean_dec = util_nn.fcnn(feat=pre_dec_feat, actfun_hid='relu')
+        dec_ni = nembed
+        dec_no = self.rez_nsample * self.ntarget
+        dec_feat = util_nn.make_feat(ni=dec_ni, no=dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.dec_mean = util_nn.fcnn(feat=dec_feat, actfun_hid='relu')
 
         # --! construct uncertainty decoder that outputs
         # --! two uncertainty features for each target: signed error and error 'geometry'
-        zeta_dec_ni = nembed
-        zeta_dec_no = self.param_kernsize * self.ntarget * 2
-        zeta_dec_feat = util_nn.make_feat(ni=zeta_dec_ni, no=zeta_dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
-        self.zeta_dec = util_nn.fcnn(feat=zeta_dec_feat, actfun_hid='relu')
+        dec_ni = nembed
+        dec_no = self.rez_nsample * self.ntarget * 2
+        dec_feat = util_nn.make_feat(ni=dec_ni, no=dec_no, nneuron=args.nneuron_trans, nlayer=args.nlayer_trans)
+        self.dec_zeta = util_nn.fcnn(feat=dec_feat, actfun_hid='relu')
 
     def embed_mean(self, timeseries):
 
@@ -1073,11 +1078,11 @@ class operator_exc(operator):
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
-        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
-        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
+        i = timeseries.reshape(timeseries.shape[0], -1, self.rez_nsample, self.nfeature)
+        i = i.reshape(timeseries.shape[0], -1, self.rez_nsample * self.nfeature)
 
         # --! based on inputs, encode parameter kernels (filters)
-        kern = self.fun_enc(i)
+        kern = self.enc_mean(i)
 
         nparam = sum(self.embed_config.values())
 
@@ -1091,12 +1096,12 @@ class operator_exc(operator):
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize * self.nfeature)
+            self.rez_nsample * self.nfeature)
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize, self.nfeature)
-        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
+            self.rez_nsample, self.nfeature)
+        i = i.reshape(i.shape[0], i.shape[1], self.rez_nsample, self.nfeature)
 
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
@@ -1108,14 +1113,14 @@ class operator_exc(operator):
         #
         # --! note that there is one single measurement of each embedding to describe
         # --! a slice, so the granularity of slicing plays an important a role
-        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.embed_config.keys(), param)], dim=-1)
+        embed = torch.cat([self._eval_embed(e, p) for e, p in zip(self.embed_config.keys(), param)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
         # --! to [B, T / kernsize, ndim * nembed]
         embed = embed.reshape(embed.shape[0], embed.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_prune(embed) if self.nfeature > 1 else embed
+        return self.prune_mean(embed) if self.nfeature > 1 else embed
 
     def embed_zeta(self, timeseries):
 
@@ -1127,11 +1132,11 @@ class operator_exc(operator):
         # --! timesteps and data channels, respectively
         #
         # --! note that -1 below infers the size of a dimension
-        i = timeseries.reshape(timeseries.shape[0], -1, self.param_kernsize, self.nfeature)
-        i = i.reshape(timeseries.shape[0], -1, self.param_kernsize * self.nfeature)
+        i = timeseries.reshape(timeseries.shape[0], -1, self.rez_nsample, self.nfeature)
+        i = i.reshape(timeseries.shape[0], -1, self.rez_nsample * self.nfeature)
 
         # --! based on inputs, encode parameter kernels (filters)
-        kern = self.fun_u_enc(i)
+        kern = self.enc_zeta(i)
 
         nparam = sum(self.embed_config.values())
 
@@ -1145,12 +1150,12 @@ class operator_exc(operator):
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize * self.nfeature)
+            self.rez_nsample * self.nfeature)
         kern = kern.reshape(
             i.shape[0], i.shape[1],
             nparam,
-            self.param_kernsize, self.nfeature)
-        i = i.reshape(i.shape[0], i.shape[1], self.param_kernsize, self.nfeature)
+            self.rez_nsample, self.nfeature)
+        i = i.reshape(i.shape[0], i.shape[1], self.rez_nsample, self.nfeature)
 
         # --! with the help of kernels extract function parameters from input timeseries
         param = torch.einsum("blkdf, bldf -> blfk", kern, i)
@@ -1160,14 +1165,14 @@ class operator_exc(operator):
         param = torch.split(param, list(self.embed_config.values()), dim=-1)
 
         # --! evaluate embeddings at each slice of timeseries
-        embed = torch.cat([self._eval_fun(f, p) for f, p in zip(self.embed_config.keys(), param)], dim=-1)
+        embed = torch.cat([self._eval_embed(e, p) for e, p in zip(self.embed_config.keys(), param)], dim=-1)
 
         # --! reshape dimensions to go from a shape [B, T / kernsize, ndim, nembed]
         # --! to [B, T / kernsize, ndim * nembed]
         embed = embed.reshape(embed.shape[0], embed.shape[1], -1)
 
         # --! prune extra dimensionality caused by multidimensional data
-        return self.fun_u_prune(embed) if self.nfeature > 1 else embed
+        return self.prune_zeta(embed) if self.nfeature > 1 else embed
 
     def predict_mean(self, embeddings):
 
@@ -1181,14 +1186,14 @@ class operator_exc(operator):
         #
         # --! attention is produced for each sequence step (rows of attention matrix); this information can be
         # --! used to derive linear time-varying matrices that locally adapt to changes in dynamics
-        embeddings = self.mod_mean_att_enc(embeddings)
+        embeddings = self.enc_model_mean(embeddings)
 
         # --! note that we omit matrix transpose here, relying on training to figure it out
         #
         # --! note also that the neural network, which generates matrices, is already configured to
         # --! cover the entire prediction horizon, i.e. lookback and forecast windows
-        mod_mean_gen_i = torch.flatten(embeddings, start_dim=1)
-        mat            = self.mod_mean_gen(mod_mean_gen_i).reshape(batsize, -1, nembed, nembed)
+        model_i = torch.flatten(embeddings, start_dim=1)
+        mat = self.model_mean(model_i).reshape(batsize, -1, nembed, nembed)
 
         # --! accumulate matrix products to enable predictions, such as z2 = A1*z1, z3 = A2*A1*z1, etc,
         # --! where zi are our embeddings, and where Ai are linear time-varying matrices
@@ -1213,7 +1218,7 @@ class operator_exc(operator):
         # --! return separate predictions for lookback and forecast windows
         #
         # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_fore], dim=1)
+        return torch.split(embed_pred, [embed_nsample - 1, self.embed_nsample_fore], dim=1)
 
     def predict_zeta(self, embeddings):
 
@@ -1224,8 +1229,8 @@ class operator_exc(operator):
 
         # --! based on history (a lookback window), generate a sequence of piecewise-linear matrices that
         # --! capture the evolution of function values
-        i = torch.flatten(embeddings, start_dim=1)
-        mat = self.mod_u_gen(i).reshape(batsize, -1, nembed, nembed)
+        model_i = torch.flatten(embeddings, start_dim=1)
+        mat = self.model_zeta(model_i).reshape(batsize, -1, nembed, nembed)
         mat = util_nn.cumprod_mat(mat[:, 1:])
 
         # --! extract the initial condition of embedded history
@@ -1246,7 +1251,7 @@ class operator_exc(operator):
         # --! return separate predictions for lookback and forecast windows
         #
         # --! note that the lookback window is -1, because we do not predict the initial condition
-        return torch.split(embed_pred, [embed_nsample - 1, self.fun_nsample_fore], dim=1)
+        return torch.split(embed_pred, [embed_nsample - 1, self.embed_nsample_fore], dim=1)
 
     def forward(self, timeseries):
 
@@ -1266,39 +1271,39 @@ class operator_exc(operator):
         # --! time series are decoded as slice rows shaped as [B, T / kernsize, kernsize],
         # --! so we reshape the decoded results back to their
         # --! original shape [B, T, ndim]
-        ts_mean = self.pre_mean_dec(torch.cat([mean_pred_back, mean_pred_fore], dim=1))
+        ts_mean = self.dec_mean(torch.cat([mean_pred_back, mean_pred_fore], dim=1))
         ts_mean = ts_mean.reshape(ts_mean.shape[0], -1, self.ntarget)
 
         # --! decode predicted zeta embeddings to time series domain
-        ts_zeta = self.zeta_dec(torch.cat([zeta_pred_back, zeta_pred_fore], dim=1))
+        ts_zeta = self.dec_zeta(torch.cat([zeta_pred_back, zeta_pred_fore], dim=1))
         ts_zeta = ts_zeta.reshape(ts_zeta.shape[0], -1, self.ntarget * 2)
 
         return ts_mean, ts_zeta, mean, mean_pred_back, zeta, zeta_pred_back
 
     def freeze_mean(self):
-        util_nn.freeze_module(self.fun_enc)
+        util_nn.freeze_module(self.enc_mean)
         if self.nfeature > 1:
-            util_nn.freeze_module(self.fun_prune)
-        util_nn.freeze_module(self.mod_mean_att_enc)
-        util_nn.freeze_module(self.mod_mean_gen)
-        util_nn.freeze_module(self.pre_mean_dec)
+            util_nn.freeze_module(self.prune_mean)
+        util_nn.freeze_module(self.enc_model_mean)
+        util_nn.freeze_module(self.model_mean)
+        util_nn.freeze_module(self.dec_mean)
 
     def freeze_zeta(self):
-        util_nn.freeze_module(self.fun_u_enc)
+        util_nn.freeze_module(self.enc_zeta)
         if self.nfeature > 1:
-            util_nn.freeze_module(self.fun_u_prune)
-        util_nn.freeze_module(self.mod_u_gen)
-        util_nn.freeze_module(self.zeta_dec)
+            util_nn.freeze_module(self.prune_zeta)
+        util_nn.freeze_module(self.model_zeta)
+        util_nn.freeze_module(self.dec_zeta)
 
     def unfreeze(self):
-        util_nn.unfreeze_module(self.fun_enc)
-        util_nn.unfreeze_module(self.fun_u_enc)
+        util_nn.unfreeze_module(self.enc_mean)
+        util_nn.unfreeze_module(self.enc_zeta)
         if self.nfeature > 1:
-            util_nn.unfreeze_module(self.fun_prune)
-            util_nn.unfreeze_module(self.fun_u_prune)
-        util_nn.unfreeze_module(self.mod_mean_att_enc)
-        util_nn.unfreeze_module(self.mod_mean_gen)
-        util_nn.unfreeze_module(self.mod_u_gen)
-        util_nn.unfreeze_module(self.pre_mean_dec)
-        util_nn.unfreeze_module(self.zeta_dec)
+            util_nn.unfreeze_module(self.prune_mean)
+            util_nn.unfreeze_module(self.prune_zeta)
+        util_nn.unfreeze_module(self.enc_model_mean)
+        util_nn.unfreeze_module(self.model_mean)
+        util_nn.unfreeze_module(self.model_zeta)
+        util_nn.unfreeze_module(self.dec_mean)
+        util_nn.unfreeze_module(self.dec_zeta)
 
