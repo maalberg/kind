@@ -110,7 +110,6 @@ class policy_iteration:
         self.base_policy = base_policy
         self.residual_policy = policy(normalizer)
 
-        # --! we use two separate value functions: one for nominal and another for excursion regimes
         self.value_fn = value_fn(normalizer)
         self.reward_fn = reward_fn
         self.normalizer = normalizer
@@ -252,22 +251,17 @@ class policy:
         policy_no = 1
         self.net = util_nn.fcnn(feat=[policy_ni, 64, 64, policy_no], actfun_hid='relu', actfun_o='linear')
 
-        self.state_train = policy_train(self)
-        self.state_eval = policy_eval(self)
-        self.state = self.state_train
-
     def __call__(self, state, **kwargs):
         return self.forward(state, **kwargs)
 
     def forward(self, state, **kwargs):
-        return self.state.forward(state, **kwargs)
+
+        state, mask = self.normalizer.normalize_state(state)
+        action = 0.5 * torch.tanh(self.net(state))
+
+        return self.normalizer.denormalize_action(action, mask)
 
     def train(self, mode=True):
-        if mode is True:
-            self.state = self.state_train
-        else:
-            self.state = self.state_eval
-
         return self.net.train(mode)
 
     def eval(self):
@@ -281,66 +275,6 @@ class policy:
 
     def state_dict(self, prefix='', keep_vars=False):
         return self.net.state_dict(prefix=prefix, keep_vars=keep_vars)
-
-
-class policy_state(interface):
-
-    @abstractmethod
-    def forward(self, state, **kwargs):
-        return
-
-    def _authorize_action(self, zeta, zeta_star, u_min=0.005, u_max_exc=0.5):
-
-        # --! normalize zeta star range to [0, 1]
-        zeta_norm = (zeta - zeta_star.nominal) / (zeta_star.excursion - zeta_star.nominal)
-        zeta_norm = zeta_norm.clamp(0.0, 1.0)
-
-        # --! compute a classic 'smoothstep',
-        # --! which has s(0) = 0, s(1) = 1, s'(0) = 0, s'(1) = 0.
-        s = 3*zeta_norm**2 - 2*zeta_norm**3
-        return u_min + s * (u_max_exc - u_min)
-
-
-class policy_train(policy_state):
-
-    def __init__(self, statemachine):
-        self.statemachine = statemachine
-
-    def forward(self, state, **kwargs):
-
-        zeta = kwargs.get('zeta', 0.0)
-        zeta_star = kwargs.get('zeta_star', kind.regimes(0.0, 0.0))
-        epoch = kwargs.get('epoch', 0)
-
-        state, mask = self.statemachine.normalizer.normalize_state(state)
-
-        #u_max_exc = self._schedule_max_action(epoch)
-        #action = self._authorize_action(zeta, zeta_star, u_max_exc=u_max_exc) * torch.tanh(self.statemachine.net(state))
-
-        action = 0.5 * torch.tanh(self.statemachine.net(state))
-
-        return self.statemachine.normalizer.denormalize_action(action, mask)
-
-    def _schedule_max_action(self, epoch, u_max_init=0.1, u_max_final=0.5):
-        return min(u_max_final, u_max_init + 0.05 * epoch)
-
-
-class policy_eval(policy_state):
-
-    def __init__(self, statemachine):
-        self.statemachine = statemachine
-
-    def forward(self, state, **kwargs):
-
-        zeta = kwargs.get('zeta', 0.0)
-        zeta_star = kwargs.get('zeta_star', kind.regimes(0.0, 0.0))
-
-        state, mask = self.statemachine.normalizer.normalize_state(state)
-        #action = self._authorize_action(zeta, zeta_star) * torch.tanh(self.statemachine.net(state))
-
-        action = 0.5 * torch.tanh(self.statemachine.net(state))
-
-        return self.statemachine.normalizer.denormalize_action(action, mask)
 
 
 class environment(interface):
