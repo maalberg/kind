@@ -135,7 +135,7 @@ class model_adapter:
     def forward(self, lookback):
 
         # --! normalize input data
-        lookback, mask = self.normalizer.normalize(lookback)
+        lookback = self.normalizer.normalize(lookback)
 
         # --! pass normalized data to the model
         model_o = self.model(lookback)
@@ -148,9 +148,9 @@ class model_adapter:
         pred_exc = model_o.mean_exc
 
         # --! denormalize extracted predictions
-        pred = self.normalizer.denormalize(pred, mask)
-        pred_nom = self.normalizer.denormalize(pred_nom, mask)
-        pred_exc = self.normalizer.denormalize(pred_exc, mask)
+        pred = self.normalizer.denormalize(pred)
+        pred_nom = self.normalizer.denormalize(pred_nom)
+        pred_exc = self.normalizer.denormalize(pred_exc)
 
         # --! put unscaled timeseries back to the result tuple and return the tuple
         model_o = model_o._asdict()

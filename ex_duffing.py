@@ -254,139 +254,88 @@ def make_base_policy(duffing_alpha, duffing_delta, q, r, dt=1e-2, setpoint=[0.0,
     return base_policy(k, setpoint), p
 
 
+def normalize_standard(timeseries, mean, std):
+    return (timeseries - mean) / std
+
+
+def denormalize_standard(timeseries, mean, std):
+    return timeseries * std + mean
+
+
 class normalizer(util_data.normalizer):
 
-    def __init__(self, timeseries_all, timeseries_exc, setpoint, state_ndim, control_ndim, mask_ndim):
+    def __init__(self, timeseries, setpoint, state_ndim, action_ndim, mask_ndim):
 
         # --! save data dimensions
         self.state_ndim = state_ndim
-        self.control_ndim = control_ndim
+        self.action_ndim = action_ndim
         self.mask_ndim = mask_ndim
 
-        # --! save setpoint before calling subtracting method
         self.setpoint = setpoint
 
-        # --! to take stats more efficiently below - subtract setpoint from data
-        timeseries_all = self._subtract_setpoint(timeseries_all)
-
+        state, action, _ = torch.split(timeseries, [self.state_ndim, self.action_ndim, self.mask_ndim], dim=-1)
+        state = state - self.setpoint
+        
         # --! take statistics
-        state, action, _ = torch.split(timeseries_all, [self.state_ndim, self.control_ndim, self.mask_ndim], dim=-1)
         self.s_mean = [s.mean() for s in torch.split(state, 1, dim=-1)]
         self.s_std = [torch.maximum(s.std(), self.std_min) for s in torch.split(state, 1, dim=-1)]
         self.a_mean = [a.mean() for a in torch.split(action, 1, dim=-1)]
         self.a_std = [torch.maximum(a.std(), self.std_min) for a in torch.split(action, 1, dim=-1)]
 
-        # --! take excursion statistics
-        #state, action, _ = torch.split(timeseries_exc, [self.state_ndim, self.control_ndim, self.mask_ndim], dim=-1)
-        #self.s_mean_exc = [s.mean() for s in torch.split(state, 1, dim=-1)]
-        #self.s_std_exc = [torch.maximum(s.std(), self.std_min) for s in torch.split(state, 1, dim=-1)]
-        #self.a_mean_exc = [a.mean() for a in torch.split(action, 1, dim=-1)]
-        #self.a_std_exc = [torch.maximum(a.std(), self.std_min) for a in torch.split(action, 1, dim=-1)]
-
-    def mask(self, timeseries):
-
-        # --! todo: this is a hack to return all Trues since mask is not needed here, rethink the architecture
-        mask = torch.ones(timeseries.shape[0], 1, 1, dtype=torch.bool)
-        return torch.squeeze(mask)
-
     def normalize(self, timeseries):
-        assert timeseries.shape[-1]==(self.state_ndim + self.control_ndim + self.mask_ndim)
 
-        mask = self.mask(timeseries)
-        assert torch.all(mask)
+        nfeature = timeseries.shape[-1]
+        assert nfeature==(self.state_ndim + self.action_ndim + self.mask_ndim) or nfeature==self.state_ndim
 
-        timeseries = self._subtract_setpoint(timeseries)
-        state, action, action_mask = torch.split(timeseries, [self.state_ndim, self.control_ndim, self.mask_ndim], dim=-1)
+        if nfeature==self.state_ndim:
+            timeseries = self._normalize_state(timeseries)
+        else:
+            timeseries = self._normalize_timeseries(timeseries)
 
-        state = torch.cat([
-            self._normalize_timeseries(
-                s, mask, mean, std) for s, mean, std in zip(torch.split(state, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
+        return timeseries
 
-        action = torch.cat([
-            self._normalize_timeseries(
-                a, mask, mean, std) for a, mean, std in zip(torch.split(action, 1, dim=-1), self.a_mean, self.a_std)], dim=-1)
-
-        return torch.cat([state, action, action_mask], dim=-1), mask
-
-    def normalize_state(self, state):
+    def _normalize_state(self, state):
         assert state.shape[-1]==self.state_ndim
 
-        mask = self.mask(state)
         state = state - self.setpoint
 
-        state = torch.cat([
-            self._normalize_timeseries(
-                s, mask, mean, std) for s, mean, std in zip(torch.split(state, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
+        return torch.cat([
+            normalize_standard(s, mean, std) for s, mean, std in zip(torch.split(state, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
 
-        return state, mask
+    def _normalize_timeseries(self, timeseries):
+        assert timeseries.shape[-1]==(self.state_ndim + self.action_ndim + self.mask_ndim)
 
-    def denormalize(self, timeseries, mask):
+        state, action, action_mask = torch.split(timeseries, [self.state_ndim, self.action_ndim, self.mask_ndim], dim=-1)
 
-        assert timeseries.shape[-1]==self.state_ndim
+        state = self._normalize_state(state)
+        action = torch.cat([
+            normalize_standard(a, mean, std) for a, mean, std in zip(torch.split(action, 1, dim=-1), self.a_mean, self.a_std)], dim=-1)
 
-        timeseries_dn = torch.cat([
-            self._denormalize_timeseries(
-                s, mask, mean, std) for s, mean, std in zip(torch.split(timeseries, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
+        return torch.cat([state, action, action_mask], dim=-1)
 
-        timeseries_dn = timeseries_dn + self.setpoint
+    def denormalize(self, timeseries):
 
-        return timeseries_dn
+        nfeature = timeseries.shape[-1]
+        assert nfeature==self.state_ndim or nfeature==self.action_ndim
 
-    def denormalize_action(self, action, mask):
+        if nfeature==self.state_ndim:
+            state = torch.cat([
+                denormalize_standard(
+                    s, mean, std) for s, mean, std in zip(torch.split(timeseries, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
+            timeseries = state + self.setpoint
+        else:
+            timeseries = torch.cat([
+                denormalize_standard(
+                    s, mean, std) for s, mean, std in zip(torch.split(timeseries, 1, dim=-1), self.a_mean, self.a_std)], dim=-1)
 
-        assert action.shape[-1]==self.control_ndim
-
-        action_dn = torch.cat([
-            self._denormalize_timeseries(
-                s, mask, mean, std) for s, mean, std in zip(torch.split(action, 1, dim=-1), self.a_mean, self.a_std)], dim=-1)
-
-        return action_dn
-
-    def _subtract_setpoint(self, timeseries):
-        state, other = torch.split(timeseries, [self.state_ndim, self.control_ndim + self.mask_ndim], dim=-1)
-        state = state - self.setpoint
-
-        return torch.cat([state, other], dim=-1)
-
-    def _extract_state(self, timeseries):
-        """Extracts state dimensions from the given ``timeseries``."""
-
-        if timeseries.shape[-1]==self.state_ndim:
-            return timeseries
-
-        state, _ = torch.split(timeseries, [self.state_ndim, self.control_ndim + self.mask_ndim], dim=-1)
-        return state
-
-    def _compute_state_norm_max(self, state):
-        """Computes the maximum ``state`` norm along the time steps dimension. All dimensions are preserved."""
-        return torch.max(torch.linalg.norm(state, dim=-1, keepdim=True), dim=1, keepdim=True)[0]
-
-    def _compute_regime_indicator(self, timeseries):
-        s = self._extract_state(timeseries)
-        s = s[...,:1]
-        sp = self.setpoint[...,:1]
-        return self._compute_state_norm_max(s - sp)
-
-    def _normalize_timeseries(self, timeseries, mask, mean, std):
-
-        timeseries_n = torch.empty_like(timeseries)
-        timeseries_n[mask] = (timeseries[mask] - mean) / std
-
-        return timeseries_n
-
-    def _denormalize_timeseries(self, timeseries, mask, mean, std):
-
-        timeseries_dn = torch.empty_like(timeseries)
-        timeseries_dn[mask] = timeseries[mask] * std + mean
-
-        return timeseries_dn
+        return timeseries
 
 
 class dataset(util_data.dataset):
     """Represents synthetic Duffing data, both nominal and excursion."""
 
     state_ndim = 2
-    control_ndim = 1
+    action_ndim = 1
     mask_ndim = 1
 
     def __init__(self,
@@ -409,10 +358,9 @@ class dataset(util_data.dataset):
     def init_normalization(self):
 
         # --! read data
-        timeseries_all = self.read_timeseries(self.make_path(data_type='all'), 626)
-        #timeseries_exc = self.read_timeseries(self.make_path(data_type='exc'), 'exc')
+        timeseries = self.read_timeseries(self.make_path(data_type='all'), 626)
 
-        return normalizer(timeseries_all, None, self.setpoint, self.state_ndim, self.control_ndim, self.mask_ndim)
+        return normalizer(timeseries, self.setpoint, self.state_ndim, self.action_ndim, self.mask_ndim)
 
 
 class replay_factory(rl.replay_factory):

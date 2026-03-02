@@ -61,13 +61,6 @@ def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory
             with torch.no_grad():
                 env_ic = factory.extract_first_s(rollout)
                 rollout = factory.create_back(64, env, env_ic, policies(policy.base, None))
-                #print(f'>>> advantage: back window reset')
-                #plt.figure(figsize=(6,3))
-                #plt.plot(rollout[0, :, :2])
-                #plt.plot(env_ic[0,0,:2], marker='o')
-                #plt.plot(rollout2[0, :, :2], linestyle='dashed')
-                #plt.show()
-                #print(tata.shape)
 
         state = factory.extract_current_s(rollout)
 
@@ -223,7 +216,7 @@ class value_fn:
         """Normalizes the given ``state`` and computes the corresponding value."""
 
         # --! normalize the state, but do not save the normalization mask (see below)
-        state, _ = self.state_normalizer.normalize_state(state)
+        state = self.state_normalizer.normalize(state)
 
         # --! get a value from the normalized state
         value = self.value_fn(state)
@@ -256,10 +249,10 @@ class policy:
 
     def forward(self, state, **kwargs):
 
-        state, mask = self.normalizer.normalize_state(state)
+        state = self.normalizer.normalize(state)
         action = 0.5 * torch.tanh(self.net(state))
 
-        return self.normalizer.denormalize_action(action, mask)
+        return self.normalizer.denormalize(action)
 
     def train(self, mode=True):
         return self.net.train(mode)

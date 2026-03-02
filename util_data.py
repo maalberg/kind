@@ -19,15 +19,11 @@ class normalizer(interface):
     std_min = torch.tensor(1e-3, dtype=torch.float32)
 
     @abstractmethod
-    def normalize(self, data):
+    def normalize(self, timeseries):
         return
 
     @abstractmethod
-    def normalize_state(self, state):
-        return
-
-    @abstractmethod
-    def denormalize(self, data):
+    def denormalize(self, timeseries):
         return
 
 
@@ -72,9 +68,9 @@ class dataset(interface):
         # --! if requested, normalize data
         if self.load_normalized:
 
-            train_data, _ = self.normalizer.normalize(train_data)
-            valid_data, _ = self.normalizer.normalize(valid_data)
-            test_data, _ = self.normalizer.normalize(test_data)
+            train_data = self.normalizer.normalize(train_data)
+            valid_data = self.normalizer.normalize(valid_data)
+            test_data = self.normalizer.normalize(test_data)
 
         train_loader = self._create_data_loader(train_data, shuffle=True)
         valid_loader = self._create_data_loader(valid_data, shuffle=False)
