@@ -358,7 +358,7 @@ class dataset(util_data.dataset):
     def init_normalization(self):
 
         # --! read data
-        timeseries = self.read_timeseries(self.make_path(data_type='all'), 626)
+        timeseries = self.read_timeseries(self.make_path(data_type='all'), 619)
 
         return normalizer(timeseries, self.setpoint, self.state_ndim, self.action_ndim, self.mask_ndim)
 
