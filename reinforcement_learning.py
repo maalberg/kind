@@ -25,7 +25,7 @@ value_functions = namedtuple('value_functions', 'nominal excursion')
 zeta_thresholds = namedtuple('zeta_thresholds', 'nominal excursion')
 
 
-def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory, replay_data, env, horizon, gamma, epoch=0):
+def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_data, env, horizon, gamma):
     """Computes advantage for reinforcement learning policy."""
 
     lookback, reward, next_lookback, done = replay_data
@@ -39,20 +39,10 @@ def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory
         # --! compute the current state value
         current_value = value_fn(state)
 
-    # --! compute current uncertainty: zeta(x, u)
-    with torch.no_grad():
-
-        # --! compute the uncertainty of a nominal KIND operator
-        model_o = model(lookback)
-        zeta = model_o.zeta_nom
-
-        # --! uncertainty zeta is represented by the mean of batch elements
-        zeta = torch.mean(zeta, dim=tuple(range(1, zeta.dim())), keepdim=True)
-
     # --! make a working copy of the current lookback to perform model rollouts
     rollout = lookback.clone()
     rollout_return = 0.0
-    rollout_nsample_max = 20
+    rollout_nsample_max = 20 # todo: place this as a parameter
 
     # --! perform model rollouts up to a spefified horizon - 1
     for k in range(horizon):
@@ -65,7 +55,7 @@ def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory
         state = factory.extract_current_s(rollout)
 
         # --! compute action
-        delta_u = policy.residual.forward(state, zeta=zeta, zeta_star=zeta_star, epoch=epoch)
+        delta_u = policy.residual(state)
         u = policy.base(state) + delta_u
 
         # --! update action in replay buffer with newly computed action
@@ -80,7 +70,7 @@ def advantage(model, zeta_star, policy, reward_fn, value_fn, normalizer, factory
         model_o = model(rollout) # < gradients flow here
 
         # --! having a prediction, take its forecast part
-        forecast = model_o.blend[:, 64:]
+        forecast = model_o.blend[:, 64:] # todo: put this constant as a parameter
 
         # --! take the first observation from the forecast
         next_state = forecast[:, :1, :]
@@ -110,7 +100,7 @@ class policy_iteration:
     def evaluate_policy(self, replay_factory, replay):
         return self._train_value(self.value_fn, replay_factory, replay)
 
-    def improve_policy(self, model, zeta_star, replay_factory, replay, env):
+    def improve_policy(self, model, replay_factory, replay, env):
 
         value_fn = self.value_fn
 
@@ -142,13 +132,13 @@ class policy_iteration:
             replay_data = replay.random_batch(batch_size)
 
             a = advantage(
-                model, zeta_star,
+                model,
                 policies(base_policy, residual_policy),
                 self.reward_fn,
                 value_fn,
                 self.normalizer,
                 replay_factory, replay_data, env,
-                horizon, gamma, epoch
+                horizon, gamma
             )
 
             policy_loss = -a.mean()
@@ -236,21 +226,22 @@ class value_fn:
 
 class policy:
 
-    def __init__(self, normalizer):
+    def __init__(self, normalizer, gain=0.5):
 
+        self.gain = gain
         self.normalizer = normalizer
 
         policy_ni = 2
         policy_no = 1
         self.net = util_nn.fcnn(feat=[policy_ni, 64, 64, policy_no], actfun_hid='relu', actfun_o='linear')
 
-    def __call__(self, state, **kwargs):
-        return self.forward(state, **kwargs)
+    def __call__(self, state):
+        return self.forward(state)
 
-    def forward(self, state, **kwargs):
+    def forward(self, state):
 
         state = self.normalizer.normalize(state)
-        action = 0.5 * torch.tanh(self.net(state))
+        action = self.gain * torch.tanh(self.net(state))
 
         return self.normalizer.denormalize(action)
 

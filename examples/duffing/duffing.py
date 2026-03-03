@@ -372,7 +372,7 @@ class replay_factory(rl.replay_factory):
     def __init__(self):
         pass
 
-    def create(self, env, env_ic, policy, zeta, zeta_star, back_nsample, skip_nsample):
+    def create(self, env, env_ic, policy, back_nsample, skip_nsample):
 
         # --! reset environment to begin replay from initial condition
         s = env.reset(env_ic)
@@ -388,7 +388,7 @@ class replay_factory(rl.replay_factory):
 
             # --! provided residual policy is available, add residual action to the base one
             if policy.residual is not None:
-                a = a + torch.squeeze(policy.residual(s, zeta=zeta, zeta_star=zeta_star), 0)
+                a = a + torch.squeeze(policy.residual(s), 0)
 
             s, reward, done = env.step(a)
 
@@ -410,7 +410,7 @@ class replay_factory(rl.replay_factory):
 
             # --! provided residual policy is available, add residual action to the base one
             if policy.residual is not None:
-                a = a + torch.squeeze(policy.residual(s, zeta=zeta, zeta_star=zeta_star), 0)
+                a = a + torch.squeeze(policy.residual(s), 0)
 
             sa_window.append((s, a))
             s, reward, done = env.step(a)
@@ -431,7 +431,7 @@ class replay_factory(rl.replay_factory):
 
             # --! provided residual policy is available, add residual action to the base one
             if policy.residual is not None:
-                a = a + torch.squeeze(policy.residual(s, zeta=zeta, zeta_star=zeta_star), 0)
+                a = a + torch.squeeze(policy.residual(s), 0)
 
             # --! update window with observation and action at time t + 1, and encode next state
             sa_window.append((s, a))
