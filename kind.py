@@ -27,7 +27,7 @@ model_output = namedtuple('model_output', [
 
 def create_args_parser():
     """ Creates a command-line parser for KIND arguments. """
-    parser = argparse.ArgumentParser(description='KIND timeseries forecasting')
+    parser = argparse.ArgumentParser(description='KIND: learned hybrid dynamics')
 
     # --! data arguments
     parser.add_argument('--file_dir', type=str, required=True, help='relative path to file directory')
@@ -159,6 +159,10 @@ class model_adapter:
         model_o['mean_exc'] = pred_exc
 
         return model_output(**model_o)
+
+    @property
+    def args(self):
+        return self.model.args
 
 
 class training:

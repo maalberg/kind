@@ -8,6 +8,7 @@ from itertools import chain
 
 from matplotlib import pyplot as plt
 
+import argparse
 import random
 import torch
 
@@ -20,12 +21,9 @@ import util_data
 
 environments = namedtuple('environments', 'nominal excursion')
 policies = namedtuple('policies', 'base residual')
-reward_functions = namedtuple('reward_functions', 'nominal excursion')
-value_functions = namedtuple('value_functions', 'nominal excursion')
-zeta_thresholds = namedtuple('zeta_thresholds', 'nominal excursion')
 
 
-def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_data, env, horizon, gamma):
+def advantage(model, policy, reward_fn, value_fn, factory, replay_data, env, horizon, gamma, back_reset_nsample, back_nsample):
     """Computes advantage for reinforcement learning policy."""
 
     lookback, reward, next_lookback, done = replay_data
@@ -42,7 +40,7 @@ def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_da
     # --! make a working copy of the current lookback to perform model rollouts
     rollout = lookback.clone()
     rollout_return = 0.0
-    rollout_nsample_max = 20 # todo: place this as a parameter
+    rollout_nsample_max = back_reset_nsample
 
     # --! perform model rollouts up to a spefified horizon - 1
     for k in range(horizon):
@@ -50,7 +48,7 @@ def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_da
         if k and k % rollout_nsample_max == 0:
             with torch.no_grad():
                 env_ic = factory.extract_first_s(rollout)
-                rollout = factory.create_back(64, env, env_ic, policies(policy.base, None))
+                rollout = factory.create_back(back_nsample, env, env_ic, policies(policy.base, None))
 
         state = factory.extract_current_s(rollout)
 
@@ -70,7 +68,7 @@ def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_da
         model_o = model(rollout) # < gradients flow here
 
         # --! having a prediction, take its forecast part
-        forecast = model_o.blend[:, 64:] # todo: put this constant as a parameter
+        forecast = model_o.blend[:, back_nsample:] # todo: put this constant as a parameter
 
         # --! take the first observation from the forecast
         next_state = forecast[:, :1, :]
@@ -85,94 +83,61 @@ def advantage(model, policy, reward_fn, value_fn, normalizer, factory, replay_da
     return rollout_return + gamma**horizon * terminal_value - current_value
 
 
+def create_args_parser():
+    """Creates a command-line parser for policy iteration arguments."""
+
+    parser = argparse.ArgumentParser(description='Policy iteration')
+
+    parser.add_argument('--gamma', type=float, required=True, help='discount factor')
+
+    parser.add_argument('--learning_rate_value', type=float, required=False, default=0.001, help='learning rate for value evaluation')
+    parser.add_argument('--nepoch_value', type=int, required=False, default=100, help='number of training epochs during policy evaluation')
+    parser.add_argument('--batch_size_value', type=int, required=False, default=64, help='batch size during policy evaluation')
+    parser.add_argument('--weight_decay_value', type=float, required=False, default=1e-6, help='weight decay during policy evaluation')
+
+    parser.add_argument('--learning_rate_policy', type=float, required=False, default=0.001, help='learning rate for policy improvement')
+    parser.add_argument('--nepoch_policy', type=int, required=False, default=100, help='number of training epochs during policy improvement')
+    parser.add_argument('--batch_size_policy', type=int, required=False, default=64, help='batch size during policy improvement')
+    parser.add_argument('--weight_decay_policy', type=float, required=False, default=1e-6, help='weight decay during policy improvement')
+    parser.add_argument('--rollout_nsample', type=int, required=True, help='model rollout horizon during policy improvement')
+    parser.add_argument('--back_reset_nsample', type=int, required=True,
+                        help='number of samples after which a lookback window is re-anchored to real data during model rollouts')
+
+    return parser
+
+
 class policy_iteration:
     """Implements a model-based policy iteration."""
 
-    def __init__(self, base_policy, reward_fn, normalizer):
+    def __init__(self, args, base_policy, reward_fn, normalizer):
+
+        self.args = args
 
         self.base_policy = base_policy
-        self.residual_policy = policy(normalizer)
+        self.reward_fn = reward_fn
 
         self.value_fn = value_fn(normalizer)
-        self.reward_fn = reward_fn
-        self.normalizer = normalizer
+        self.residual_policy = policy(normalizer)
 
     def evaluate_policy(self, replay_factory, replay):
-        return self._train_value(self.value_fn, replay_factory, replay)
-
-    def improve_policy(self, model, replay_factory, replay, env):
-
+        
         value_fn = self.value_fn
-
-        residual_policy = self.residual_policy
-        base_policy = self.base_policy
-
-        gamma = 0.995
-        batch_size = 64
-        learning_rate = 1e-3
-        weight_decay = 1e-6
-        policy_optim = torch.optim.Adam(residual_policy.parameters(), lr=learning_rate, weight_decay=weight_decay)
-
-        losses = []
-
-        # --! freeze value function
-        value_fn.eval()
-
-        # --! train policy
-        residual_policy.train()
-
-        # --! now, model rollout horizon
-        horizon = 1
-        nepoch = 100
-
-        for epoch in range(nepoch):
-            policy_optim.zero_grad()
-
-            # --! sample a random batch that may contain mixed - nominal and excursion - data
-            replay_data = replay.random_batch(batch_size)
-
-            a = advantage(
-                model,
-                policies(base_policy, residual_policy),
-                self.reward_fn,
-                value_fn,
-                self.normalizer,
-                replay_factory, replay_data, env,
-                horizon, gamma
-            )
-
-            policy_loss = -a.mean()
-            losses.append(policy_loss.item())
-            policy_loss.backward()
-            policy_optim.step()
-
-        residual_policy.eval()
-        return losses
-
-    def _train_value(self, value_fn, replay_factory, replay):
-
-        nepoch = 500
-        batch_size = 64
-        gamma = 0.995
-
-        learning_rate = 1e-3
-        weight_decay = 1e-6
-        value_optim = torch.optim.Adam(value_fn.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        value_optim = torch.optim.Adam(value_fn.parameters(), lr=self.args.learning_rate_value, weight_decay=self.args.weight_decay_value)
 
         losses = []
 
         value_fn.train()
 
-        for epoch in range(nepoch):
+        for epoch in range(self.args.nepoch_value):
             value_optim.zero_grad()
 
             # --! sample a random batch
-            lookback, reward, next_lookback, done = replay.random_batch(batch_size)
+            lookback, reward, next_lookback, done = replay.random_batch(self.args.batch_size_value)
 
             # --! target must be treated as a constant, so restrict any gradient flow during target calculation
             with torch.no_grad():
                 next_state = replay_factory.extract_current_s(next_lookback)
-                target = reward + gamma * (1.0 - done) * value_fn(next_state)
+                target = reward + self.args.gamma * (1.0 - done) * value_fn(next_state)
 
             # --! compute the value of the current state
             state = replay_factory.extract_current_s(lookback)
@@ -186,6 +151,44 @@ class policy_iteration:
             loss.backward()
             value_optim.step()
 
+        return losses
+
+    def improve_policy(self, model, replay_factory, replay, env):
+
+        value_fn = self.value_fn
+        residual_policy = self.residual_policy
+        base_policy = self.base_policy
+        policy_optim = torch.optim.Adam(residual_policy.parameters(), lr=self.args.learning_rate_policy, weight_decay=self.args.weight_decay_policy)
+
+        losses = []
+
+        # --! freeze value function
+        value_fn.eval()
+
+        # --! train policy
+        residual_policy.train()
+
+        for epoch in range(self.args.nepoch_policy):
+            policy_optim.zero_grad()
+
+            # --! sample a random batch that may contain mixed - nominal and excursion - data
+            replay_data = replay.random_batch(self.args.batch_size_policy)
+
+            a = advantage(
+                model,
+                policies(base_policy, residual_policy),
+                self.reward_fn,
+                value_fn,
+                replay_factory, replay_data, env,
+                self.args.rollout_nsample, self.args.gamma, self.args.back_reset_nsample, model.args.back_nsample
+            )
+
+            policy_loss = -a.mean()
+            losses.append(policy_loss.item())
+            policy_loss.backward()
+            policy_optim.step()
+
+        residual_policy.eval()
         return losses
 
 
@@ -284,7 +287,7 @@ class environment(interface):
 class replay_factory(interface):
 
     @abstractmethod
-    def create(self, env, env_ic, policy, zeta, zeta_star, state_nsample, skip_nsample):
+    def create(self, env, env_ic, policy, state_nsample, skip_nsample):
         pass
 
     @abstractmethod
