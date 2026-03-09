@@ -11,33 +11,33 @@ import random
 from scipy import signal
 from scipy.integrate import solve_ivp
 from collections import deque
-from itertools import chain
 
 import util_data
 import util_nn
 import reinforcement_learning as rl
 
 
-def duffing_energy_torch(state, alpha=-1.0, beta=20.0):
-    q = state[..., [0]]
-    qdot = state[..., [1]]
-    return 0.5 * qdot**2 + 0.5 * alpha * q**2 + 0.25 * beta * q**4
+class duffing_reward:
+    def __init__(self, q, r, setpoint):
+        self.q = np.atleast_2d(q)
+        self.r = np.atleast_2d(r)
+        self.setpoint = np.atleast_2d(setpoint)
+
+    def __call__(self, state, action):
+        x_err = state - self.setpoint
+
+        state_cost = x_err @ self.q @ x_err.T
+        action_cost = action @ self.r @ action.T
+
+        return -(state_cost + action_cost)
 
 
-class DuffingRewardTorch:
-    def __init__(self, Q, R, setpoint,
-                 alpha=-1.0, beta=20.0,
-                 lambda_E=0.1,
-                 device=None,
-                 dtype=torch.float32):
+class duffing_reward_adapter:
+    def __init__(self, q, r, setpoint, device=None, dtype=torch.float32):
 
-        self.Q = torch.atleast_2d(torch.as_tensor(Q, dtype=dtype, device=device))
-        self.R = torch.atleast_2d(torch.as_tensor(R, dtype=dtype, device=device))
+        self.q = torch.atleast_2d(torch.as_tensor(q, dtype=dtype, device=device))
+        self.r = torch.atleast_2d(torch.as_tensor(r, dtype=dtype, device=device))
         self.setpoint = torch.atleast_2d(torch.as_tensor(setpoint, dtype=dtype, device=device))
-
-        self.alpha = alpha
-        self.beta = beta
-        self.lambda_E = lambda_E
 
     def __call__(self, state, action):
 
@@ -46,41 +46,13 @@ class DuffingRewardTorch:
 
         x_err = state - self.setpoint
 
-        state_cost = x_err @ self.Q @ x_err.transpose(-1, -2)
-        action_cost = action @ self.R @ action.transpose(-1, -2)
-
-        reward = -(state_cost + action_cost)
-        return reward
-
-
-def duffing_energy(state, alpha=-1.0, beta=20.0):
-    q = state[..., 0]
-    qdot = state[..., 1]
-    return 0.5 * qdot**2 + 0.5 * alpha * q**2 + 0.25 * beta * q**4
-
-
-class duffing_reward:
-    def __init__(self, Q, R, setpoint,
-                 alpha=-1.0, beta=20.0,
-                 lambda_E=0.1):
-        self.Q = np.atleast_2d(Q)
-        self.R = np.atleast_2d(R)
-        self.setpoint = np.atleast_2d(setpoint)
-        self.alpha = alpha
-        self.beta = beta
-        self.lambda_E = lambda_E
-
-    def __call__(self, state, action):
-        x_err = state - self.setpoint
-
-        state_cost = x_err @ self.Q @ x_err.T
-        action_cost = action @ self.R @ action.T
+        state_cost = x_err @ self.q @ x_err.transpose(-1, -2)
+        action_cost = action @ self.r @ action.transpose(-1, -2)
 
         return -(state_cost + action_cost)
 
 
 def duffing_update(t, state, sim, u):
-    """Generates a Duffing ``state`` update."""
 
     x1, x2 = state
     dx1 = x2
@@ -89,9 +61,12 @@ def duffing_update(t, state, sim, u):
 
 
 class duffing(rl.environment):
-    """Simulates a Duffing oscillator. Implements Dyna environment interface."""
 
-    def __init__(self, reward_fn, beta=20.0, gamma=10.0, alpha=-1.0, delta=0.5, omega=1.2, dt_sim=1e-4, dt_control=2e-2, t_final=100.0):
+    def __init__(
+        self,
+        reward_fn,
+        beta=20.0, gamma=10.0, alpha=-1.0, delta=0.5, omega=1.2,
+        dt_sim=1e-4, dt_control=2e-2, t_end=100.0):
 
         self.alpha = alpha
         self.beta  = beta
@@ -107,19 +82,18 @@ class duffing(rl.environment):
         # --! define simulation timing
         self.dt_sim = dt_sim
         self.dt_control = dt_control
-        self.jstep = 0
-        self.t_final = t_final
-        self.nstep = int(self.t_final / self.dt_control)
+
+        self.step_cnt = 0
+        self.nstep = int(t_end / self.dt_control)
 
     def reset(self, ic=[0.0, 0.0]):
-
-        #print(f'>>> duffing: reset to initial condition {ic}')
 
         # --! reset the state to the initial condition
         self.x = ic[0]
         self.dx = ic[1]
 
-        self.jstep = 0
+        # --! reset step counter
+        self.step_cnt = 0
 
         return np.array([[self.x, self.dx]])
 
@@ -130,7 +104,7 @@ class duffing(rl.environment):
         reward = self.r_fn(state, np.array([[action]]))
 
         # --! for integration below, define step timing
-        t_start = self.jstep * self.dt_control
+        t_start = self.step_cnt * self.dt_control
         t = t_start + np.arange(0, self.dt_control, self.dt_sim)
         t_span = (t[0], t[-1])
 
@@ -148,8 +122,8 @@ class duffing(rl.environment):
 
         next_state = np.array([[self.x, self.dx]])
 
-        self.jstep += 1
-        done = self.jstep == self.nstep
+        self.step_cnt += 1
+        done = self.step_cnt == self.nstep
 
         return next_state, reward, done
 
@@ -159,16 +133,12 @@ class duffing(rl.environment):
 
 
 class duffing_adapter(rl.environment):
-    """Adapts a NumPy-based Duffing environment to PyTorch."""
 
     def __init__(self, env):
         self.env = env
 
         reward_fn = env.reward_fn
-        self.r_fn = DuffingRewardTorch(
-            reward_fn.Q, reward_fn.R,
-            reward_fn.setpoint,
-            reward_fn.alpha, reward_fn.beta, reward_fn.lambda_E)
+        self.r_fn = duffing_reward_adapter(reward_fn.q, reward_fn.r, reward_fn.setpoint)
 
     def reset(self, ic=torch.zeros(1,1,2)):
         ic = ic.detach().cpu().numpy()
@@ -191,23 +161,7 @@ class duffing_adapter(rl.environment):
         return self.r_fn
 
 
-def make_duffing(name, reward_fn, dt=1e-2):
-
-    if name == 'nom':
-        d = duffing(1.0, 0.1, reward_fn, dt_control=dt)
-        d.ic = [0.2, 0.2]
-        return d
-    elif name == 'exc':
-        d = duffing(140.0, 70.0, reward_fn, dt_control=dt, alpha=-110.0)
-        d.ic = [2.5, 5.0]
-        return d
-    else:
-        print(f'err >> unknown duffing name: {name}')
-        return None
-
-
 class base_policy:
-    """Defines a PyTorch-based base policy."""
 
     def __init__(self, gain, setpoint):
         self.gain = torch.from_numpy(gain).to(torch.float32)
@@ -219,9 +173,6 @@ class base_policy:
 
 
 def make_base_policy(duffing_alpha, duffing_delta, q, r, dt=1e-2, setpoint=[0.0, 0.0]):
-    """Makes a baseline LQR policy for a Duffing oscillator.
-    Parameters ``q`` and ``r`` are diagonal numpy arrays for state and action costs, respectively.
-    Default parameter ``setpoint`` is set to the origin."""
 
     a = np.array([
         [ 0,      1    ],
@@ -332,7 +283,6 @@ class normalizer(util_data.normalizer):
 
 
 class dataset(util_data.dataset):
-    """Represents synthetic Duffing data, both nominal and excursion."""
 
     state_ndim = 2
     action_ndim = 1
@@ -393,8 +343,6 @@ class replay_factory(rl.replay_factory):
             s, reward, done = env.step(a)
 
             if done: break
-
-        print(f'>>> replay factory: skipped {k + 1} samples')
 
         if done: return None
 
