@@ -14,10 +14,10 @@ from collections import deque
 
 import util_data
 import util_nn
-import reinforcement_learning as rl
+import reinforcement_learning
 
 
-class duffing_reward:
+class reward:
     def __init__(self, q, r, setpoint):
         self.q = np.atleast_2d(q)
         self.r = np.atleast_2d(r)
@@ -32,7 +32,7 @@ class duffing_reward:
         return -(state_cost + action_cost)
 
 
-class duffing_reward_adapter:
+class reward_adapter:
     def __init__(self, q, r, setpoint, device=None, dtype=torch.float32):
 
         self.q = torch.atleast_2d(torch.as_tensor(q, dtype=dtype, device=device))
@@ -60,7 +60,8 @@ def duffing_update(t, state, sim, u):
     return [dx1, dx2]
 
 
-class duffing(rl.environment):
+class environment(reinforcement_learning.environment):
+    """Implements a Duffing oscillator using numpy."""
 
     def __init__(
         self,
@@ -127,18 +128,21 @@ class duffing(rl.environment):
 
         return next_state, reward, done
 
+    def replay(self, ic, policy, obs_nsample=1, skip_nsample=0):
+        raise NotImplementedError()
+
     @property
     def reward_fn(self):
         return self.r_fn
 
 
-class duffing_adapter(rl.environment):
+class environment_adapter(reinforcement_learning.environment):
 
     def __init__(self, env):
         self.env = env
 
         reward_fn = env.reward_fn
-        self.r_fn = duffing_reward_adapter(reward_fn.q, reward_fn.r, reward_fn.setpoint)
+        self.r_fn = reward_adapter(reward_fn.q, reward_fn.r, reward_fn.setpoint)
 
     def reset(self, ic=torch.zeros(1,1,2)):
         ic = ic.detach().cpu().numpy()
@@ -156,9 +160,186 @@ class duffing_adapter(rl.environment):
 
         return next_state, reward, done
 
+    def replay(self, ic, policy, obs_nsample=1, skip_nsample=0):
+
+        # --! reset environment to begin replay from initial condition
+        s = self.reset(ic)
+
+        # --! done flag for sanity checks
+        done = False
+
+        # --! skip specified number of samples
+        for k in range(skip_nsample):
+
+            # --! compute action
+            #
+            # --! provided residual policy is available, add residual action to the base one
+            a = policy.base(s)
+            if policy.residual is not None:
+                a = a + torch.squeeze(policy.residual(s), 0)
+
+            s, reward, done = self.step(a)
+
+            if done: break
+
+        if done: return None
+
+        # --! make a window for recent observations and actions
+        #
+        # --! a deque allows to push new data in,
+        # --! which automatically pops out old data once deque's capacity is filled
+        sa_window = deque(maxlen=obs_nsample)
+
+        # --! fill initial window
+        for _ in range(obs_nsample):
+
+            # --! compute action
+            #
+            # --! provided residual policy is available, add residual action to the base one
+            a = policy.base(s)
+            if policy.residual is not None:
+                a = a + torch.squeeze(policy.residual(s), 0)
+
+            sa_window.append((s, a))
+            s, reward, done = self.step(a)
+
+            if done: break
+
+        # --! make an empty replay buffer
+        buf = replay()
+
+        # --! fill replay with observation windows, rewards, etc.
+        while not done:
+
+            # --! encode state at time t from a window of recent observations
+            state = buf.util.encode_obs(sa_window)
+
+            # --! based on observation at time t + 1, compute action at time t + 1
+            #
+            # --! provided residual policy is available, add residual action to the base one
+            a = policy.base(s)
+            if policy.residual is not None:
+                a = a + torch.squeeze(policy.residual(s), 0)
+
+            # --! update window with observation and action at time t + 1, and encode next state
+            sa_window.append((s, a))
+            next_state = buf.util.encode_obs(sa_window)
+
+            # --! replay buffer receives:
+            #
+            # --! state at time t
+            # --! reward at time t
+            # --! state at time t + 1
+            # --! done flag at time t
+            buf.add(
+                state,
+                reward,
+                next_state,
+                done
+            )
+
+            # --! make environment step to get next observations, rewards, etc.
+            s, reward, done = self.step(a)
+
+        return buf
+
     @property
     def reward_fn(self):
         return self.r_fn
+
+
+class replay(reinforcement_learning.replay):
+    def __init__(self, buffer=None):
+        super().__init__(buffer)
+        self._util = replay_util()
+
+    @property
+    def util(self):
+        return self._util
+
+
+class replay_util(reinforcement_learning.replay_util):
+
+    obs_ndim = 2
+    action_ndim = 1
+    mask_ndim = 1
+
+    def encode_obs(self, sa):
+
+        # --! unpack given deque into sa tuples, and then zip all s's together and all a's together
+        s, a = zip(*sa)
+
+        # --! concatenate zipped s tuples into torch tensor, do the same for a
+        s = torch.cat(s, dim=0)
+        a = torch.cat(a, dim=0)
+
+        # --! concatenate s, a and mask tensors and return result as a 3D tensor
+        return torch.unsqueeze(torch.cat([s, a, torch.ones_like(a)], dim=-1), 0)
+
+    def replay_obs(self, env, env_ic, policy, obs_nsample):
+        """Replays and encodes observation of length ``obs_nsamples`` starting from initial condition ``env_ic``.
+        It is expected that ``env_ic`` is a batch of initial conditions."""
+
+        # --! process a batch of initial conditions
+        return torch.cat([self._replay_obs_nonbatch(env, torch.unsqueeze(ic, 0), policy, obs_nsample) for ic in env_ic], dim=0)
+
+    def _replay_obs_nonbatch(self, env, env_ic, policy, obs_nsample):
+
+        # --! make a window for observations s and actions a
+        #
+        # --! a deque allows to push new data in,
+        # --! which automatically pops out old data once deque's capacity is filled
+        sa_window = deque(maxlen=obs_nsample)
+
+        # --! reset environment to begin replay from initial condition
+        s = env.reset(env_ic)
+
+        done = False
+        for _ in range(obs_nsample):
+
+            # --! compute action a from observation s
+            #
+            # --! provided residual policy is available, add residual action to the base one
+            a = policy.base(s)
+            if policy.residual is not None:
+                a = a + torch.squeeze(policy.residual(s), 0)
+
+            sa_window.append((s, a))
+            s, reward, done = env.step(a)
+
+            if done: break
+        if done: return None
+
+        return self.encode_obs(sa_window)
+
+    def get_s0(self, encoded_obs):
+        """Gets initial, i.e. first, observation s from encoded observation ``encoded_obs``."""
+        s, other = torch.split(encoded_obs, [self.obs_ndim, self.action_ndim + self.mask_ndim], dim=-1)
+        return s[:, :1]
+
+    def get_s(self, encoded_obs):
+        """Gets 'current', i.e. last, observation s from encoded observation ``encoded_obs``."""
+        s, other = torch.split(encoded_obs, [self.obs_ndim, self.action_ndim + self.mask_ndim], dim=-1)
+        return s[:, [-1]]
+
+    def get_a(self, encoded_obs):
+        """Gets 'current', i.e. last, action a from encoded observation ``encoded_obs``."""
+        s, a, mask = torch.split(encoded_obs, [self.obs_ndim, self.action_ndim, self.mask_ndim], dim=-1)
+        return a[:, [-1]]
+
+    def update_s(self, encoded_obs, s):
+
+        # --! make a dummy (zero) action
+        a = torch.zeros(s.shape[0], s.shape[1], 1)
+
+        # --! concatenate state-action pair and mask
+        sa = torch.cat([s, a, torch.ones_like(a)], dim=-1)
+
+        # --! shift in new state-action pair from the right
+        return torch.cat([encoded_obs[:, 1:], sa], dim=1)
+
+    def update_a(self, encoded_obs, a):
+        encoded_obs[:, -2:, [2]] = a
 
 
 class base_policy:
@@ -313,168 +494,7 @@ class dataset(util_data.dataset):
         return normalizer(timeseries, self.setpoint, self.state_ndim, self.action_ndim, self.mask_ndim)
 
 
-class replay_factory(rl.replay_factory):
-
-    state_ndim = 2
-    action_ndim = 1
-    mask_ndim = 1
-
-    def __init__(self):
-        pass
-
-    def create(self, env, env_ic, policy, back_nsample, skip_nsample):
-
-        # --! reset environment to begin replay from initial condition
-        s = env.reset(env_ic)
-
-        # --! done flag for sanity checks
-        done = False
-
-        print(f'>>> replay factory: skipping {skip_nsample} samples')
-
-        # --! skip specified number of samples
-        for k in range(skip_nsample):
-            a = policy.base(s)
-
-            # --! provided residual policy is available, add residual action to the base one
-            if policy.residual is not None:
-                a = a + torch.squeeze(policy.residual(s), 0)
-
-            s, reward, done = env.step(a)
-
-            if done: break
-
-        if done: return None
-
-        # --! make a window for recent states and actions
-        #
-        # --! a deque allows to push new data in,
-        # --! which automatically pops out old data once deque's capacity is filled
-        sa_window = deque(maxlen=back_nsample)
-
-        # --! fill the first window
-        for _ in range(back_nsample):
-            a = policy.base(s)
-
-            # --! provided residual policy is available, add residual action to the base one
-            if policy.residual is not None:
-                a = a + torch.squeeze(policy.residual(s), 0)
-
-            sa_window.append((s, a))
-            s, reward, done = env.step(a)
-
-            if done: break
-
-        # --! make an empty replay buffer
-        buf = rl.replay()
-
-        # --! fill replay with back windows, rewards, etc.
-        while not done:
-
-            # --! encode state at time t from a window of recent observations
-            state = self.encode_state(sa_window)
-
-            # --! based on observation at time t + 1, compute action at time t + 1
-            a = policy.base(s)
-
-            # --! provided residual policy is available, add residual action to the base one
-            if policy.residual is not None:
-                a = a + torch.squeeze(policy.residual(s), 0)
-
-            # --! update window with observation and action at time t + 1, and encode next state
-            sa_window.append((s, a))
-            next_state = self.encode_state(sa_window)
-
-            # --! replay buffer receives:
-            #
-            # --! state at time t
-            # --! reward at time t
-            # --! state at time t + 1
-            # --! done flag at time t
-            buf.add(
-                state,
-                reward,
-                next_state,
-                done
-            )
-
-            # --! make environment step to get next observations, rewards, etc.
-            s, reward, done = env.step(a)
-
-        return buf
-
-    def create_back(self, back_nsample, env, env_ic, policy):
-        return torch.cat([self._create_back(back_nsample, env, torch.unsqueeze(ic, 0), policy) for ic in env_ic], dim=0)
-
-    def _create_back(self, back_nsample, env, env_ic, policy):
-
-        # --! make a window for recent states and actions
-        #
-        # --! a deque allows to push new data in,
-        # --! which automatically pops out old data once deque's capacity is filled
-        sa_window = deque(maxlen=back_nsample)
-
-        # --! reset environment to begin replay from initial condition
-        s = env.reset(env_ic)
-
-        done = False
-
-        for _ in range(back_nsample):
-            a = policy.base(s)
-
-            # --! provided residual policy is available, add residual action to the base one
-            if policy.residual is not None:
-                a = a + torch.squeeze(policy.residual(s), 0)
-
-            sa_window.append((s, a))
-            s, reward, done = env.step(a)
-
-            if done: break
-
-        if done: return None
-
-        return self.encode_state(sa_window)
-
-    def encode_state(self, sa_window):
-
-        # --! unpack given deque into sa tuples, and then zip all s's together and all a's together
-        s, a = zip(*sa_window)
-
-        # --! concatenate zipped s tuples into torch tensor, do the same for a
-        s = torch.cat(s, dim=0)
-        a = torch.cat(a, dim=0)
-
-        # --! concatenate s, a and mask tensors and return result as a 3D tensor
-        return torch.unsqueeze(torch.cat([s, a, torch.ones_like(a)], dim=-1), 0)
-
-    def extract_first_s(self, back):
-        s, other = torch.split(back, [self.state_ndim, self.action_ndim + self.mask_ndim], dim=-1)
-        return s[:, :1]
-
-    def extract_current_s(self, state):
-        s, other = torch.split(state, [self.state_ndim, self.action_ndim + self.mask_ndim], dim=-1)
-        return s[:, [-1]]
-
-    def extract_current_a(self, state):
-        s, a, mask = torch.split(state, [self.state_ndim, self.action_ndim, self.mask_ndim], dim=-1)
-        return a[:, [-1]]
-
-    def update_current_a(self, state, a):
-        state[:, -2:, [2]] = a
-
-    def update_state(self, state, s):
-
-        # --! make a dummy (zero) action
-        a = torch.zeros(s.shape[0], s.shape[1], 1)
-
-        # --! concatenate state-action pair and mask
-        sa = torch.cat([s, a, torch.ones_like(a)], dim=-1)
-
-        # --! shift in new state-action pair from the right
-        return torch.cat([state[:, 1:], sa], dim=1)
-
-
-class dataset_factory(rl.dataset_factory):
+class dataset_factory(reinforcement_learning.dataset_factory):
 
     def __init__(self, setpoint):
         self.setpoint = setpoint

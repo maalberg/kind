@@ -23,66 +23,6 @@ environments = namedtuple('environments', 'nominal excursion')
 policies = namedtuple('policies', 'base residual')
 
 
-def advantage(model, policy, reward_fn, value_fn, factory, replay_data, env, horizon, gamma, back_reset_nsample, back_nsample):
-    """Computes advantage for reinforcement learning policy."""
-
-    lookback, reward, next_lookback, done = replay_data
-
-    # --! restrict any gradient flow while computing the value of the current state
-    with torch.no_grad():
-
-        # --! extract the current state
-        state = factory.extract_current_s(lookback)
-
-        # --! compute the current state value
-        current_value = value_fn(state)
-
-    # --! make a working copy of the current lookback to perform model rollouts
-    rollout = lookback.clone()
-    rollout_return = 0.0
-    rollout_nsample_max = back_reset_nsample
-
-    # --! perform model rollouts up to a spefified horizon - 1
-    for k in range(horizon):
-
-        if k and k % rollout_nsample_max == 0:
-            with torch.no_grad():
-                env_ic = factory.extract_first_s(rollout)
-                rollout = factory.create_back(back_nsample, env, env_ic, policies(policy.base, None))
-
-        state = factory.extract_current_s(rollout)
-
-        # --! compute action
-        delta_u = policy.residual(state)
-        u = policy.base(state) + delta_u
-
-        # --! update action in replay buffer with newly computed action
-        factory.update_current_a(rollout, u)
-
-        # --! calculate reward for nominal or excursion timeseries present in current batch
-        rollout_reward = reward_fn(state, u)
-
-        rollout_return += gamma**k * rollout_reward
-
-        # --! KIND predicts next state
-        model_o = model(rollout) # < gradients flow here
-
-        # --! having a prediction, take its forecast part
-        forecast = model_o.blend[:, back_nsample:] # todo: put this constant as a parameter
-
-        # --! take the first observation from the forecast
-        next_state = forecast[:, :1, :]
-
-        # --! shift/update lookback using next observation
-        rollout = factory.update_state(rollout, next_state)
-
-    # --! compute the terminal value
-    with torch.no_grad():
-        terminal_value = value_fn(next_state)
-
-    return rollout_return + gamma**horizon * terminal_value - current_value
-
-
 def create_args_parser():
     """Creates a command-line parser for policy iteration arguments."""
 
@@ -107,41 +47,35 @@ def create_args_parser():
 
 
 class policy_iteration:
-    """Implements a model-based policy iteration."""
+    """Implements policy iteration."""
 
-    def __init__(self, args, base_policy, reward_fn, normalizer):
+    def __init__(self, args):
 
+        if args.rollout_nsample < 2:
+            raise Exception('cannot train a policy when rollout horizon is less than 2 samples!')
         self.args = args
 
-        self.base_policy = base_policy
-        self.reward_fn = reward_fn
+    def evaluate_policy(self, value_fn, replay):
 
-        self.value_fn = value_fn(normalizer)
-        self.residual_policy = policy(normalizer)
-
-    def evaluate_policy(self, replay_factory, replay):
-        
-        value_fn = self.value_fn
+        value_fn.train()
         value_optim = torch.optim.Adam(value_fn.parameters(), lr=self.args.learning_rate_value, weight_decay=self.args.weight_decay_value)
 
         losses = []
-
-        value_fn.train()
 
         for epoch in range(self.args.nepoch_value):
             value_optim.zero_grad()
 
             # --! sample a random batch
-            lookback, reward, next_lookback, done = replay.random_batch(self.args.batch_size_value)
+            obs, reward, next_obs, done = replay.random_batch(self.args.batch_size_value)
 
             # --! target must be treated as a constant, so restrict any gradient flow during target calculation
             with torch.no_grad():
-                next_state = replay_factory.extract_current_s(next_lookback)
-                target = reward + self.args.gamma * (1.0 - done) * value_fn(next_state)
+                next_s = replay.util.get_s(next_obs)
+                target = reward + self.args.gamma * (1.0 - done) * value_fn(next_s)
 
-            # --! compute the value of the current state
-            state = replay_factory.extract_current_s(lookback)
-            value = value_fn(state)
+            # --! compute value of current s
+            s = replay.util.get_s(obs)
+            value = value_fn(s)
 
             # --! compute loss
             criterion = torch.nn.MSELoss()
@@ -153,34 +87,24 @@ class policy_iteration:
 
         return losses
 
-    def improve_policy(self, model, replay_factory, replay, env):
+    def improve_policy(self, model, policy, value_fn, env, replay):
 
-        value_fn = self.value_fn
-        residual_policy = self.residual_policy
-        base_policy = self.base_policy
-        policy_optim = torch.optim.Adam(residual_policy.parameters(), lr=self.args.learning_rate_policy, weight_decay=self.args.weight_decay_policy)
+        value_fn.eval()
+        policy.residual.train()
+
+        policy_optim = torch.optim.Adam(
+            policy.residual.parameters(), lr=self.args.learning_rate_policy, weight_decay=self.args.weight_decay_policy)
 
         losses = []
-
-        # --! freeze value function
-        value_fn.eval()
-
-        # --! train policy
-        residual_policy.train()
 
         for epoch in range(self.args.nepoch_policy):
             policy_optim.zero_grad()
 
-            # --! sample a random batch that may contain mixed - nominal and excursion - data
-            replay_data = replay.random_batch(self.args.batch_size_policy)
-
-            a = advantage(
+            a = self.compute_advantage(
                 model,
-                policies(base_policy, residual_policy),
-                self.reward_fn,
+                policy,
                 value_fn,
-                replay_factory, replay_data, env,
-                self.args.rollout_nsample, self.args.gamma, self.args.back_reset_nsample, model.args.back_nsample
+                env, replay, training=True
             )
 
             policy_loss = -a.mean()
@@ -188,15 +112,86 @@ class policy_iteration:
             policy_loss.backward()
             policy_optim.step()
 
-        residual_policy.eval()
+        policy.residual.eval()
         return losses
+
+    def compute_advantage(self, model, policy, value_fn, env, replay, training=False):
+
+        if training:
+            # --! sample a random batch of replay data
+            obs, reward, next_obs, done = replay.random_batch(self.args.batch_size_policy)
+        else:
+            obs, reward, next_obs, done = replay.to_data()
+
+        # --! restrict any gradient flow while computing the value of observation s
+        with torch.no_grad():
+            current_value = value_fn(replay.util.get_s(obs))
+
+        # --! initialize next observation s, so that in case H=1 and we do not compute
+        # --! rollout return we have a proper next s to compute terminal value
+        next_s = replay.util.get_s(next_obs)
+
+        # --! make a working copy of current observation to perform model rollouts
+        rollout = obs.clone()
+
+        rollout_return = 0.0
+        gamma = self.args.gamma
+        horizon = self.args.rollout_nsample
+        obs_nsample = model.args.back_nsample
+
+        # --! perform model rollouts up to a spefified horizon - 1
+        for k in range(horizon - 1):
+
+            if k and k % self.args.back_reset_nsample == 0:
+                with torch.no_grad():
+                    env_ic = replay.util.get_s0(rollout)
+                    rollout = replay.util.replay_obs(
+                        env, env_ic, policies(policy.base, None), obs_nsample) # TODO: residual policy is not always None!
+
+            # --! get current observation as s_{t+k}
+            s = replay.util.get_s(rollout)
+
+            # --! compute action
+            delta_a = policy.residual(s)
+            a = policy.base(s) + delta_a
+
+            # --! update action inside rollout window with newly computed action
+            replay.util.update_a(rollout, a)
+
+            # --! calculate reward for nominal or excursion timeseries present in current batch
+            rollout_reward = env.reward_fn(s, a)
+
+            rollout_return += gamma**k * rollout_reward
+
+            # --! model predicts next state
+            #
+            # --! gradients flow through model, but the model is supposed to be fixed
+            model_o = model(rollout)
+
+            # --! having a prediction, take its forecast part
+            fore = model_o.blend[:, model.args.back_nsample:]
+
+            # --! take first observation from forecast as s_{t+k+1}
+            next_s = fore[:, :1, :]
+
+            # --! shift/update rollout window using predicted next observation
+            rollout = replay.util.update_s(rollout, next_s)
+
+        # --! compute terminal value
+        #
+        # --! next s is either the one initialized at the start of the algorithm or the one
+        # --! updated during rollout return computation
+        with torch.no_grad():
+            terminal_value = value_fn(next_s)
+
+        return rollout_return + gamma**horizon * terminal_value - current_value
 
 
 class value_fn:
     """Wraps a learned value function to add the capability of internal state normalization."""
 
-    def __init__(self, state_normalizer):
-        self.state_normalizer = state_normalizer
+    def __init__(self, normalizer):
+        self.normalizer = normalizer
 
         value_fn_ni = 2
         value_fn_no = 1
@@ -209,7 +204,7 @@ class value_fn:
         """Normalizes the given ``state`` and computes the corresponding value."""
 
         # --! normalize the state, but do not save the normalization mask (see below)
-        state = self.state_normalizer.normalize(state)
+        state = self.normalizer.normalize(state)
 
         # --! get a value from the normalized state
         value = self.value_fn(state)
@@ -277,6 +272,11 @@ class environment(interface):
         """Applies ``action`` and returns the next observation, reward and termination flags."""
         pass
 
+    @abstractmethod
+    def replay(self, ic, policy, obs_nsample=1, skip_nsample=0):
+        """Replays this environment under given ``policy`` starting from initial condition ``ic``."""
+        pass
+
     @property
     @abstractmethod
     def reward_fn(self):
@@ -284,46 +284,45 @@ class environment(interface):
         pass
 
 
-class replay_factory(interface):
+class replay_util(interface):
 
     @abstractmethod
-    def create(self, env, env_ic, policy, state_nsample, skip_nsample):
+    def encode_obs(self, sa):
         pass
 
     @abstractmethod
-    def encode_state(self, sa_window):
+    def replay_obs(self, env, env_ic, policy, obs_nsample):
+        """Replays and encodes observation of length ``obs_nsamples`` starting from initial condition ``env_ic``."""
         pass
 
     @abstractmethod
-    def extract_current_s(self, state):
+    def get_s(self, encoded_obs):
+        """Gets 'current', i.e. last, observation s from encoded observation ``encoded_obs``."""
         pass
 
     @abstractmethod
-    def extract_current_a(self, state):
+    def get_s0(self, encoded_obs):
+        """Gets initial, i.e. first, observation s from encoded observation ``encoded_obs``."""
         pass
 
     @abstractmethod
-    def update_current_a(self, state, a):
+    def get_a(self, encoded_obs):
+        """Gets 'current', i.e. last, action a from encoded observation ``encoded_obs``."""
         pass
 
     @abstractmethod
-    def update_state(self, state, s):
+    def update_s(self, encoded_obs, s):
+        pass
+
+    @abstractmethod
+    def update_a(self, encoded_obs, a):
         pass
 
 
-class replay:
+class replay(interface):
 
     def __init__(self, buffer=None):
         self.buffer = buffer if buffer is not None else []
-
-    def __add__(self, other):
-        a = self.buffer
-        b = other.buffer
-
-        # --! interleave both buffers, such that the new buffer has elements: a[0], b[0], a[1], b[1], etc.
-        ab = list(chain.from_iterable(zip(a, b)))
-
-        return replay(buffer=ab)
 
     def add(self, state, reward, next_state, done):
 
@@ -350,10 +349,13 @@ class replay:
     def empty(self):
         return len(self.buffer)==0
 
+    def to_data(self):
+        return map(torch.cat, zip(*self.buffer))
+
     def to_file(self, filepath):
 
         # --! extract the last data element (s, a, mask) from every state (lookback)
-        state, reward, next_state, done = map(torch.cat, zip(*self.buffer))
+        state, reward, next_state, done = self.to_data()
         data = state[:, [-1]]
 
         # --! for purity, reshape this 3D data, such that there is one n-step trajectory with m features, i.e. [1, n, m]
@@ -361,6 +363,11 @@ class replay:
         print(f'saving data with a shape {data.shape} to a file')
 
         util_data.write_datafile(filepath, data.numpy())
+
+    @property
+    @abstractmethod
+    def util(self):
+        pass
 
 
 class dataset_factory(interface):
