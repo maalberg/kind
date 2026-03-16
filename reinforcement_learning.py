@@ -311,7 +311,7 @@ class replay_util(interface):
         pass
 
     @abstractmethod
-    def update_s(self, encoded_obs, s):
+    def shift_obs(self, encoded_obs, s):
         pass
 
     @abstractmethod

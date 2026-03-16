@@ -32,21 +32,14 @@ class dataset(interface):
     # --! minimum standard deviation to avoid division by zero-like deviation values
     min_std = torch.tensor(1e-3, dtype=torch.float32)
 
-    def __init__(self,
-                 file_dir, file_name, file_index, file_ext,
-                 data_nsample_nom, data_nsample_exc, data_split_size, batch_size, window_nsample, setpoint, load_normalized=True):
+    def __init__(self, args, setpoint, load_normalized=True, extract_windows=True):
 
-        self.file_dir = file_dir
-        self.file_name = file_name
-        self.file_index = file_index
-        self.file_ext = file_ext
-        self.data_nsample_nom = data_nsample_nom
-        self.data_nsample_exc = data_nsample_exc
-        self.split_size = data_split_size
-        self.batch_size = batch_size
-        self.window_nsample = window_nsample
-        self.setpoint = torch.unsqueeze(torch.unsqueeze(torch.tensor(setpoint), 0), 0) # <-- converting a 1d list into a 3d tensor
+        self.args = args
+        self.split_size = (args.data_train_size, args.data_test_size)
+        self.window_nsample = (args.back_nsample, args.fore_nsample)
+        self.setpoint = torch.unsqueeze(torch.unsqueeze(setpoint, 0), 0) # <-- converting a 1d tensor into a 3d tensor
         self.load_normalized = load_normalized
+        self.extract_windows = extract_windows
 
         # --! initialize a normalizer
         self.normalizer = self.init_normalization()
@@ -83,10 +76,13 @@ class dataset(interface):
         # --! this method is not supposed to be called for mixed data
         assert data_type in ['nom', 'exc']
 
-        data_nsample = self.data_nsample_nom if data_type=='nom' else self.data_nsample_exc
+        data_nsample = self.args.data_nsample_nom if data_type=='nom' else self.args.data_nsample_exc
 
         timeseries = self.read_timeseries(self.make_path(data_type), data_nsample)
-        window = self.extract_window(timeseries)
+        if self.extract_windows:
+            window = self.extract_window(timeseries)
+        else:
+            window = timeseries
 
         # --! split loaded windows into train, valid, test sets of data
         train_data, valid_test_data = train_test_split(window, train_size=self.split_size[0], shuffle=True)
@@ -116,7 +112,7 @@ class dataset(interface):
         dataset = torch.utils.data.TensorDataset(data_back, data_fore)
 
         # --! wrap the datasets into loaders
-        return torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle)
+        return torch.utils.data.DataLoader(dataset, batch_size=self.args.batch_size, shuffle=shuffle)
 
     @abstractmethod
     def make_path(self, data_type='nom'):
