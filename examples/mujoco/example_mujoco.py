@@ -165,3 +165,47 @@ class replay_util(reinforcement_learning.replay_util):
 
     def update_a(self, encoded_obs, a):
         encoded_obs[:, -2:, -(self.a_ndim + 1):] = a
+
+
+class baseline_dataset(torch.utils.data.Dataset):
+    def __init__(self, states, actions, next_states):
+        self.states = states
+        self.actions = actions
+        self.targets = next_states - states  # delta
+
+    def __len__(self):
+        return len(self.states)
+
+    def __getitem__(self, idx):
+        return self.states[idx], self.actions[idx], self.targets[idx]
+
+
+class global_dynamics(torch.nn.Module):
+    def __init__(self, obs_ndim=11, act_ndim=3, hidden_ndim=256):
+        super().__init__()
+
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(obs_ndim + act_ndim, hidden_ndim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_ndim, hidden_ndim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_ndim, obs_ndim)  # predicts delta observation
+        )
+
+    def forward(self, s, a):
+        """Returns predicted observation delta."""
+        x = torch.cat([s, a], dim=-1)
+        return self.net(x)
+
+
+def rollout_global(model, s0, act):
+    s = s0
+    traj = [s0]
+
+    for a in act:
+        delta = model(s.unsqueeze(0), a.unsqueeze(0)).squeeze(0)
+        s = s + delta
+        traj.append(s)
+
+    return torch.stack(traj)
+
