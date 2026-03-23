@@ -1,5 +1,10 @@
 import os
+import numpy as np
 import torch
+import torch.nn.functional as F
+import random
+
+from matplotlib import pyplot as plt
 
 import util_data
 import reinforcement_learning
@@ -181,7 +186,7 @@ class baseline_dataset(torch.utils.data.Dataset):
 
 
 class global_dynamics(torch.nn.Module):
-    def __init__(self, obs_ndim=11, act_ndim=3, hidden_ndim=256):
+    def __init__(self, obs_ndim, act_ndim, hidden_ndim=256):
         super().__init__()
 
         self.net = torch.nn.Sequential(
@@ -208,4 +213,234 @@ def rollout_global(model, s0, act):
         traj.append(s)
 
     return torch.stack(traj)
+
+
+class stochastic_dynamics(torch.nn.Module):
+    def __init__(self, obs_ndim, act_ndim, hidden_ndim=256):
+        super().__init__()
+
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(obs_ndim + act_ndim, hidden_ndim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_ndim, hidden_ndim),
+            torch.nn.ReLU(),
+        )
+
+        self.mean = torch.nn.Linear(hidden_ndim, obs_ndim)
+        self.logvar = torch.nn.Linear(hidden_ndim, obs_ndim)
+
+        # --! PETS trick: learned bounds
+        self.max_logvar = torch.nn.Parameter(torch.ones(obs_ndim) * 0.5)
+        self.min_logvar = torch.nn.Parameter(torch.ones(obs_ndim) * -10)
+
+    def forward(self, s, a):
+        x = torch.cat([s, a], dim=-1)
+        h = self.net(x)
+
+        mean = self.mean(h)
+        logvar = self.logvar(h)
+
+        # --! variance clipping
+        logvar = self.max_logvar - F.softplus(self.max_logvar - logvar)
+        logvar = self.min_logvar + F.softplus(logvar - self.min_logvar)
+
+        return mean, logvar
+
+
+class model_ensemble:
+    def __init__(self, nmodel, obs_ndim, act_ndim):
+        self.models = [
+            stochastic_dynamics(obs_ndim, act_ndim)
+            for _ in range(nmodel)
+        ]
+
+    def parameters(self):
+        params = []
+        for m in self.models:
+            params += list(m.parameters())
+        return params
+
+
+def compute_stochastic_loss(mean, logvar, target):
+    """Computes Gaussian negative log likelihood."""
+    inv_var = torch.exp(-logvar)
+    mse = (mean - target) ** 2
+    return torch.mean(mse * inv_var + logvar)
+
+
+def train_ensemble(ensemble, dataloaders, nepoch=50):
+
+    optimizers = [
+        torch.optim.Adam(m.parameters(), lr=1e-3, weight_decay=1e-8)
+        for m in ensemble.models
+    ]
+
+    for epoch in range(nepoch):
+        model_losses = [np.zeros(1) for _ in range(len(ensemble.models))]
+
+        for model, dataloader, opt, model_loss in zip(ensemble.models, dataloaders, optimizers, model_losses):
+            for s, a, target in dataloader:
+                opt.zero_grad()
+
+                mean, logvar = model(s, a)
+                loss = compute_stochastic_loss(mean, logvar, target)
+
+                loss.backward()
+                opt.step()
+
+                model_loss[0] += loss.item()
+
+        for model_loss in model_losses:
+            model_loss[0] /= len(ensemble.models)
+        if epoch % 10 == 0:
+            print(epoch, model_losses)
+
+
+def step_ensemble_deterministic(ensemble, s, a):
+    preds = []
+
+    for m in ensemble.models:
+        mean, _ = m(s, a)
+        preds.append(mean)
+
+    mean = torch.stack(preds).mean(0)
+    return s + mean
+
+
+def step_ensemble_stochastic(ensemble, s, a):
+
+    m = random.choice(ensemble.models)
+
+    mean, logvar = m(s, a)
+
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+
+    delta = mean + eps * std
+
+    return s + delta
+
+
+def rollout_ensemble(ensemble, s0, act, deterministic=True):
+    states = [s0]
+    s = s0
+
+    for a in act:
+        if deterministic:
+            s = step_ensemble_deterministic(ensemble, s, a)
+        else:
+            s = step_ensemble_stochastic(ensemble, s, a)
+
+        states.append(s)
+
+    return torch.stack(states)
+
+
+class expert_dynamics(torch.nn.Module):
+    def __init__(self, i_ndim, o_ndim, hidden_ndim=256):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(i_ndim, hidden_ndim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_ndim, hidden_ndim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_ndim, o_ndim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class model_moe(torch.nn.Module):
+    def __init__(self, obs_ndim, act_ndim, nexpert=3):
+        super().__init__()
+
+        self.i_ndim = obs_ndim + act_ndim
+        self.o_ndim = obs_ndim
+
+        self.experts = torch.nn.ModuleList([expert_dynamics(self.i_ndim, self.o_ndim) for _ in range(nexpert)])
+
+        # --! gating network
+        self.gate = torch.nn.Sequential(
+            torch.nn.Linear(self.i_ndim, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, nexpert)
+        )
+
+    def forward(self, s, a):
+        x = torch.cat([s, a], dim=-1)
+
+        logits = self.gate(x)
+        weights = F.softmax(logits, dim=-1)
+
+        outputs = torch.stack([expert(x) for expert in self.experts], dim=-1)
+        weights_expanded = weights.unsqueeze(-2)
+
+        out = (outputs * weights_expanded).sum(dim=-1)
+        return out, weights
+
+
+def train_moe(model, dataloader, nepoch=100, ent_coef=0.01):
+
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-8)
+    losses = []
+    for epoch in range(nepoch):
+        total_loss = 0.0
+        for s, a, target in dataloader:
+            opt.zero_grad()
+
+            pred, weights = model(s, a)
+
+            mse = F.mse_loss(pred, target)
+            entropy = -(weights * torch.log(weights + 1e-8)).sum(dim=-1)
+            entropy = entropy.mean()
+            loss = mse - ent_coef * entropy
+
+            loss.backward()
+            opt.step()
+
+            total_loss += loss.item()
+
+        if epoch % 20 == 0:
+            print(f"epoch {epoch}, loss: {total_loss / len(dataloader):.6f}")
+
+
+def rollout_moe(model, s0, act):
+    s = s0
+    traj = [s0]
+
+    for a in act:
+        delta, _ = model(s.unsqueeze(0), a.unsqueeze(0))
+        delta = delta.squeeze(0)
+        s = s + delta
+        traj.append(s)
+
+    return torch.stack(traj)
+
+
+def disp_rollout(obs_true, obs_rollout, obs_mean, obs_std, this_traj=0, disp_end=300):
+
+    with torch.no_grad():
+        plot_rollout_traj = torch.unsqueeze(obs_rollout, 0)
+        plot_rollout_traj = torch.cat([
+            denormalize_standard(
+                s, mean, std) for s, mean, std in zip(torch.split(plot_rollout_traj, 1, dim=-1), obs_mean, obs_std)], dim=-1)
+        plot_obs = torch.cat([
+            denormalize_standard(
+                s, mean, std) for s, mean, std in zip(torch.split(obs_true, 1, dim=-1), obs_mean, obs_std)], dim=-1)
+
+        plt.figure(figsize=(6,6))
+
+        plt.subplot(2,1,1)
+        plt.plot(plot_obs[this_traj, :disp_end, 0], label='z')
+        plt.plot(plot_rollout_traj[0, :disp_end, 0])
+        plt.legend()
+
+        plt.subplot(2,1,2)
+        plt.plot(plot_obs[this_traj, :disp_end, 9], label='dz')
+        plt.plot(plot_rollout_traj[0, :disp_end, 9])
+        plt.legend()
+
+        plt.show()
+
+    return plot_obs, plot_rollout_traj
 
