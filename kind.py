@@ -34,12 +34,14 @@ def create_args_parser():
     parser.add_argument('--file_name', type=str, required=True, help='file name with no extension (e.g., .csv) and no suffix (e.g., _stat)')
     parser.add_argument('--file_index', type=int, required=False, default=0, help='file index to define or separate learning stages')
     parser.add_argument('--file_ext', type=str, required=False, default='.csv', help='data file extension')
-    parser.add_argument('--data_nsample_all', type=int, required=True, help='number of samples in time series stored in all data')
+    parser.add_argument('--data_nsample_baseline', type=int, required=True, help='number of samples in time series stored in baseline data')
     parser.add_argument('--data_nsample_nom', type=int, required=True, help='number of samples in time series stored in nominal data')
     parser.add_argument('--data_nsample_exc', type=int, required=True, help='number of samples in time series stored in excursion data')
     parser.add_argument('--data_train_size', type=float, required=False, default=0.8, help='dataset part to include in training')
     parser.add_argument('--data_test_size', type=float, required=False, default=0.5, help='non-train part to include in test, rest is validation')
-    parser.add_argument('--feature_ndim', type=int, required=True, help='number of feature dimensions in data')
+    parser.add_argument('--obs_ndim', type=int, required=True, help='number of observation dimensions in data')
+    parser.add_argument('--act_ndim', type=int, required=True, help='number of action dimensions in data')
+    parser.add_argument('--mask_ndim', type=int, required=False, default=0, help='number of mask dimensions in data')
     parser.add_argument('--target_ndim', type=int, required=True, help='number of target dimensions in data')
 
     # --! KIND
@@ -567,7 +569,7 @@ class operator(torch.nn.Module, interface):
         super().__init__()
 
         # --! store mutual configuration inside this base class
-        self.nfeature = args.feature_ndim
+        self.nfeature = args.obs_ndim + args.act_ndim + args.mask_ndim
         self.ntarget = args.target_ndim
         self.back_nsample = args.back_nsample
         self.fore_nsample = args.fore_nsample

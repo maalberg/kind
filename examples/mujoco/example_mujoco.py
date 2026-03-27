@@ -11,10 +11,6 @@ import reinforcement_learning
 
 class dataset(util_data.dataset):
 
-    obs_ndim = 11
-    action_ndim = 3
-    mask_ndim = 0
-
     def __init__(self, args, setpoint, load_normalized=True, extract_windows=True):
         super().__init__(args, setpoint, load_normalized, extract_windows)
 
@@ -23,41 +19,39 @@ class dataset(util_data.dataset):
         return os.path.join(self.args.file_dir, filename)
 
     def extract_target(self, window):
-        return window[:, :, :self.obs_ndim]
+        return window[:, :, :self.args.obs_ndim]
 
     def init_normalization(self):
 
         # --! read data
-        timeseries = self.read_timeseries(self.make_path(data_type='all'), self.args.data_nsample_all)
+        timeseries = self.read_timeseries(self.make_path(data_type='baseline'), self.args.data_nsample_baseline)
 
         # --! create normalizer
-        return normalizer(timeseries, self.setpoint, self.obs_ndim, self.action_ndim, self.mask_ndim)
+        return normalizer(timeseries, self.setpoint, self.args.obs_ndim, self.args.act_ndim, self.args.mask_ndim)
 
 
 class normalizer(util_data.normalizer):
 
-    def __init__(self, timeseries, setpoint, obs_ndim, action_ndim, mask_ndim):
+    def __init__(self, timeseries, setpoint, obs_ndim, act_ndim, mask_ndim):
 
         # --! save data dimensions
         self.obs_ndim = obs_ndim
-        self.action_ndim = action_ndim
+        self.act_ndim = act_ndim
         self.mask_ndim = mask_ndim
 
         self.setpoint = setpoint
 
-        obs, action, _ = torch.split(timeseries, [self.obs_ndim, self.action_ndim, self.mask_ndim], dim=-1)
+        obs, _ = torch.split(timeseries, [self.obs_ndim, self.act_ndim + self.mask_ndim], dim=-1)
         obs = obs - self.setpoint
 
         # --! take statistics
         self.s_mean = [s.mean() for s in torch.split(obs, 1, dim=-1)]
         self.s_std = [torch.maximum(s.std(), self.std_min) for s in torch.split(obs, 1, dim=-1)]
-        self.a_mean = [a.mean() for a in torch.split(action, 1, dim=-1)]
-        self.a_std = [torch.maximum(a.std(), self.std_min) for a in torch.split(action, 1, dim=-1)]
 
     def normalize(self, timeseries):
 
         nfeature = timeseries.shape[-1]
-        assert nfeature==(self.obs_ndim + self.action_ndim + self.mask_ndim) or nfeature==self.state_ndim
+        assert nfeature==(self.obs_ndim + self.act_ndim + self.mask_ndim) or nfeature==self.obs_ndim
 
         if nfeature==self.obs_ndim:
             timeseries = self._normalize_state(timeseries)
@@ -75,30 +69,22 @@ class normalizer(util_data.normalizer):
             normalize_standard(s, mean, std) for s, mean, std in zip(torch.split(obs, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
 
     def _normalize_timeseries(self, timeseries):
-        assert timeseries.shape[-1]==(self.obs_ndim + self.action_ndim + self.mask_ndim)
+        assert timeseries.shape[-1]==(self.obs_ndim + self.act_ndim + self.mask_ndim)
 
-        obs, action, action_mask = torch.split(timeseries, [self.obs_ndim, self.action_ndim, self.mask_ndim], dim=-1)
-
+        obs, other = torch.split(timeseries, [self.obs_ndim, self.act_ndim + self.mask_ndim], dim=-1)
         obs = self._normalize_state(obs)
-        action = torch.cat([
-            normalize_standard(a, mean, std) for a, mean, std in zip(torch.split(action, 1, dim=-1), self.a_mean, self.a_std)], dim=-1)
 
-        return torch.cat([obs, action, action_mask], dim=-1)
+        return torch.cat([obs, other], dim=-1)
 
     def denormalize(self, timeseries):
 
         nfeature = timeseries.shape[-1]
-        assert nfeature==self.obs_ndim or nfeature==self.action_ndim
+        assert nfeature==self.obs_ndim
 
-        if nfeature==self.obs_ndim:
-            obs = torch.cat([
-                denormalize_standard(
-                    s, mean, std) for s, mean, std in zip(torch.split(timeseries, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
-            timeseries = obs + self.setpoint
-        else:
-            timeseries = torch.cat([
-                denormalize_standard(
-                    s, mean, std) for s, mean, std in zip(torch.split(timeseries, 1, dim=-1), self.a_mean, self.a_std)], dim=-1)
+        obs = torch.cat([
+            denormalize_standard(
+                s, mean, std) for s, mean, std in zip(torch.split(timeseries, 1, dim=-1), self.s_mean, self.s_std)], dim=-1)
+        timeseries = obs + self.setpoint
 
         return timeseries
 
@@ -415,6 +401,74 @@ def rollout_moe(model, s0, act):
         traj.append(s)
 
     return torch.stack(traj)
+
+
+def rollout_kind(model, traj_true, horizon=1, reset_nsample=20, offset=0):
+
+    args = model.args
+
+    # --! we use this dummy replay just to get access to replay utilities
+    dummy_replay = replay(s_ndim=args.obs_ndim, a_ndim=args.act_ndim)
+
+    next_ss = []
+    alphas = []
+    means_nom = []
+    means_exc = []
+    zetas_nom = []
+    zetas_exc = []
+
+    back = traj_true[:, offset:offset + args.back_nsample].clone()
+    true = traj_true[:, offset + args.back_nsample:offset + args.back_nsample + horizon]
+
+    with torch.no_grad():
+
+        for k in range(horizon):
+            if k % reset_nsample == 0:
+                t2 = offset + args.back_nsample + k
+                t1 = t2 - args.back_nsample
+                back = traj_true[:, t1:t2].clone()
+
+            s = dummy_replay.util.get_s(back)
+            t = offset + k + args.back_nsample - 1
+            a = traj_true[:, [t], -(dummy_replay.util.a_ndim + 1):]
+
+            dummy_replay.util.update_a(back, a)
+            model_o = model(back)
+
+            fore = model_o.blend[:, args.back_nsample:]
+            next_s = fore[:, :1]
+            back = dummy_replay.util.shift_obs(back, next_s)
+
+            alpha = model_o.alpha[:, args.back_nsample:]
+            alpha = alpha[:, :1]
+
+            zeta_nom = model_o.zeta_nom[:, args.back_nsample:]
+            zeta_nom = zeta_nom[:, :1]
+
+            zeta_exc = model_o.zeta_exc[:, args.back_nsample:]
+            zeta_exc = zeta_exc[:, :1]
+
+            mean_nom = model_o.mean_nom[:, args.back_nsample:]
+            mean_nom = mean_nom[:, :1]
+
+            mean_exc = model_o.mean_exc[:, args.back_nsample:]
+            mean_exc = mean_exc[:, :1]
+
+            next_ss.append(next_s)
+            alphas.append(alpha)
+            zetas_nom.append(zeta_nom)
+            zetas_exc.append(zeta_exc)
+            means_nom.append(mean_nom)
+            means_exc.append(mean_exc)
+
+        next_ss = torch.cat(next_ss, dim=1)
+        alphas = torch.cat(alphas, dim=1)
+        zetas_nom = torch.cat(zetas_nom, dim=1)
+        zetas_exc = torch.cat(zetas_exc, dim=1)
+        means_nom = torch.cat(means_nom, dim=1)
+        means_exc = torch.cat(means_exc, dim=1)
+
+    return true, next_ss, alphas, zetas_nom, zetas_exc, means_nom, means_exc
 
 
 def disp_rollout(obs_true, obs_rollout, obs_mean, obs_std, this_traj=0, disp_end=300):
