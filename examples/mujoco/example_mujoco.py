@@ -189,11 +189,13 @@ class global_dynamics(torch.nn.Module):
         return self.net(x)
 
 
-def rollout_global(model, s0, act):
+def rollout_global(model, s0, obs, act, reset_nsample=1_000):
     s = s0
     traj = [s0]
 
-    for a in act:
+    for j, a in enumerate(act):
+        if j % reset_nsample == 0:
+            s = obs[j]
         delta = model(s.unsqueeze(0), a.unsqueeze(0)).squeeze(0)
         s = s + delta
         traj.append(s)
@@ -307,11 +309,13 @@ def step_ensemble_stochastic(ensemble, s, a):
     return s + delta
 
 
-def rollout_ensemble(ensemble, s0, act, deterministic=True):
+def rollout_ensemble(ensemble, s0, obs, act, deterministic=True, reanchor_nsample=1_000):
     states = [s0]
     s = s0
 
-    for a in act:
+    for j, a in enumerate(act):
+        if j % reanchor_nsample == 0:
+            s = obs[j]
         if deterministic:
             s = step_ensemble_deterministic(ensemble, s, a)
         else:
@@ -390,11 +394,13 @@ def train_moe(model, dataloader, nepoch=100, ent_coef=0.01):
             print(f"epoch {epoch}, loss: {total_loss / len(dataloader):.6f}")
 
 
-def rollout_moe(model, s0, act):
+def rollout_moe(model, s0, obs, act, reanchor_nsample=1_000):
     s = s0
     traj = [s0]
 
-    for a in act:
+    for j, a in enumerate(act):
+        if j % reanchor_nsample == 0:
+            s = obs[j]
         delta, _ = model(s.unsqueeze(0), a.unsqueeze(0))
         delta = delta.squeeze(0)
         s = s + delta
