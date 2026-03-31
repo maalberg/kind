@@ -189,6 +189,27 @@ class global_dynamics(torch.nn.Module):
         return self.net(x)
 
 
+def train_global(model, dataloader, nepoch=1_000):
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = torch.nn.MSELoss()
+
+    for epoch in range(nepoch):
+        total_loss = 0.0
+
+        for s, a, s_delta in dataloader:
+            pred = model(s, a)
+            loss = loss_fn(pred, s_delta)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        if epoch % 20 == 0:
+            print(f"epoch {epoch}, loss: {total_loss / len(dataloader):.6f}")
+
+
 def rollout_global(model, s0, obs, act, reset_nsample=1_000):
     s = s0
     traj = [s0]
@@ -247,6 +268,10 @@ class model_ensemble:
         for m in self.models:
             params += list(m.parameters())
         return params
+
+    def eval(self):
+        for m in self.models:
+            m.eval()
 
 
 def compute_stochastic_loss(mean, logvar, target):
