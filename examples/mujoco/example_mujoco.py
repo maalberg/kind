@@ -518,6 +518,7 @@ def disp_rollout(obs_true, obs_rollout, obs_mean, obs_std, this_traj=0, disp_end
         plt.subplot(2,1,1)
         plt.plot(plot_obs[this_traj, :disp_end, 0], label='z')
         plt.plot(plot_rollout_traj[0, :disp_end, 0])
+        plt.ylim((-1,2))
         plt.legend()
 
         plt.subplot(2,1,2)
