@@ -3,6 +3,7 @@
 # --!--------------------------------------------------------------!
 
 import torch
+import random
 import numpy as np
 
 class early_stopping:
@@ -159,6 +160,7 @@ def cumprod_mat(mat_array):
 
     return torch.stack(cumprod, dim=1)
 
+
 def make_feat(ni=1, no=1, nneuron=32, nlayer=2):
     """ Makes a feature list for a fully-connected neural network.
     Arguments ``ni``, ``no``, ``nneuron`` and ``nlayer`` denote the number of
@@ -168,3 +170,30 @@ def make_feat(ni=1, no=1, nneuron=32, nlayer=2):
     hidden = [nneuron for _ in range(nlayer)]
 
     return ni + hidden + no
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def train_test_split(X, y, test_size=0.2, shuffle=True, seed=None):
+    assert len(X) == len(y), "X and y must have the same length"
+
+    n = len(X)
+    indices = np.arange(n)
+
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+
+    split = int(n * (1 - test_size))
+
+    train_idx = indices[:split]
+    test_idx = indices[split:]
+
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    return X_train, X_test, y_train, y_test

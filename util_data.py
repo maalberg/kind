@@ -10,7 +10,7 @@ import torch
 import numpy as np
 import pandas as pd
 
-#from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split
 
 
 class normalizer(interface):
@@ -91,6 +91,13 @@ class dataset(interface):
         return train_data, valid_data, test_data
 
     def _mix_data(self, data_nom, data_exc):
+
+        if data_nom.shape[0] > data_exc.shape[0]:
+            k = int(np.ceil(data_nom.shape[0] / data_exc.shape[0]))
+            data_exc = torch.tile(data_exc, (k, 1, 1))
+        elif data_exc.shape[0] > data_nom.shape[0]:
+            k = np.ceil(data_exc.shape[0] / data_nom.shape[0])
+            data_nom = torch.tile(data_nom, (k, 1, 1))
 
         # --! ensure both data have the same size in the first dimension
         ndata = data_nom.shape[0] if data_nom.shape[0] < data_exc.shape[0] else data_exc.shape[0]
@@ -190,7 +197,7 @@ def conv_str2ints(string):
     return [int(item) for item in string.split(',')]
 
 
-def read_datafile(name: str, datachunk_len) -> torch.Tensor:
+def read_datafile(name: str, datachunk_len, delim=',') -> torch.Tensor:
     """
     Reads data from a file called ``name`` and formats the data based on ``datachunk_len``,
     i.e. the length of one contiguous chunk of data. The file data are expected to be
@@ -202,7 +209,7 @@ def read_datafile(name: str, datachunk_len) -> torch.Tensor:
     # --! note that we force numpy loadtxt to return at least a two-dimensional array
     # --! by setting ndmin=2
     data = torch.tensor(
-        np.loadtxt(name + '.csv', delimiter=',', dtype=np.float32, ndmin=2))
+        np.loadtxt(name + '.csv', delimiter=delim, dtype=np.float32, ndmin=2))
     datachunks_n = int(data.shape[0] / datachunk_len)
 
     # return read data in channels-last format

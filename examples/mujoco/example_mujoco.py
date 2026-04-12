@@ -15,7 +15,7 @@ class dataset(util_data.dataset):
         super().__init__(args, setpoint, load_normalized, extract_windows)
 
     def make_path(self, data_type='nom'):
-        filename = f'{self.args.file_name}_{data_type}_{self.args.file_index}{self.args.file_ext}'
+        filename = f'{data_type}{self.args.file_ext}'
         return os.path.join(self.args.file_dir, filename)
 
     def extract_target(self, window):
