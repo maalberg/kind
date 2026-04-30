@@ -172,7 +172,7 @@ class baseline_dataset(torch.utils.data.Dataset):
 
 
 class global_dynamics(torch.nn.Module):
-    def __init__(self, obs_ndim, act_ndim, hidden_ndim=256):
+    def __init__(self, obs_ndim, act_ndim, hidden_ndim=512):
         super().__init__()
 
         self.net = torch.nn.Sequential(
@@ -225,7 +225,7 @@ def rollout_global(model, s0, obs, act, reset_nsample=1_000):
 
 
 class stochastic_dynamics(torch.nn.Module):
-    def __init__(self, obs_ndim, act_ndim, hidden_ndim=256):
+    def __init__(self, obs_ndim, act_ndim, hidden_ndim=512):
         super().__init__()
 
         self.net = torch.nn.Sequential(
@@ -352,7 +352,7 @@ def rollout_ensemble(ensemble, s0, obs, act, deterministic=True, reanchor_nsampl
 
 
 class expert_dynamics(torch.nn.Module):
-    def __init__(self, i_ndim, o_ndim, hidden_ndim=256):
+    def __init__(self, i_ndim, o_ndim, hidden_ndim=512):
         super().__init__()
         self.net = torch.nn.Sequential(
             torch.nn.Linear(i_ndim, hidden_ndim),
@@ -365,14 +365,22 @@ class expert_dynamics(torch.nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
 class model_moe(torch.nn.Module):
-    def __init__(self, obs_ndim, act_ndim, nexpert=3):
+    def __init__(self, obs_ndim, act_ndim, nexpert=3, smoothing=0.9, gumbel=1.0):
         super().__init__()
 
         self.i_ndim = obs_ndim + act_ndim
         self.o_ndim = obs_ndim
+        self.nexpert = nexpert
+        self.smoothing = smoothing
+        self.gumbel = gumbel
 
-        self.experts = torch.nn.ModuleList([expert_dynamics(self.i_ndim, self.o_ndim) for _ in range(nexpert)])
+        # --! experts
+        self.experts = torch.nn.ModuleList([
+            expert_dynamics(self.i_ndim, self.o_ndim)
+            for _ in range(nexpert)
+        ])
 
         # --! gating network
         self.gate = torch.nn.Sequential(
@@ -381,16 +389,39 @@ class model_moe(torch.nn.Module):
             torch.nn.Linear(128, nexpert)
         )
 
+        # --! buffer for temporal smoothing (NOT part of gradient graph)
+        self.register_buffer("prev_logits", None)
+
+    def reset(self):
+        """Call at start of each rollout/sequence"""
+        self.prev_logits = None
+
     def forward(self, s, a):
         x = torch.cat([s, a], dim=-1)
 
         logits = self.gate(x)
-        weights = F.softmax(logits, dim=-1)
 
+        # --! temporal smoothing (safe)
+        if self.prev_logits is not None and self.smoothing is not None:
+            logits = self.smoothing * self.prev_logits + (1 - self.smoothing) * logits
+
+        # --! store detached version (IMPORTANT)
+        with torch.no_grad():
+            self.prev_logits = logits.detach()
+
+        # --! gating
+        if self.gumbel is not None:
+            weights = F.gumbel_softmax(logits, tau=self.gumbel, hard=True)
+        else:
+            weights = F.softmax(logits, dim=-1)
+
+        # --! expert outputs
         outputs = torch.stack([expert(x) for expert in self.experts], dim=-1)
-        weights_expanded = weights.unsqueeze(-2)
 
+        # --! weighted combination
+        weights_expanded = weights.unsqueeze(-2)
         out = (outputs * weights_expanded).sum(dim=-1)
+
         return out, weights
 
 
