@@ -1,4 +1,4 @@
-# --! example: Duffing oscillator --!
+# --! example: function and class definitions for Duffing oscillator --!
 
 import numpy as np
 import scipy as sp
@@ -15,49 +15,6 @@ from collections import deque
 import util_data
 import util_nn
 import reinforcement_learning
-
-
-class reward:
-    def __init__(self, q, r, setpoint):
-        self.q = np.atleast_2d(q)
-        self.r = np.atleast_2d(r)
-        self.setpoint = np.atleast_2d(setpoint)
-
-    def __call__(self, state, action):
-        x_err = state - self.setpoint
-
-        state_cost = x_err @ self.q @ x_err.T
-        action_cost = action @ self.r @ action.T
-
-        return -(state_cost + action_cost)
-
-
-class reward_adapter:
-    def __init__(self, q, r, setpoint, device=None, dtype=torch.float32):
-
-        self.q = torch.atleast_2d(torch.as_tensor(q, dtype=dtype, device=device))
-        self.r = torch.atleast_2d(torch.as_tensor(r, dtype=dtype, device=device))
-        self.setpoint = torch.atleast_2d(torch.as_tensor(setpoint, dtype=dtype, device=device))
-
-    def __call__(self, state, action):
-
-        state = torch.atleast_2d(state)
-        action = torch.atleast_2d(action)
-
-        x_err = state - self.setpoint
-
-        state_cost = x_err @ self.q @ x_err.transpose(-1, -2)
-        action_cost = action @ self.r @ action.transpose(-1, -2)
-
-        return -(state_cost + action_cost)
-
-
-def duffing_update(t, state, sim, u):
-
-    x1, x2 = state
-    dx1 = x2
-    dx2 = -sim.delta * x2 - sim.alpha * x1 - sim.beta * x1**3 + u + sim.gamma * np.cos(sim.omega * t)
-    return [dx1, dx2]
 
 
 class environment(reinforcement_learning.environment):
@@ -249,9 +206,9 @@ class environment_adapter(reinforcement_learning.environment):
 
 
 class replay(reinforcement_learning.replay):
-    def __init__(self, buffer=None):
+    def __init__(self, s_ndim=2, a_ndim=1, buffer=None):
         super().__init__(buffer)
-        self._util = replay_util()
+        self._util = replay_util(s_ndim, a_ndim)
 
     @property
     def util(self):
@@ -260,9 +217,9 @@ class replay(reinforcement_learning.replay):
 
 class replay_util(reinforcement_learning.replay_util):
 
-    obs_ndim = 2
-    action_ndim = 1
-    mask_ndim = 1
+    def __init__(self, s_ndim, a_ndim):
+        self.s_ndim = s_ndim
+        self.a_ndim = a_ndim
 
     def encode_obs(self, sa):
 
@@ -273,17 +230,19 @@ class replay_util(reinforcement_learning.replay_util):
         s = torch.cat(s, dim=0)
         a = torch.cat(a, dim=0)
 
-        # --! concatenate s, a and mask tensors and return result as a 3D tensor
-        return torch.unsqueeze(torch.cat([s, a, torch.ones_like(a)], dim=-1), 0)
+        # --! concatenate s, a tensors and return result as a 3D tensor
+        return torch.unsqueeze(torch.cat([s, a], dim=-1), 0)
 
     def replay_obs(self, env, env_ic, policy, obs_nsample):
-        """Replays and encodes observation of length ``obs_nsamples`` starting from initial condition ``env_ic``.
+        """Replays and encodes observation of length ``obs_nsample`` starting from initial condition ``env_ic``.
         It is expected that ``env_ic`` is a batch of initial conditions."""
 
         # --! process a batch of initial conditions
         return torch.cat([self._replay_obs_nonbatch(env, torch.unsqueeze(ic, 0), policy, obs_nsample) for ic in env_ic], dim=0)
 
     def _replay_obs_nonbatch(self, env, env_ic, policy, obs_nsample):
+        """Replays and encodes observation of length ``obs_length`` starting from initial condition ``env_ic``.
+        This method works with non-batch version of ``env_ic``."""
 
         # --! make a window for observations s and actions a
         #
@@ -314,32 +273,75 @@ class replay_util(reinforcement_learning.replay_util):
 
     def get_s0(self, encoded_obs):
         """Gets initial, i.e. first, observation s from encoded observation ``encoded_obs``."""
-        s, other = torch.split(encoded_obs, [self.obs_ndim, self.action_ndim + self.mask_ndim], dim=-1)
+        s, other = torch.split(encoded_obs, [self.s_ndim, self.a_ndim], dim=-1)
         return s[:, :1]
 
     def get_s(self, encoded_obs):
         """Gets 'current', i.e. last, observation s from encoded observation ``encoded_obs``."""
-        s, other = torch.split(encoded_obs, [self.obs_ndim, self.action_ndim + self.mask_ndim], dim=-1)
+        s, other = torch.split(encoded_obs, [self.s_ndim, self.a_ndim], dim=-1)
         return s[:, [-1]]
 
     def get_a(self, encoded_obs):
         """Gets 'current', i.e. last, action a from encoded observation ``encoded_obs``."""
-        s, a, mask = torch.split(encoded_obs, [self.obs_ndim, self.action_ndim, self.mask_ndim], dim=-1)
+        s, a = torch.split(encoded_obs, [self.s_ndim, self.a_ndim], dim=-1)
         return a[:, [-1]]
 
-    def update_s(self, encoded_obs, s):
+    def shift_obs(self, encoded_obs, s):
 
         # --! make a dummy (zero) action
         a = torch.zeros(s.shape[0], s.shape[1], 1)
 
-        # --! concatenate state-action pair and mask
-        sa = torch.cat([s, a, torch.ones_like(a)], dim=-1)
+        # --! concatenate state-action pair
+        sa = torch.cat([s, a], dim=-1)
 
         # --! shift in new state-action pair from the right
         return torch.cat([encoded_obs[:, 1:], sa], dim=1)
 
     def update_a(self, encoded_obs, a):
         encoded_obs[:, -2:, [2]] = a
+
+
+class reward:
+    def __init__(self, q, r, setpoint):
+        self.q = np.atleast_2d(q)
+        self.r = np.atleast_2d(r)
+        self.setpoint = np.atleast_2d(setpoint)
+
+    def __call__(self, state, action):
+        x_err = state - self.setpoint
+
+        state_cost = x_err @ self.q @ x_err.T
+        action_cost = action @ self.r @ action.T
+
+        return -(state_cost + action_cost)
+
+
+class reward_adapter:
+    def __init__(self, q, r, setpoint, device=None, dtype=torch.float32):
+
+        self.q = torch.atleast_2d(torch.as_tensor(q, dtype=dtype, device=device))
+        self.r = torch.atleast_2d(torch.as_tensor(r, dtype=dtype, device=device))
+        self.setpoint = torch.atleast_2d(torch.as_tensor(setpoint, dtype=dtype, device=device))
+
+    def __call__(self, state, action):
+
+        state = torch.atleast_2d(state)
+        action = torch.atleast_2d(action)
+
+        x_err = state - self.setpoint
+
+        state_cost = x_err @ self.q @ x_err.transpose(-1, -2)
+        action_cost = action @ self.r @ action.transpose(-1, -2)
+
+        return -(state_cost + action_cost)
+
+
+def duffing_update(t, state, sim, u):
+
+    x1, x2 = state
+    dx1 = x2
+    dx2 = -sim.delta * x2 - sim.alpha * x1 - sim.beta * x1**3 + u + sim.gamma * np.cos(sim.omega * t)
+    return [dx1, dx2]
 
 
 class base_policy:
@@ -465,33 +467,23 @@ class normalizer(util_data.normalizer):
 
 class dataset(util_data.dataset):
 
-    state_ndim = 2
-    action_ndim = 1
-    mask_ndim = 1
-
-    def __init__(self,
-                 file_dir, file_name, file_index, file_ext,
-                 data_nsample_nom, data_nsample_exc,
-                 data_split_size,
-                 batch_size, window_nsample, setpoint, load_normalized=True):
-        super().__init__(file_dir, file_name, file_index, file_ext,
-                         data_nsample_nom, data_nsample_exc, data_split_size,
-                         batch_size, window_nsample, setpoint, load_normalized)
+    def __init__(self, args, setpoint, load_normalized=True, extract_windows=True):
+        super().__init__(args, setpoint, load_normalized, extract_windows)
 
     def make_path(self, data_type='nom'):
-        filename = f'{self.file_name}_{data_type}_{self.file_index}{self.file_ext}'
-        return os.path.join(self.file_dir, filename)
+        filename = f'{data_type}{self.args.file_ext}'
+        return os.path.join(self.args.file_dir, filename)
 
     def extract_target(self, window):
-        """Extracts the first two feature dimensions: position and velocity."""
-        return window[:, :, :self.state_ndim]
+        return window[:, :, :self.args.obs_ndim]
 
     def init_normalization(self):
 
         # --! read data
-        timeseries = self.read_timeseries(self.make_path(data_type='all'), 619)
+        timeseries = self.read_timeseries(self.make_path(data_type='baseline'), self.args.data_nsample_baseline)
 
-        return normalizer(timeseries, self.setpoint, self.state_ndim, self.action_ndim, self.mask_ndim)
+        # --! create normalizer
+        return normalizer(timeseries, self.setpoint, self.args.obs_ndim, self.args.act_ndim, self.args.mask_ndim)
 
 
 class dataset_factory(reinforcement_learning.dataset_factory):

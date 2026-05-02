@@ -96,7 +96,7 @@ class dataset(interface):
             k = int(np.ceil(data_nom.shape[0] / data_exc.shape[0]))
             data_exc = torch.tile(data_exc, (k, 1, 1))
         elif data_exc.shape[0] > data_nom.shape[0]:
-            k = np.ceil(data_exc.shape[0] / data_nom.shape[0])
+            k = int(np.ceil(data_exc.shape[0] / data_nom.shape[0]))
             data_nom = torch.tile(data_nom, (k, 1, 1))
 
         # --! ensure both data have the same size in the first dimension

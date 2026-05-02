@@ -175,7 +175,7 @@ class policy_iteration:
             next_s = fore[:, :1, :]
 
             # --! shift/update rollout window using predicted next observation
-            rollout = replay.util.update_s(rollout, next_s)
+            rollout = replay.util.shift_obs(rollout, next_s)
 
         # --! compute terminal value
         #
