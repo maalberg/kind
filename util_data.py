@@ -10,7 +10,20 @@ import torch
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import train_test_split
+
+def train_test_split(data, train_size=0.8, shuffle=True):
+    n = data.shape[0]
+    n_train = int(train_size * n)
+
+    if shuffle:
+        indices = torch.randperm(n)
+    else:
+        indices = torch.arange(n)
+
+    train_idx = indices[:n_train]
+    test_idx = indices[n_train:]
+
+    return data[train_idx], data[test_idx]
 
 
 class normalizer(interface):
@@ -86,7 +99,7 @@ class dataset(interface):
 
         # --! split loaded windows into train, valid, test sets of data
         train_data, valid_test_data = train_test_split(window, train_size=self.split_size[0], shuffle=True)
-        valid_data, test_data = train_test_split(valid_test_data, test_size=self.split_size[1], shuffle=True)
+        valid_data, test_data = train_test_split(valid_test_data, train_size=1-self.split_size[1], shuffle=True)
 
         return train_data, valid_data, test_data
 
@@ -167,7 +180,7 @@ class dataset(interface):
 
         # --! read a csv-file with no header
         dataframe = pd.read_csv(data_path, header=None, dtype=np.float32)
-        return torch.from_numpy(dataframe.to_numpy())
+        return torch.from_numpy(dataframe.to_numpy().copy())
 
 
 class minmax_scaler:
