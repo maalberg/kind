@@ -28,6 +28,28 @@ More specifically, the repository includes:
 
 Jupyter notebooks are provided in an 'executed' state, so one could start browsing them immediately.
 
+## Installation
+
+1. Clone ```kind```
+
+```
+cd kind
+git clone https://github.com/maalberg/kind.git
+```
+
+2. Create a mamba environment for a specific example, e.g. MuJoCo
+
+```
+mamba env create --file environment/kind-mujoco.yml
+mamba activate kind-mujoco
+```
+
+3. Launch Jupyter notebook
+
+```
+jupyter notebook
+```
+
 ## Results
 
 Preliminary results on MuJoCo tasks (Hopper, Walker2d) indicate that KIND can achieve:
@@ -41,7 +63,7 @@ Preliminary results on MuJoCo tasks (Hopper, Walker2d) indicate that KIND can ac
   <figcaption>
   KIND rollout behavior. Predictions closely track ground truth over long horizons, with MSE remaining nearly constant across rollout steps (median with 10–90% quantiles).
   </figcaption>
-</figure>
+</figure><br>
 
 In contrast, standard baselines (global models, ensembles, mixture-of-experts) often exhibit:
 
@@ -54,7 +76,7 @@ In contrast, standard baselines (global models, ensembles, mixture-of-experts) o
   <figcaption>
   Ensemble rollout behavior. While some seeds yield stable trajectories, aggregated results show increasing error and significant variability across runs.
   </figcaption>
-</figure>
+</figure><br>
 
 These results highlight the gap between one-step accuracy and long-horizon stability, and suggest the importance of structural constraints in learned dynamics.
 
