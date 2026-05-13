@@ -85,12 +85,13 @@ These results highlight the gap between one-step accuracy and long-horizon stabi
 If you use this code, please cite:
 
 ```
-@inproceedings{Maalberg_2026_kind,
-  title        = {{KIND}: A {K}alman-inspired Adaptive Estimator for {SRF} Cavity Detuning},
+@inproceedings{Maalberg_2026_kind_kalman,
+  title        = {{KIND}: A {K}alman-Inspired Adaptive Estimator for {SRF} Cavity Detuning},
   author       = {Maalberg, Andrei and Neumann, Axel and Echevarria, Pablo and Ushakov, Andriy and Knobloch, Jens},
   booktitle    = {Proc. 23rd IFAC World Congr.},
-  note         = {accepted},
   year         = {2026},
+  note         = {Accepted for publication. Preprint available at arXiv:2605.11957},
+  url          = {https://arxiv.org/abs/2605.11957},
 }
 ```
 
