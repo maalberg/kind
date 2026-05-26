@@ -1,4 +1,4 @@
-# --! utility functions for cavity resonance control --!
+# --! care: methods for cavity resonance control --!
 
 
 import numpy as np

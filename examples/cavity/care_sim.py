@@ -1,4 +1,4 @@
-# --! utility functions for cavity resonance simulation --!
+# --! care: methods to simulate cavity resonance --!
 
 
 import numpy as np
