@@ -5,6 +5,7 @@ from abc import abstractmethod
 from abc import ABC as interface
 
 import argparse
+import json
 import numpy as np
 
 import care_control
@@ -31,13 +32,10 @@ def create_args_parser():
     p.add_argument('-qm', '--mech_q', type=lambda s: [float(q) for q in s.split(',')], required=True, help='list, qualify factors of mech modes')
     p.add_argument('-km', '--mech_k', type=lambda s: [float(k) for k in s.split(',')], required=True, help='list, K values, rad/s/(MV)^2')
 
-    p.add_argument('-ib', '--beam_i', type=float, required=True, help='float, average beam current, A')
-    p.add_argument('-nb', '--beam_n', type=int, required=True, help='int, number of time steps during beam, sample')
-
-    p.add_argument('-nf', '--fill_n', type=int, required=True, help='int, number of time steps during cavity filling, sample')
+    p.add_argument('-ib', '--beam_i', type=float, required=False, default=0.0, help='float, average beam current, A')
 
     p.add_argument('-ts', '--step_t', type=float, required=True, help='float, time step duration, s')
-    p.add_argument('-ns', '--step_n', type=int, required=True, help='int, number of time steps in total, sample')
+    p.add_argument('-es', '--step_e', type=json.loads, required=True, help='dictionary, events at particular time steps')
 
     return p
 
@@ -45,8 +43,16 @@ def create_args_parser():
 class care(interface):
 
     @abstractmethod
-    def reset(self):
-        """Resets this cavity resonance entity."""
+    def reset(self, *args):
+        """
+        Resets this cavity resonance entity.
+        
+        Parameters:
+            args: tuple, concrete parameters depend on a particular entity
+            
+        Returns:
+            result: concrete result depends on a particular entity
+        """
         pass
 
     @abstractmethod
@@ -67,47 +73,67 @@ class simulator(care):
 
     def __init__(self, args):
 
-        self.src = source(args)
-        self.amp = amplifier(args)
-        self.cav = cavity(args)
+        self.src  = source(args)
+        self.amp  = amplifier(args)
+        self.cav  = cavity(args)
+        self.beam = beam(args)
 
-    def reset(self):
+        self.timing = timing(args)
+        self.timing.register_observer(self.src)
+        self.timing.register_observer(self.beam)
+
+    def reset(self, *args):
+
+        # --! extract initial condition with a default value option if no argument is provided
+        ic = args[0] if args else 0.0
+
+        self.timing.reset()
         self.src.reset()
         self.amp.reset()
-        self.cav.reset()
+        self.cav.reset(ic)
+        self.beam.reset()
 
-    def step(self, action):
+    def step(self, *args):
+
+        # --! extract action with a default value option if no argument is provided
+        a = args[0] if args else 0.0
+
+        self.timing.step()
 
         vg = self.src.step()
         vf = self.amp.step(vg)
-        vb = 0
-        vc, dc = self.cav.step(vf, vb, action)
+        vb = self.beam.step()
+        vc, dc = self.cav.step(vf, vb, a)
 
         return vc, dc
 
 
 class timing(care):
 
-    def __init__(self, rf_fill_nstep, rf_flat_nstep):
+    def __init__(self, args):
 
-        self.rf_fill_nstep = rf_fill_nstep
-        self.rf_flat_nstep = rf_flat_nstep
+        self.events = args.step_e
         self.cur_step = 0
 
         # --! list of observers that will be notified when events happen
         self.observers = []
 
-    def reset(self):
+    def reset(self, *args):
         self.cur_step = 0
 
     def step(self, *args):
 
-        if self.cur_step==0:
-            self.notify_rf_pulse(started=True)
-        elif self.cur_step==self.rf_fill_nstep:
-            pass
-        elif self.cur_step==(self.rf_fill_nstep + self.rf_flat_nstep):
-            self.notify_rf_pulse(started=False)
+        event_key = str(self.cur_step)
+        if event_key in self.events:
+            events = self.events[event_key]
+            if events=='rf_on':
+                self.notify_rf_pulse(started=True)
+            elif events=='rf_off':
+                self.notify_rf_pulse(started=False)
+            elif events=='beam_on':
+                self.notify_beam_pulse(started=True)
+            elif events=='beam_off':
+                self.notify_beam_pulse(started=False)
 
         self.cur_step += 1
 
@@ -121,6 +147,14 @@ class timing(care):
                 observer.rf_pulse_started()
             else:
                 observer.rf_pulse_finished()
+
+    def notify_beam_pulse(self, started=True):
+
+        for observer in self.observers:
+            if started:
+                observer.beam_pulse_started()
+            else:
+                observer.beam_pulse_finished()
 
 
 class care_observer(interface):
@@ -137,6 +171,10 @@ class care_observer(interface):
     def beam_pulse_started(self):
         pass
 
+    @abstractmethod
+    def beam_pulse_finished(self):
+        pass
+
 
 class source(care, care_observer):
 
@@ -151,7 +189,10 @@ class source(care, care_observer):
         # --! current phase that acts as the state of this source
         self.cur_p = self.p
 
-    def reset(self):
+        # --! flag that turns rf on and off
+        self.rf_active = False
+
+    def reset(self, *args):
         self.cur_p = self.p
 
     def step(self, *args):
@@ -159,8 +200,38 @@ class source(care, care_observer):
         # --! advance current phase
         self.cur_p = self.cur_p + 2.0 * np.pi * self.f * self.t
 
-        # --! generate a complex sinusoid rotating at frequency f relative to the simulator reference frame
-        return self.a * np.exp(1j*self.cur_p)
+        # --! generate a complex sinusoid rotating at frequency f relative to simulator reference frame
+        return self.a * np.exp(1j*self.cur_p) if self.rf_active else 0.0 + 1j * 0.0
+
+    def rf_pulse_started(self):
+        self.rf_active = True
+
+    def rf_pulse_finished(self):
+        self.rf_active = False
+
+    def beam_pulse_started(self):
+        pass
+
+    def beam_pulse_finished(self):
+        pass
+
+
+class beam(care, care_observer):
+
+    def __init__(self, args):
+
+        # --! compute beam voltage
+        RL = 0.5 * args.cav_r * args.cav_q
+        self.vb = -RL * args.beam_i * 0.1
+
+        # --! flag that turns beam on and off
+        self.beam_active = False
+
+    def reset(self, *args):
+        pass
+
+    def step(self, *args):
+        return self.vb if self.beam_active else 0.0
 
     def rf_pulse_started(self):
         pass
@@ -169,7 +240,10 @@ class source(care, care_observer):
         pass
 
     def beam_pulse_started(self):
-        pass
+        self.beam_active = True
+
+    def beam_pulse_finished(self):
+        self.beam_active = False
 
 
 class amplifier(care):
@@ -177,7 +251,7 @@ class amplifier(care):
     def __init__(self, args):
         self.gain_db = 20*np.log10(args.amp_g)
 
-    def reset(self):
+    def reset(self, *args):
         pass
 
     def step(self, *args):
@@ -199,10 +273,12 @@ class cavity(care):
 
         self.dt = args.step_t
 
-    def reset(self):
+    def reset(self, *args):
+
+        ic = args[0] if args else 0.0
 
         # --! reset states
-        self.vc = 0.0
+        self.vc = ic
         self.sm = np.zeros(self.mm.b.shape)
 
     def step(self, *args):
