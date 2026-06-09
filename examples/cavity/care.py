@@ -90,8 +90,8 @@ class simulator(care):
         self.timing.reset()
         self.src.reset()
         self.amp.reset()
-        self.cav.reset(ic)
         self.beam.reset()
+        self.cav.reset(ic)
 
     def step(self, *args):
 
@@ -194,13 +194,14 @@ class source(care, care_observer):
 
     def reset(self, *args):
         self.cur_p = self.p
+        self.rf_active = False
 
     def step(self, *args):
 
         # --! advance current phase
         self.cur_p = self.cur_p + 2.0 * np.pi * self.f * self.t
 
-        # --! generate a complex sinusoid rotating at frequency f relative to simulator reference frame
+        # --! generate a complex sinusoid
         return self.a * np.exp(1j*self.cur_p) if self.rf_active else 0.0 + 1j * 0.0
 
     def rf_pulse_started(self):
