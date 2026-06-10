@@ -16,15 +16,6 @@ import util_data
 import util_nn
 
 
-regimes = namedtuple('regimes', 'nominal excursion')
-model_output = namedtuple('model_output', [
-    'blend', 'alpha',
-    'mean_nom', 'zeta_raw_nom', 'zeta_nom',
-    'mean_exc', 'zeta_raw_exc', 'zeta_exc',
-    'mean_embed_nom', 'mean_embed_pred_nom', 'zeta_embed_nom', 'zeta_embed_pred_nom',
-    'mean_embed_exc', 'mean_embed_pred_exc', 'zeta_embed_exc', 'zeta_embed_pred_exc'])
-
-
 def create_args_parser():
     """ Creates a command-line parser for KIND arguments. """
     parser = argparse.ArgumentParser(description='KIND: learned hybrid dynamics')
@@ -66,6 +57,35 @@ def create_args_parser():
     parser.add_argument('--nlayer_trans', type=int, required=False, default=3, help='number of layers in transient operator')
 
     return parser
+
+
+regimes = namedtuple('regimes', 'nominal excursion')
+
+
+class regime_encoder(torch.nn.Module):
+    """ Encodes future-aware latent space for regime decomposition. """
+
+    def __init__(self, window_nsample, window_ndim, latent_ndim):
+        super().__init__()
+
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(window_nsample * window_ndim, 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, latent_ndim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+model_output = namedtuple('model_output', [
+    'blend', 'alpha',
+    'mean_nom', 'zeta_raw_nom', 'zeta_nom',
+    'mean_exc', 'zeta_raw_exc', 'zeta_exc',
+    'mean_embed_nom', 'mean_embed_pred_nom', 'zeta_embed_nom', 'zeta_embed_pred_nom',
+    'mean_embed_exc', 'mean_embed_pred_exc', 'zeta_embed_exc', 'zeta_embed_pred_exc'])
 
 
 class model(torch.nn.Module):
