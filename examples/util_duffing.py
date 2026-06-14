@@ -347,15 +347,26 @@ def duffing_update(t, state, sim, u):
 class base_policy:
 
     def __init__(self, gain, setpoint):
-        self.gain = torch.from_numpy(gain).to(torch.float32)
-        self.setpoint = torch.atleast_2d(torch.tensor(setpoint))
+        self.gain = gain
+        self.setpoint = np.atleast_2d(setpoint)
+
+    def __call__(self, obs):
+        obs = obs - self.setpoint
+        return -np.matmul(obs, np.transpose(self.gain, (0, 1)))
+
+
+class base_policy_adapter:
+
+    def __init__(self, base_policy):
+        self.gain = torch.from_numpy(base_policy.gain).to(torch.float32)
+        self.setpoint = torch.atleast_2d(torch.tensor(base_policy.setpoint, dtype=torch.float32))
 
     def __call__(self, obs):
         obs = obs - self.setpoint
         return -torch.matmul(obs, torch.transpose(self.gain, 0, 1))
 
 
-def make_base_policy(duffing_alpha, duffing_delta, q, r, dt=1e-2, setpoint=[0.0, 0.0]):
+def make_base_policy(duffing_alpha, duffing_delta, q, r, dt=1e-2, setpoint=[0.0, 0.0], adapted=True):
 
     a = np.array([
         [ 0,      1    ],
@@ -384,8 +395,10 @@ def make_base_policy(duffing_alpha, duffing_delta, q, r, dt=1e-2, setpoint=[0.0,
     rhs = bp.dot(a)
     k = np.linalg.solve(lhs, rhs)
 
+    policy = base_policy(k, setpoint)
+
     # --! return base policy, and the solution to Riccati equation
-    return base_policy(k, setpoint), p
+    return base_policy_adapter(policy) if adapted else policy, p
 
 
 def normalize_standard(timeseries, mean, std):
