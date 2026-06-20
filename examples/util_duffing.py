@@ -352,7 +352,7 @@ class base_policy:
 
     def __call__(self, obs):
         obs = obs - self.setpoint
-        return -np.matmul(obs, np.transpose(self.gain, (0, 1)))
+        return -np.matmul(obs, np.transpose(self.gain))
 
 
 class base_policy_adapter:
