@@ -21,7 +21,7 @@ More specifically, the repository includes:
 - PyTorch implementation of KIND
 - Example notebooks for:
   - Kalman filter experiments (IFAC 2026, accepted)
-  - Duffing oscillator experiments (CDC 2026, under review)
+  - Duffing oscillator experiments (CDC 2026, accepted)
   - MuJoCo locomotion experiments (ongoing work)
 
 ## Quick Start
