@@ -1,6 +1,6 @@
-# --!--------------------------------------------------------------!
-# --! utilities for data operations
-# --!--------------------------------------------------------------!
+# --!                               --!
+# --! utilities for data operations --!
+# --!                               --!
 
 from abc import abstractmethod
 from abc import ABC as interface
@@ -9,6 +9,14 @@ import os
 import torch
 import numpy as np
 import pandas as pd
+
+
+def normalize_standard(timeseries, mean, std):
+    return (timeseries - mean) / std
+
+
+def denormalize_standard(timeseries, mean, std):
+    return timeseries * std + mean
 
 
 def train_test_split(data, train_size=0.8, shuffle=True):

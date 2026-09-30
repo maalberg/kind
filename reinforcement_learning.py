@@ -15,6 +15,7 @@ import torch
 import os
 
 import kind
+import regimes
 import util_nn
 import util_data
 
@@ -395,7 +396,7 @@ class agent:
         # --! construct policy iteration
         self.piter = policy_iteration(
             base_policy,
-            kind.regimes(env.nominal.reward_fn, env.excursion.reward_fn),
+            regimes.regimes(env.nominal.reward_fn, env.excursion.reward_fn),
             dataset_factory.create_normalizer(args))
 
     def train(self, niter=1):
@@ -403,7 +404,7 @@ class agent:
         # --! initially there is no residual policy,
         # --! so zeta star constants (maximum zetas of a nominal model on nominal and excursion data) do not matter and are set to 0
         policy = None
-        zeta_star = kind.regimes(0.0, 0.0)
+        zeta_star = regimes.regimes(0.0, 0.0)
 
         replay_nsample = self.args.lookback_nsample
         replay_skip_nsample = replay_nsample*3
@@ -435,7 +436,7 @@ class agent:
             zeta_star.excursion, zeta_star,
             state_nsample, skip_nsample)
 
-        return kind.regimes(replay_nom, replay_exc)
+        return regimes.regimes(replay_nom, replay_exc)
 
     def _train_model(self, replay, i):
 
@@ -563,7 +564,7 @@ class agent:
         zeta = torch.tensor(zeta, dtype=torch.float32)
         zeta_nom_exc = torch.mean(zeta)
 
-        return kind.regimes(zeta_nom_nom, zeta_nom_exc)
+        return regimes.regimes(zeta_nom_nom, zeta_nom_exc)
 
     def _save_progress(self, replay, replay_nsample, replay_skip_nsample, model, zeta_star, residual_policy, i):
         print(zeta_star)

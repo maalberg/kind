@@ -10,19 +10,8 @@ import argparse
 import time
 import json
 
-from collections import namedtuple
-
 import util_data
 import util_nn
-
-
-regimes = namedtuple('regimes', 'nominal excursion')
-model_output = namedtuple('model_output', [
-    'blend', 'alpha',
-    'mean_nom', 'zeta_raw_nom', 'zeta_nom',
-    'mean_exc', 'zeta_raw_exc', 'zeta_exc',
-    'mean_embed_nom', 'mean_embed_pred_nom', 'zeta_embed_nom', 'zeta_embed_pred_nom',
-    'mean_embed_exc', 'mean_embed_pred_exc', 'zeta_embed_exc', 'zeta_embed_pred_exc'])
 
 
 def create_args_parser():
@@ -66,6 +55,14 @@ def create_args_parser():
     parser.add_argument('--nlayer_trans', type=int, required=False, default=3, help='number of layers in transient operator')
 
     return parser
+
+
+model_output = namedtuple('model_output', [
+    'blend', 'alpha',
+    'mean_nom', 'zeta_raw_nom', 'zeta_nom',
+    'mean_exc', 'zeta_raw_exc', 'zeta_exc',
+    'mean_embed_nom', 'mean_embed_pred_nom', 'zeta_embed_nom', 'zeta_embed_pred_nom',
+    'mean_embed_exc', 'mean_embed_pred_exc', 'zeta_embed_exc', 'zeta_embed_pred_exc'])
 
 
 class model(torch.nn.Module):
