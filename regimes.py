@@ -247,7 +247,7 @@ def compute_loss_variance(z):
     return torch.mean(torch.relu(1.0 - std))
 
 
-def train_encoder(model_past, model_future, dataloader, temp_lag=1, nepoch=100, lr=1e-3):
+def train_encoder(model_past, model_future, dataloader, temp_lag=1, alpha=1e-1, beta=1e-2, nepoch=100, lr=1e-3):
     """Trains past and future encoder models in parallel."""
 
     optimizer = torch.optim.Adam(list(model_past.parameters()) + list(model_future.parameters()), lr=lr)
@@ -277,8 +277,8 @@ def train_encoder(model_past, model_future, dataloader, temp_lag=1, nepoch=100, 
 
             loss = (
                 loss_future
-                + 0.01 * loss_var_z + 0.01 * loss_var_h
-                + 0.1 * loss_slow
+                + beta * loss_var_z + beta * loss_var_h
+                + alpha * loss_slow
             )
 
             optimizer.zero_grad()
