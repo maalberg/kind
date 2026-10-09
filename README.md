@@ -22,7 +22,7 @@ More specifically, the repository includes:
 - Example notebooks for:
   - Kalman filter experiments (IFAC 2026, accepted)
   - Duffing oscillator experiments (CDC 2026, accepted)
-  - Dynamical regimes experiments (ACC2027, under review)
+  - Dynamical regimes experiments (ACC 2027, under review)
   - MuJoCo locomotion experiments (ongoing work)
 
 ## Quick Start
@@ -61,11 +61,9 @@ Preliminary results on MuJoCo tasks (Hopper, Walker2d) indicate that KIND can ac
 
 <figure>
   <img src="images/kind_rollout.png" alt="KIND rollout" width=80%>
-  <figcaption>
-  KIND rollout behavior. Predictions closely track ground truth over long horizons, with MSE remaining nearly constant across rollout steps (median with 10–90% quantiles).
-  </figcaption>
-</figure><br>
+</figure>
 
+KIND rollout behavior. Predictions closely track ground truth over long horizons, with MSE remaining nearly constant across rollout steps (median with 10–90% quantiles).
 
 In contrast, standard baselines (global models, ensembles, mixture-of-experts) often exhibit:
 
@@ -75,11 +73,9 @@ In contrast, standard baselines (global models, ensembles, mixture-of-experts) o
 
 <figure>
   <img src="images/ensemble_rollout.png" alt="Ensemble rollout" width=80%>
-  <figcaption>
-  Ensemble rollout behavior. While some seeds yield stable trajectories, aggregated results show increasing error and significant variability across runs.
-  </figcaption>
-</figure><br>
+</figure>
 
+Ensemble rollout behavior. While some seeds yield stable trajectories, aggregated results show increasing error and significant variability across runs.
 
 These results highlight the gap between one-step accuracy and long-horizon stability, and suggest the importance of structural constraints in learned dynamics.
 
