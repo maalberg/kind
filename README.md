@@ -22,6 +22,7 @@ More specifically, the repository includes:
 - Example notebooks for:
   - Kalman filter experiments (IFAC 2026, accepted)
   - Duffing oscillator experiments (CDC 2026, accepted)
+  - Dynamical regimes experiments (ACC2027, under review)
   - MuJoCo locomotion experiments (ongoing work)
 
 ## Quick Start
@@ -65,6 +66,7 @@ Preliminary results on MuJoCo tasks (Hopper, Walker2d) indicate that KIND can ac
   </figcaption>
 </figure><br>
 
+
 In contrast, standard baselines (global models, ensembles, mixture-of-experts) often exhibit:
 
 - Rapid error growth under recursive rollout  
@@ -78,6 +80,7 @@ In contrast, standard baselines (global models, ensembles, mixture-of-experts) o
   </figcaption>
 </figure><br>
 
+
 These results highlight the gap between one-step accuracy and long-horizon stability, and suggest the importance of structural constraints in learned dynamics.
 
 ## Citation
@@ -90,7 +93,7 @@ If you use this code, please cite:
   author       = {Maalberg, Andrei and Neumann, Axel and Echevarria, Pablo and Ushakov, Andriy and Knobloch, Jens},
   booktitle    = {Proc. 23rd IFAC World Congr.},
   year         = {2026},
-  note         = {Accepted for publication. Preprint available at arXiv:2605.11957},
+  note         = {Accepted for publication, preprint available at arXiv:2605.11957},
   url          = {https://arxiv.org/abs/2605.11957},
 }
 ```
